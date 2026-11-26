@@ -303,6 +303,16 @@ pub struct HayakuApp {
     logo_texture: Option<TextureHandle>,
     format_icon_textures: HashMap<String, TextureHandle>,
     last_window_title: String,
+    sys_prefs_checked_at: Option<Instant>,
+    cached_sys_dark: bool,
+    cached_text_scale: f32,
+    cached_sys_dpi: f32,
+    applied_visuals_dark: Option<bool>,
+    applied_styles: bool,
+    fixed_last_scale_key: u32,
+    fixed_scale_changed_at: Option<Instant>,
+    flow_width_changed_at: Option<Instant>,
+    flow_pending_width: i32,
 
     status_msg: Option<(String, Option<Instant>)>,
     context_menu: Option<ImageContextMenu>,
@@ -439,6 +449,16 @@ impl HayakuApp {
             logo_texture,
             format_icon_textures,
             last_window_title: String::new(),
+            sys_prefs_checked_at: None,
+            cached_sys_dark: false,
+            cached_text_scale: 1.0,
+            cached_sys_dpi: 1.0,
+            applied_visuals_dark: None,
+            applied_styles: false,
+            fixed_last_scale_key: 0,
+            fixed_scale_changed_at: None,
+            flow_width_changed_at: None,
+            flow_pending_width: 0,
             status_msg: None,
             context_menu: None,
             link_warning: None,
@@ -529,18 +549,27 @@ impl HayakuApp {
         }
     }
 
+    fn refresh_system_prefs(&mut self) {
+        let needs_refresh = self
+            .sys_prefs_checked_at
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
+        if !needs_refresh {
+            return;
+        }
+        self.sys_prefs_checked_at = Some(Instant::now());
+        #[cfg(windows)]
+        {
+            self.cached_sys_dark = platform::windows_system_prefers_dark();
+            self.cached_text_scale = platform::windows_text_scale_factor();
+            self.cached_sys_dpi = platform::windows_system_dpi_scale();
+        }
+    }
+
     fn theme_mode(&self) -> ThemeMode {
         if self.settings.theme.eq_ignore_ascii_case("system") {
-            #[cfg(windows)]
-            {
-                if platform::windows_system_prefers_dark() {
-                    ThemeMode::Dark
-                } else {
-                    ThemeMode::Light
-                }
-            }
-            #[cfg(not(windows))]
-            {
+            if self.cached_sys_dark {
+                ThemeMode::Dark
+            } else {
                 ThemeMode::Light
             }
         } else {
@@ -1325,39 +1354,43 @@ impl HayakuApp {
         }
     }
 
-    fn apply_egui_visuals(&self, ctx: &Context) {
-        for theme in [egui::Theme::Light, egui::Theme::Dark] {
-            ctx.style_mut_of(theme, |s| {
-                s.interaction.selectable_labels = false;
-                s.text_styles.insert(
-                    egui::TextStyle::Small,
-                    FontId::proportional(14.0),
-                );
-                s.text_styles.insert(
-                    egui::TextStyle::Body,
-                    FontId::proportional(18.0),
-                );
-                s.text_styles.insert(
-                    egui::TextStyle::Button,
-                    FontId::proportional(18.0),
-                );
-                s.text_styles.insert(
-                    egui::TextStyle::Monospace,
-                    FontId::monospace(17.0),
-                );
-                s.text_styles.insert(
-                    egui::TextStyle::Heading,
-                    FontId::proportional(26.0),
-                );
-                s.spacing.item_spacing = Vec2::new(8.0, 7.0);
-                s.spacing.button_padding = Vec2::new(10.0, 5.0);
-                s.spacing.interact_size.y = 28.0;
-            });
+    fn apply_egui_visuals(&mut self, ctx: &Context) {
+        self.refresh_system_prefs();
+        if !self.applied_styles {
+            self.applied_styles = true;
+            for theme in [egui::Theme::Light, egui::Theme::Dark] {
+                ctx.style_mut_of(theme, |s| {
+                    s.interaction.selectable_labels = false;
+                    s.text_styles.insert(
+                        egui::TextStyle::Small,
+                        FontId::proportional(14.0),
+                    );
+                    s.text_styles.insert(
+                        egui::TextStyle::Body,
+                        FontId::proportional(18.0),
+                    );
+                    s.text_styles.insert(
+                        egui::TextStyle::Button,
+                        FontId::proportional(18.0),
+                    );
+                    s.text_styles.insert(
+                        egui::TextStyle::Monospace,
+                        FontId::monospace(17.0),
+                    );
+                    s.text_styles.insert(
+                        egui::TextStyle::Heading,
+                        FontId::proportional(26.0),
+                    );
+                    s.spacing.item_spacing = Vec2::new(8.0, 7.0);
+                    s.spacing.button_padding = Vec2::new(10.0, 5.0);
+                    s.spacing.interact_size.y = 28.0;
+                });
+            }
         }
         #[cfg(windows)]
         {
-            let text_scale = platform::windows_text_scale_factor();
-            let sys_dpi = platform::windows_system_dpi_scale();
+            let text_scale = self.cached_text_scale;
+            let sys_dpi = self.cached_sys_dpi;
             let native_ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
             let dpi_comp = if sys_dpi > 1.05 && (native_ppp - 1.0).abs() < 0.05 {
                 sys_dpi
@@ -1369,8 +1402,13 @@ impl HayakuApp {
                 ctx.set_zoom_factor(target_zoom);
             }
         }
+        let is_dark = self.theme_mode() == ThemeMode::Dark;
+        if self.applied_visuals_dark == Some(is_dark) {
+            return;
+        }
+        self.applied_visuals_dark = Some(is_dark);
         let p = self.palette();
-        let mut visuals = if self.theme_mode() == ThemeMode::Dark {
+        let mut visuals = if is_dark {
             egui::Visuals::dark()
         } else {
             egui::Visuals::light()
@@ -3230,7 +3268,50 @@ impl HayakuApp {
 
             let mut first_visible = None;
             let desired_scale = (factor * ppp).clamp(0.5, 4.5);
-            let scale_key = (desired_scale * 100.0).round() as u32;
+            let quantized_scale = ((desired_scale * 20.0).round() / 20.0).clamp(0.5, 4.5);
+            let scale_key = (quantized_scale * 100.0).round() as u32;
+            if scale_key != self.fixed_last_scale_key {
+                if self.fixed_last_scale_key != 0 {
+                    self.fixed_scale_changed_at = Some(Instant::now());
+                }
+                self.fixed_last_scale_key = scale_key;
+            }
+            let resizing_debounce = self
+                .fixed_scale_changed_at
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(120));
+            if resizing_debounce {
+                ui.ctx().request_repaint_after(Duration::from_millis(50));
+            }
+
+            let mut render_target: Option<usize> = None;
+            let mut preload_target: Option<usize> = None;
+            let mut pending_count = 0usize;
+            for (idx, &(top, _, disp_h)) in page_tops.iter().enumerate() {
+                let bot = top + disp_h;
+                if bot < vis_top - 400.0 || top > vis_bot + 400.0 {
+                    continue;
+                }
+                let is_vis = bot >= vis_top && top <= vis_bot;
+                let cache_key = (book_id.clone(), idx);
+                let (has_entry, needs_render) = match self.page_cache.get(&cache_key) {
+                    Some(c) => (true, c.scale_key != scale_key || c.smart_invert != smart_invert),
+                    None => (false, true),
+                };
+                if needs_render && (!has_entry || !resizing_debounce) {
+                    pending_count += 1;
+                    if is_vis {
+                        if render_target.is_none() {
+                            render_target = Some(idx);
+                        }
+                    } else if preload_target.is_none() {
+                        preload_target = Some(idx);
+                    }
+                }
+            }
+            let page_to_render = render_target.or(preload_target);
+            if pending_count > usize::from(page_to_render.is_some()) {
+                ui.ctx().request_repaint();
+            }
 
             for (idx, &(top, disp_w, disp_h)) in page_tops.iter().enumerate() {
                 let bot = top + disp_h;
@@ -3248,14 +3329,12 @@ impl HayakuApp {
                 );
 
                 let cache_key = (book_id.clone(), idx);
-                let needs_render = match self.page_cache.get(&cache_key) {
-                    Some(c) => c.scale_key != scale_key || c.smart_invert != smart_invert,
-                    None => true,
-                };
-                if needs_render && let Some(book) = self.active_book.as_ref() {
+                if page_to_render == Some(idx) && let Some(book) = self.active_book.as_ref() {
+                    let render_scale = quantized_scale
+                        .min((2400.0 / page_sizes[idx][0].max(1.0)).max(0.5));
                     match &book.source {
                         LoadedSource::Pdf(pdf) => {
-                            if let Ok(mut rendered) = pdf.render_rgba(idx, desired_scale) {
+                            if let Ok(mut rendered) = pdf.render_rgba(idx, render_scale) {
                                 if smart_invert {
                                     smart_invert_rgba(
                                         &mut rendered.rgba,
@@ -3273,25 +3352,32 @@ impl HayakuApp {
                                     img,
                                     TextureOptions::LINEAR,
                                 );
-                                let links = pdf.page_links(idx);
-                                let pdf_runs = pdf.page_text_runs(idx);
                                 self.use_tick += 1;
-                                self.page_cache.insert(
-                                    cache_key.clone(),
-                                    CachedPageTexture {
-                                        scale_key,
-                                        smart_invert,
-                                        links,
-                                        pdf_runs,
-                                        word_runs: Vec::new(),
-                                        texture: tex,
-                                        last_used: self.use_tick,
-                                    },
-                                );
+                                if let Some(existing) = self.page_cache.get_mut(&cache_key) {
+                                    existing.scale_key = scale_key;
+                                    existing.smart_invert = smart_invert;
+                                    existing.texture = tex;
+                                    existing.last_used = self.use_tick;
+                                } else {
+                                    let links = pdf.page_links(idx);
+                                    let pdf_runs = pdf.page_text_runs(idx);
+                                    self.page_cache.insert(
+                                        cache_key.clone(),
+                                        CachedPageTexture {
+                                            scale_key,
+                                            smart_invert,
+                                            links,
+                                            pdf_runs,
+                                            word_runs: Vec::new(),
+                                            texture: tex,
+                                            last_used: self.use_tick,
+                                        },
+                                    );
+                                }
                             }
                         }
                         LoadedSource::Word(word) => {
-                            if let Ok((w, h, mut rgba)) = word.render_rgba(idx, Some(desired_scale)) {
+                            if let Ok((w, h, mut rgba)) = word.render_rgba(idx, Some(render_scale)) {
                                 if smart_invert {
                                     let [pw, ph] = word.metadata.pages[idx];
                                     let sx = w as f32 / pw.max(1.0);
@@ -3315,20 +3401,27 @@ impl HayakuApp {
                                     img,
                                     TextureOptions::LINEAR,
                                 );
-                                let word_runs = word.text_runs(idx).unwrap_or_default();
                                 self.use_tick += 1;
-                                self.page_cache.insert(
-                                    cache_key.clone(),
-                                    CachedPageTexture {
-                                        scale_key,
-                                        smart_invert,
-                                        links: Vec::new(),
-                                        pdf_runs: Vec::new(),
-                                        word_runs,
-                                        texture: tex,
-                                        last_used: self.use_tick,
-                                    },
-                                );
+                                if let Some(existing) = self.page_cache.get_mut(&cache_key) {
+                                    existing.scale_key = scale_key;
+                                    existing.smart_invert = smart_invert;
+                                    existing.texture = tex;
+                                    existing.last_used = self.use_tick;
+                                } else {
+                                    let word_runs = word.text_runs(idx).unwrap_or_default();
+                                    self.page_cache.insert(
+                                        cache_key.clone(),
+                                        CachedPageTexture {
+                                            scale_key,
+                                            smart_invert,
+                                            links: Vec::new(),
+                                            pdf_runs: Vec::new(),
+                                            word_runs,
+                                            texture: tex,
+                                            last_used: self.use_tick,
+                                        },
+                                    );
+                                }
                             }
                         }
                         LoadedSource::Flow(_) => {}
@@ -3750,13 +3843,31 @@ impl HayakuApp {
             line_height_hundredths: (line_height * 100.0).round() as u32,
             dark,
         };
-        if self
-            .flow_cache
-            .as_ref()
-            .is_some_and(|c| c.key == key)
-        {
-            return;
+        if let Some(existing) = &self.flow_cache {
+            if existing.key == key {
+                self.flow_width_changed_at = None;
+                return;
+            }
+            let only_width_changed = existing.key.book_id == key.book_id
+                && existing.key.is_code_mode == key.is_code_mode
+                && existing.key.font_size_tenths == key.font_size_tenths
+                && existing.key.line_height_hundredths == key.line_height_hundredths
+                && existing.key.dark == key.dark;
+            if only_width_changed {
+                if self.flow_pending_width != key.width_px {
+                    self.flow_pending_width = key.width_px;
+                    self.flow_width_changed_at = Some(Instant::now());
+                }
+                if self
+                    .flow_width_changed_at
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(90))
+                {
+                    ui.ctx().request_repaint_after(Duration::from_millis(50));
+                    return;
+                }
+            }
         }
+        self.flow_width_changed_at = None;
 
         let (items, chapter_first_item, anchor_to_item) = build_flow_items_list(
             flow,
@@ -8687,6 +8798,16 @@ mod tests {
             logo_texture: None,
             format_icon_textures: HashMap::new(),
             last_window_title: String::new(),
+            sys_prefs_checked_at: Some(Instant::now()),
+            cached_sys_dark: false,
+            cached_text_scale: 1.0,
+            cached_sys_dpi: 1.0,
+            applied_visuals_dark: None,
+            applied_styles: false,
+            fixed_last_scale_key: 0,
+            fixed_scale_changed_at: None,
+            flow_width_changed_at: None,
+            flow_pending_width: 0,
             status_msg: None,
             context_menu: None,
             link_warning: None,

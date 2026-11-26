@@ -281,7 +281,29 @@ fn register(data: &Path, selected: &[String]) -> io::Result<()> {
         );
     }
     unsafe {
-        SHChangeNotify(0x08000000, 0, std::ptr::null(), std::ptr::null());
+        SHChangeNotify(0x08000000, 0x1000, std::ptr::null(), std::ptr::null());
+    }
+    Ok(())
+}
+
+pub fn sync_installed_associations(data: &Path) -> io::Result<()> {
+    if !installed() {
+        return Ok(());
+    }
+    let exe = installed_path()?;
+    if !exe.is_file() {
+        return Ok(());
+    }
+    let recorded: Option<String> = read_json(&data.join("installed-version.json")).ok();
+    let version_changed = recorded.as_deref() != Some(VERSION);
+    let expected_pdf_icon = format!("\"{}\",-101", exe.display());
+    let pdf_icon_matches = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Classes\HayakuReader.pdf\DefaultIcon")
+        .and_then(|key| key.get_value::<String, _>(""))
+        .is_ok_and(|val| val == expected_pdf_icon);
+    if version_changed || !pdf_icon_matches {
+        let selected = associations(data)?;
+        register(data, &selected)?;
     }
     Ok(())
 }

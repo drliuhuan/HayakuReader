@@ -238,7 +238,12 @@ pub fn smart_invert_rgba(
 
     const STRIDE_R: usize = LUT_SIZE * LUT_SIZE * 3;
     const STRIDE_G: usize = LUT_SIZE * 3;
+    const WHITE_LI: usize = 64 * STRIDE_R + 64 * STRIDE_G + 64 * 3;
+    const BLACK_LI: usize = 0;
+    let white_rgb = [lut[WHITE_LI], lut[WHITE_LI + 1], lut[WHITE_LI + 2]];
+    let black_rgb = [lut[BLACK_LI], lut[BLACK_LI + 1], lut[BLACK_LI + 2]];
 
+    let row_bytes = w * 4;
     for y in 0..h {
         let mut row_ranges: [(usize, usize); 16] = [(0, 0); 16];
         let mut range_count = 0usize;
@@ -248,25 +253,54 @@ pub fn smart_invert_rgba(
                 range_count += 1;
             }
         }
-        let row_offset = y * w * 4;
-        for x in 0..w {
-            if row_ranges[..range_count]
-                .iter()
-                .any(|&(x0, x1)| x >= x0 && x < x1)
-            {
-                continue;
+        let row_slice = &mut rgba[y * row_bytes..(y + 1) * row_bytes];
+        let mut spans: [(usize, usize); 17] = [(0, 0); 17];
+        let mut span_count = 0usize;
+        if range_count == 0 {
+            spans[0] = (0, w);
+            span_count = 1;
+        } else {
+            let active = &mut row_ranges[..range_count];
+            active.sort_unstable_by_key(|&(x0, _)| x0);
+            let mut cursor = 0usize;
+            for &(x0, x1) in active.iter() {
+                if x0 > cursor {
+                    spans[span_count] = (cursor, x0);
+                    span_count += 1;
+                }
+                cursor = cursor.max(x1);
             }
-            let i = row_offset + x * 4;
-            if rgba[i + 3] == 0 {
-                continue;
+            if cursor < w {
+                spans[span_count] = (cursor, w);
+                span_count += 1;
             }
-            let r = (usize::from(rgba[i]) + 2) >> 2;
-            let g = (usize::from(rgba[i + 1]) + 2) >> 2;
-            let b = (usize::from(rgba[i + 2]) + 2) >> 2;
-            let li = r * STRIDE_R + g * STRIDE_G + b * 3;
-            rgba[i] = lut[li];
-            rgba[i + 1] = lut[li + 1];
-            rgba[i + 2] = lut[li + 2];
+        }
+
+        for &(sx0, sx1) in &spans[..span_count] {
+            for px in row_slice[sx0 * 4..sx1 * 4].as_chunks_mut::<4>().0 {
+                if px[3] == 0 {
+                    continue;
+                }
+                if px[0] == 255 && px[1] == 255 && px[2] == 255 {
+                    px[0] = white_rgb[0];
+                    px[1] = white_rgb[1];
+                    px[2] = white_rgb[2];
+                    continue;
+                }
+                if px[0] == 0 && px[1] == 0 && px[2] == 0 {
+                    px[0] = black_rgb[0];
+                    px[1] = black_rgb[1];
+                    px[2] = black_rgb[2];
+                    continue;
+                }
+                let r = (usize::from(px[0]) + 2) >> 2;
+                let g = (usize::from(px[1]) + 2) >> 2;
+                let b = (usize::from(px[2]) + 2) >> 2;
+                let li = r * STRIDE_R + g * STRIDE_G + b * 3;
+                px[0] = lut[li];
+                px[1] = lut[li + 1];
+                px[2] = lut[li + 2];
+            }
         }
     }
 }
@@ -300,5 +334,37 @@ mod tests {
         assert!(rgba[paper_idx] < 55 && rgba[paper_idx + 1] < 55 && rgba[paper_idx + 2] < 55);
         // Photo pixel inside preserve rect remained untouched
         assert_eq!(&rgba[photo_idx..photo_idx + 4], &[20, 120, 230, 255]);
+    }
+
+    #[test]
+    fn smart_invert_handles_overlapping_preserve_rects() {
+        let width = 40;
+        let height = 20;
+        let mut rgba = vec![255u8; (width * height * 4) as usize];
+        let p1 = (5 * width as usize + 6) * 4;
+        rgba[p1] = 10;
+        rgba[p1 + 1] = 100;
+        rgba[p1 + 2] = 200;
+        let p_overlap = (5 * width as usize + 12) * 4;
+        rgba[p_overlap] = 50;
+        rgba[p_overlap + 1] = 180;
+        rgba[p_overlap + 2] = 90;
+        let p2 = (5 * width as usize + 18) * 4;
+        rgba[p2] = 200;
+        rgba[p2 + 1] = 80;
+        rgba[p2 + 2] = 30;
+
+        smart_invert_rgba(
+            &mut rgba,
+            width,
+            height,
+            &[[4.0, 2.0, 10.0, 10.0], [10.0, 3.0, 10.0, 9.0]],
+        );
+
+        assert_eq!(&rgba[p1..p1 + 4], &[10, 100, 200, 255]);
+        assert_eq!(&rgba[p_overlap..p_overlap + 4], &[50, 180, 90, 255]);
+        assert_eq!(&rgba[p2..p2 + 4], &[200, 80, 30, 255]);
+        let outside = (5 * width as usize + 28) * 4;
+        assert!(rgba[outside] < 55 && rgba[outside + 1] < 55 && rgba[outside + 2] < 55);
     }
 }

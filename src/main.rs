@@ -105,6 +105,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         };
 
         platform::cleanup_updates(&data);
+        let _ = platform::sync_installed_associations(&data);
         platform::record_version(&data)?;
 
         let initial = launch_paths.pop_front();
