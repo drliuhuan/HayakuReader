@@ -11,3 +11,7 @@ Starting with v0.2.1, HTM and HTML are unchecked by default. You can still selec
 v0.2.2 shows update download progress and speed, offers a manual GitHub download after a failure, and asks you to close the previous process if it blocks an update.
 
 Complex Word layouts may differ from the originals. Kindle files protected by DRM or compressed with HUFF/CDIC are currently unsupported. OCR, Markdown editing, and annotation export are planned for later releases.
+
+GitHub repository [github.com/drliuhuan/HayakuReader](https://github.com/drliuhuan/HayakuReader)
+
+© 2026 drliuhuan · Apache-2.0
