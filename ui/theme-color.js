@@ -131,6 +131,8 @@ export function mapRgbDark(r, g, b, isBackground = false) {
 
 const LUT_SIZE = 33;
 let lutData = null;
+const WHITE_MAPPED = mapRgbDark(255, 255, 255, false);
+const BLACK_MAPPED = mapRgbDark(0, 0, 0, false);
 
 function ensureLut() {
   if (lutData) return lutData;
@@ -153,46 +155,6 @@ function ensureLut() {
   return lutData;
 }
 
-function sampleLut(lut, r, g, b) {
-  const max = LUT_SIZE - 1;
-  const rf = (r / 255) * max;
-  const gf = (g / 255) * max;
-  const bf = (b / 255) * max;
-  const r0 = Math.min(max - 1, rf | 0);
-  const g0 = Math.min(max - 1, gf | 0);
-  const b0 = Math.min(max - 1, bf | 0);
-  const dr = rf - r0;
-  const dg = gf - g0;
-  const db = bf - b0;
-  const strideG = LUT_SIZE * 3;
-  const strideB = LUT_SIZE * strideG;
-  const base = b0 * strideB + g0 * strideG + r0 * 3;
-
-  const c000 = base;
-  const c100 = base + 3;
-  const c010 = base + strideG;
-  const c110 = c010 + 3;
-  const c001 = base + strideB;
-  const c101 = c001 + 3;
-  const c011 = c001 + strideG;
-  const c111 = c011 + 3;
-
-  const w00 = (1 - dr) * (1 - dg);
-  const w10 = dr * (1 - dg);
-  const w01 = (1 - dr) * dg;
-  const w11 = dr * dg;
-  const w0 = 1 - db;
-  const w1 = db;
-
-  const outR = (lut[c000] * w00 + lut[c100] * w10 + lut[c010] * w01 + lut[c110] * w11) * w0
-    + (lut[c001] * w00 + lut[c101] * w10 + lut[c011] * w01 + lut[c111] * w11) * w1;
-  const outG = (lut[c000 + 1] * w00 + lut[c100 + 1] * w10 + lut[c010 + 1] * w01 + lut[c110 + 1] * w11) * w0
-    + (lut[c001 + 1] * w00 + lut[c101 + 1] * w10 + lut[c011 + 1] * w01 + lut[c111 + 1] * w11) * w1;
-  const outB = (lut[c000 + 2] * w00 + lut[c100 + 2] * w10 + lut[c010 + 2] * w01 + lut[c110 + 2] * w11) * w0
-    + (lut[c001 + 2] * w00 + lut[c101 + 2] * w10 + lut[c011 + 2] * w01 + lut[c111 + 2] * w11) * w1;
-  return [Math.round(outR), Math.round(outG), Math.round(outB)];
-}
-
 export function applySmartInvertToCanvas(canvas, preserveRects = []) {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx || !canvas.width || !canvas.height) return;
@@ -213,13 +175,60 @@ export function applySmartInvertToCanvas(canvas, preserveRects = []) {
   const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const pixels = frame.data;
   const lut = ensureLut();
+  const max = LUT_SIZE - 1;
+  const scale = max / 255;
+  const strideG = LUT_SIZE * 3;
+  const strideB = LUT_SIZE * strideG;
+  const wr = WHITE_MAPPED[0], wg = WHITE_MAPPED[1], wb = WHITE_MAPPED[2];
+  const br = BLACK_MAPPED[0], bg = BLACK_MAPPED[1], bb = BLACK_MAPPED[2];
+
   for (let i = 0; i < pixels.length; i += 4) {
-    const a = pixels[i + 3];
-    if (a === 0) continue;
-    const [nr, ng, nb] = sampleLut(lut, pixels[i], pixels[i + 1], pixels[i + 2]);
-    pixels[i] = nr;
-    pixels[i + 1] = ng;
-    pixels[i + 2] = nb;
+    if (pixels[i + 3] === 0) continue;
+    const r = pixels[i];
+    const g = pixels[i + 1];
+    const b = pixels[i + 2];
+    if (r === 255 && g === 255 && b === 255) {
+      pixels[i] = wr;
+      pixels[i + 1] = wg;
+      pixels[i + 2] = wb;
+      continue;
+    }
+    if (r === 0 && g === 0 && b === 0) {
+      pixels[i] = br;
+      pixels[i + 1] = bg;
+      pixels[i + 2] = bb;
+      continue;
+    }
+    const rf = r * scale;
+    const gf = g * scale;
+    const bf = b * scale;
+    const r0 = rf < max ? (rf | 0) : max - 1;
+    const g0 = gf < max ? (gf | 0) : max - 1;
+    const b0 = bf < max ? (bf | 0) : max - 1;
+    const dr = rf - r0;
+    const dg = gf - g0;
+    const db = bf - b0;
+    const base = b0 * strideB + g0 * strideG + r0 * 3;
+    const c100 = base + 3;
+    const c010 = base + strideG;
+    const c110 = c010 + 3;
+    const c001 = base + strideB;
+    const c101 = c001 + 3;
+    const c011 = c001 + strideG;
+    const c111 = c011 + 3;
+    const w00 = (1 - dr) * (1 - dg);
+    const w10 = dr * (1 - dg);
+    const w01 = (1 - dr) * dg;
+    const w11 = dr * dg;
+    const w0 = 1 - db;
+    const w1 = db;
+
+    pixels[i] = ((lut[base] * w00 + lut[c100] * w10 + lut[c010] * w01 + lut[c110] * w11) * w0
+      + (lut[c001] * w00 + lut[c101] * w10 + lut[c011] * w01 + lut[c111] * w11) * w1 + 0.5) | 0;
+    pixels[i + 1] = ((lut[base + 1] * w00 + lut[c100 + 1] * w10 + lut[c010 + 1] * w01 + lut[c110 + 1] * w11) * w0
+      + (lut[c001 + 1] * w00 + lut[c101 + 1] * w10 + lut[c011 + 1] * w01 + lut[c111 + 1] * w11) * w1 + 0.5) | 0;
+    pixels[i + 2] = ((lut[base + 2] * w00 + lut[c100 + 2] * w10 + lut[c010 + 2] * w01 + lut[c110 + 2] * w11) * w0
+      + (lut[c001 + 2] * w00 + lut[c101 + 2] * w10 + lut[c011 + 2] * w01 + lut[c111 + 2] * w11) * w1 + 0.5) | 0;
   }
   ctx.putImageData(frame, 0, 0);
 

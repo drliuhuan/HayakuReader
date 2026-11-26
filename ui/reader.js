@@ -83,7 +83,7 @@ function save(keepalive = false) {
   clearTimeout(saveTimer);
   if (!book) return Promise.resolve();
   if (!restoring && !reader.hidden && reader.childElementCount) {
-    getState().position = activePosition();
+    getState().position = activePosition(true);
     getState().digest = book.digest;
   }
   const url = sessionUrl("save");
@@ -358,13 +358,13 @@ async function present(next) {
     if (book.kind === "pdf") {
       reader.className = "fixed";
       const { openPdf } = await import("/ui/pdf.js");
-      pdf = await openPdf(contentRoute(0), headers, reader, scroll, refreshHighlights, isSmartInvertActive);
+      pdf = await openPdf(contentRoute(0), headers, reader, scroll, scheduleRefreshHighlights, isSmartInvertActive);
       contents = await pdf.outline().catch(() => []);
       $("page-number").max = pdf.count;
     } else if (book.kind === "word") {
       reader.className = "fixed";
       const { openWord } = await import("/ui/word.js");
-      pdf = openWord(book.word, contentRoute, request, reader, scroll, refreshHighlights, isSmartInvertActive);
+      pdf = openWord(book.word, contentRoute, request, reader, scroll, scheduleRefreshHighlights, isSmartInvertActive);
       contents = book.word.outline;
       $("page-number").max = pdf.count;
     } else {
@@ -522,7 +522,7 @@ function persistWorkspace(keepalive = false) {
 
 setInterval(() => { if (sleepTabs()) renderDocumentTabs(); }, 15000);
 
-function activePosition() {
+function activePosition(includeAnchor = false) {
   const top = scroll.getBoundingClientRect().top + 12;
   const candidates = units();
   let low = 0;
@@ -539,7 +539,7 @@ function activePosition() {
     index: Number(element.dataset.unit),
     fraction: Math.max(0, Math.min(1, (top - box.top) / Math.max(box.height, 1)))
   };
-  if (!pdf && position.fraction > 0) {
+  if (includeAnchor && !pdf && position.fraction > 0) {
     const y = Math.min(top, box.bottom - 1);
     const x = Math.max(box.left + 28, 1);
     let caretContainer = null;
@@ -696,8 +696,22 @@ function selectionParts(selection) {
   return parts;
 }
 
+let highlightFrame;
+
+function scheduleRefreshHighlights() {
+  if (!book || !getState().annotations.length || highlightFrame) return;
+  highlightFrame = requestAnimationFrame(() => {
+    highlightFrame = null;
+    refreshHighlights();
+  });
+}
+
 function refreshHighlights() {
   if (!CSS.highlights || !book) return;
+  if (!getState().annotations.length) {
+    for (const color of colors) CSS.highlights.delete("hayaku-" + color);
+    return;
+  }
   const groups = new Map(colors.map(color => [color, new Highlight()]));
   for (const annotation of getState().annotations) {
     const group = groups.get(annotation.color || "yellow");
@@ -1075,11 +1089,11 @@ $("query").addEventListener("keydown", event => {
   }
 });
 $("bookmark").addEventListener("click", () => {
-  const position = activePosition();
+  const position = activePosition(true);
   showEditor({ kind: "bookmark", text: bookmarkTitle(position), position, digest: book.digest });
 });
 $("page-note").addEventListener("click", () => {
-  showEditor({ kind: "note", position: activePosition(), digest: book.digest });
+  showEditor({ kind: "note", position: activePosition(true), digest: book.digest });
 });
 $("selection-tools").addEventListener("pointerdown", event => event.preventDefault());
 $("copy").addEventListener("click", () => {

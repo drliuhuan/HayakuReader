@@ -9,7 +9,7 @@ mod word;
 
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path as RoutePath, Query, State},
     http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
@@ -109,7 +109,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
 fn digest(path: &Path) -> io::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hash = Sha256::new();
-    let mut buffer = [0; 32768];
+    let mut buffer = [0; 131_072];
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {
@@ -687,10 +687,27 @@ fn bytes(mime: &'static str, data: Vec<u8>) -> Response {
         .into_response()
 }
 
+fn static_bytes(
+    mime: &'static str,
+    data: &'static [u8],
+    cache_control: &'static str,
+) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, cache_control),
+        ],
+        Body::from(data),
+    )
+        .into_response()
+}
+
 async fn index() -> Response {
-    let mut response = bytes(
+    let mut response = static_bytes(
         "text/html; charset=utf-8",
-        include_bytes!("../ui/index.html").to_vec(),
+        include_bytes!("../ui/index.html"),
+        "no-store",
     );
     response.headers_mut().insert(header::CONTENT_SECURITY_POLICY,
         "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data: blob:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'".parse().unwrap());
@@ -699,33 +716,40 @@ async fn index() -> Response {
 
 async fn frontend(RoutePath(file): RoutePath<String>) -> Result<Response> {
     match file.as_str() {
-        "reader.js" => Ok(bytes(
+        "reader.js" => Ok(static_bytes(
             "text/javascript; charset=utf-8",
-            include_bytes!("../ui/reader.js").to_vec(),
+            include_bytes!("../ui/reader.js"),
+            "private, max-age=3600",
         )),
-        "pdf.js" => Ok(bytes(
+        "pdf.js" => Ok(static_bytes(
             "text/javascript; charset=utf-8",
-            include_bytes!("../ui/pdf.js").to_vec(),
+            include_bytes!("../ui/pdf.js"),
+            "private, max-age=3600",
         )),
-        "word.js" => Ok(bytes(
+        "word.js" => Ok(static_bytes(
             "text/javascript; charset=utf-8",
-            include_bytes!("../ui/word.js").to_vec(),
+            include_bytes!("../ui/word.js"),
+            "private, max-age=3600",
         )),
-        "theme-color.js" => Ok(bytes(
+        "theme-color.js" => Ok(static_bytes(
             "text/javascript; charset=utf-8",
-            include_bytes!("../ui/theme-color.js").to_vec(),
+            include_bytes!("../ui/theme-color.js"),
+            "private, max-age=3600",
         )),
-        "code.js" => Ok(bytes(
+        "code.js" => Ok(static_bytes(
             "text/javascript; charset=utf-8",
-            include_bytes!("../ui/code.js").to_vec(),
+            include_bytes!("../ui/code.js"),
+            "private, max-age=3600",
         )),
-        "reader.css" => Ok(bytes(
+        "reader.css" => Ok(static_bytes(
             "text/css; charset=utf-8",
-            include_bytes!("../ui/reader.css").to_vec(),
+            include_bytes!("../ui/reader.css"),
+            "private, max-age=3600",
         )),
-        "logo.svg" => Ok(bytes(
+        "logo.svg" => Ok(static_bytes(
             "image/svg+xml",
-            include_bytes!("../assets/logo.svg").to_vec(),
+            include_bytes!("../assets/logo.svg"),
+            "private, max-age=3600",
         )),
         _ => Err((StatusCode::NOT_FOUND, "资源不存在".into())),
     }
@@ -784,7 +808,7 @@ async fn vendor(RoutePath(file): RoutePath<String>) -> Result<Response> {
             (asset.contents(), mime)
         }
     };
-    Ok(bytes(mime, data.to_vec()))
+    Ok(static_bytes(mime, data, "public, max-age=86400, immutable"))
 }
 
 fn app_data() -> io::Result<PathBuf> {

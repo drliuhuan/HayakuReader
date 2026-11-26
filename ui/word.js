@@ -6,11 +6,42 @@ export function openWord(metadata, contentRoute, request, reader, scroll, onRend
   const measure = document.createElement("canvas").getContext("2d");
   let zoom = null;
   let closed = false;
+  let useTick = 0;
+  const MAX_RENDERED_PAGES = 10;
   const observer = new IntersectionObserver(records => {
     for (const record of records) {
-      if (record.isIntersecting) render(Number(record.target.dataset.unit)).catch(console.error);
+      const index = Number(record.target.dataset.unit);
+      const entry = entries[index];
+      if (!entry) continue;
+      entry.visible = record.isIntersecting;
+      if (record.isIntersecting) {
+        entry.lastUsed = ++useTick;
+        render(index).catch(console.error);
+      }
     }
   }, { root: scroll, rootMargin: "480px" });
+
+  function evictPages() {
+    const totalRendered = entries.filter(entry => entry.pending).length;
+    if (totalRendered <= MAX_RENDERED_PAGES) return;
+    const candidates = entries.filter(entry => entry.pending && !entry.visible);
+    candidates.sort((a, b) => a.lastUsed - b.lastUsed);
+    let excess = totalRendered - MAX_RENDERED_PAGES;
+    for (const entry of candidates) {
+      if (excess <= 0) break;
+      entry.bitmap?.close();
+      entry.bitmap = null;
+      if (entry.canvas) {
+        entry.canvas.width = 0;
+        entry.canvas.height = 0;
+        entry.canvas = null;
+      }
+      entry.layer = null;
+      entry.pending = null;
+      entry.element.replaceChildren();
+      excess--;
+    }
+  }
 
   function scale() {
     return zoom ?? Math.max(.2, (scroll.clientWidth - 36) / firstWidth);
@@ -61,6 +92,7 @@ export function openWord(metadata, contentRoute, request, reader, scroll, onRend
   function render(index) {
     const entry = entries[index];
     if (!entry || closed) return Promise.resolve();
+    entry.lastUsed = ++useTick;
     if (!entry.pending) entry.pending = (async () => {
       const [runs, response] = await Promise.all([getText(index), request(contentRoute(index) + "&raster=true")]);
       const blob = await response.blob();
@@ -96,6 +128,7 @@ export function openWord(metadata, contentRoute, request, reader, scroll, onRend
       }
       entry.layer = layer;
       entry.element.replaceChildren(canvas, layer);
+      evictPages();
       onRender();
     })().catch(error => {
       entry.pending = null;
@@ -110,7 +143,7 @@ export function openWord(metadata, contentRoute, request, reader, scroll, onRend
     element.dataset.unit = index;
     element.setAttribute("aria-label", "第 " + (index + 1) + " 页");
     reader.append(element);
-    entries.push({ element, pending: null });
+    entries.push({ element, pending: null, bitmap: null, canvas: null, layer: null, visible: false, lastUsed: 0 });
     observer.observe(element);
   }
   resize();
@@ -134,6 +167,12 @@ export function openWord(metadata, contentRoute, request, reader, scroll, onRend
       observer.disconnect();
       for (const entry of entries) {
         entry.bitmap?.close();
+        entry.bitmap = null;
+        if (entry.canvas) {
+          entry.canvas.width = 0;
+          entry.canvas.height = 0;
+          entry.canvas = null;
+        }
       }
     }
   };

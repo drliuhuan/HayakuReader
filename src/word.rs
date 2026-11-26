@@ -189,7 +189,7 @@ impl Word {
 
     pub fn image(&self, index: usize) -> Result<Vec<u8>, String> {
         let [width, height] = *self.metadata.pages.get(index).ok_or("页码不存在")?;
-        let scale = (12_000_000.0 / (width * height)).sqrt().clamp(0.1, 2.0);
+        let scale = (6_000_000.0 / (width * height)).sqrt().clamp(0.1, 1.8);
         let pixmap = docboss_render::render_page(&self.layout, index, scale)
             .map_err(|error| error.to_string())?;
         pixmap

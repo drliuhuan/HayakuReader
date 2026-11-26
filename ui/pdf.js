@@ -98,12 +98,42 @@ export async function openPdf(url, headers, reader, scroll, onRender, shouldSmar
   let zoom = null;
   let revision = 0;
   let closed = false;
+  let useTick = 0;
+  const MAX_RENDERED_PAGES = 12;
   const entries = [];
   const observer = new IntersectionObserver(records => {
     for (const record of records) {
-      if (record.isIntersecting) render(Number(record.target.dataset.unit)).catch(console.error);
+      const idx = Number(record.target.dataset.unit);
+      const entry = entries[idx];
+      if (!entry) continue;
+      entry.visible = record.isIntersecting;
+      if (record.isIntersecting) {
+        entry.lastUsed = ++useTick;
+        render(idx).catch(console.error);
+      }
     }
   }, { root: scroll, rootMargin: "480px" });
+
+  function evictPages() {
+    const rendered = entries.filter(entry => entry.pending && !entry.visible);
+    const totalRendered = entries.filter(entry => entry.pending).length;
+    if (totalRendered <= MAX_RENDERED_PAGES) return;
+    rendered.sort((a, b) => a.lastUsed - b.lastUsed);
+    let excess = totalRendered - MAX_RENDERED_PAGES;
+    for (const entry of rendered) {
+      if (excess <= 0) break;
+      entry.cancel?.();
+      entry.pending = null;
+      entry.cancel = null;
+      if (entry.canvas) {
+        entry.canvas.width = 0;
+        entry.canvas.height = 0;
+        entry.canvas = null;
+      }
+      entry.element.replaceChildren();
+      excess--;
+    }
+  }
 
   function scale() {
     return zoom ?? Math.max(.2, (scroll.clientWidth - 36) / Math.max(1, sample.width));
@@ -119,6 +149,7 @@ export async function openPdf(url, headers, reader, scroll, onRender, shouldSmar
   function render(index) {
     const entry = entries[index];
     if (!entry || closed) return Promise.resolve();
+    entry.lastUsed = ++useTick;
     if (entry.pending) return entry.pending;
     const version = revision;
     const target = entry.element;
@@ -129,11 +160,12 @@ export async function openPdf(url, headers, reader, scroll, onRender, shouldSmar
       const viewport = page.getViewport({ scale: scale() });
       dimensions(target, viewport);
       const canvas = window.document.createElement("canvas");
-      const pixelRatio = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(12000000 / Math.max(1, viewport.width * viewport.height)));
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(8000000 / Math.max(1, viewport.width * viewport.height)));
       canvas.width = Math.ceil(viewport.width * pixelRatio);
       canvas.height = Math.ceil(viewport.height * pixelRatio);
       canvas.style.width = viewport.width + "px";
       canvas.style.height = viewport.height + "px";
+      entry.canvas = canvas;
       const layer = window.document.createElement("div");
       layer.className = "textLayer";
       const text = new pdfjs.TextLayer({ textContentSource: page.streamTextContent(), container: layer, viewport });
@@ -146,10 +178,16 @@ export async function openPdf(url, headers, reader, scroll, onRender, shouldSmar
       const [, , preserveRects] = await Promise.all([raster.promise, text.render(), opsPromise]);
       if (closed || version !== revision) return;
       if (shouldSmartInvert()) applySmartInvertToCanvas(canvas, preserveRects);
+      evictPages();
       onRender();
     })().catch(error => {
       if (!closed && version === revision) {
         entry.pending = null;
+        if (entry.canvas) {
+          entry.canvas.width = 0;
+          entry.canvas.height = 0;
+          entry.canvas = null;
+        }
         throw error;
       }
     });
@@ -163,6 +201,11 @@ export async function openPdf(url, headers, reader, scroll, onRender, shouldSmar
       entry.cancel?.();
       entry.pending = null;
       entry.cancel = null;
+      if (entry.canvas) {
+        entry.canvas.width = 0;
+        entry.canvas.height = 0;
+        entry.canvas = null;
+      }
       entry.element.replaceChildren();
       dimensions(entry.element, {
         width: entry.baseViewport.width * factor,
@@ -181,7 +224,7 @@ export async function openPdf(url, headers, reader, scroll, onRender, shouldSmar
     element.setAttribute("aria-label", "第 " + (i + 1) + " 页");
     dimensions(element, first.getViewport({ scale: scale() }));
     reader.append(element);
-    entries.push({ element, baseViewport: sample, pending: null, cancel: null });
+    entries.push({ element, baseViewport: sample, pending: null, cancel: null, canvas: null, visible: false, lastUsed: 0 });
     observer.observe(element);
   }
 
@@ -219,7 +262,14 @@ export async function openPdf(url, headers, reader, scroll, onRender, shouldSmar
     close() {
       closed = true;
       observer.disconnect();
-      for (const entry of entries) entry.cancel?.();
+      for (const entry of entries) {
+        entry.cancel?.();
+        if (entry.canvas) {
+          entry.canvas.width = 0;
+          entry.canvas.height = 0;
+          entry.canvas = null;
+        }
+      }
       task.destroy().catch(console.error);
     }
   };
