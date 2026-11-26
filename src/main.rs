@@ -2,6 +2,7 @@
 
 mod app;
 mod flow;
+mod highlight;
 mod math;
 mod pdf;
 #[cfg(windows)]

@@ -1,6 +1,8 @@
-use crate::math::mathml_to_latex;
+use crate::math::mathml_element_to_latex;
+use ego_tree::NodeRef;
 use encoding_rs::{GB18030, UTF_8, UTF_16BE, UTF_16LE};
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use scraper::{ElementRef, Html, Node};
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -34,6 +36,8 @@ pub enum Inline {
         italic: bool,
         strike: bool,
         code: bool,
+        superscript: bool,
+        subscript: bool,
         inlines: Vec<Inline>,
     },
     Link {
@@ -64,6 +68,7 @@ pub enum Block {
         items: Vec<Vec<Block>>,
     },
     Code {
+        lang: String,
         code: String,
     },
     Table {
@@ -86,6 +91,7 @@ pub struct FlowChapter {
     pub path: String,
     pub title: String,
     pub blocks: Vec<Block>,
+    pub anchors: HashMap<String, usize>,
     pub raw_source: String,
 }
 
@@ -139,7 +145,7 @@ fn collect_block_plain(block: &Block, out: &mut String) {
                 }
             }
         }
-        Block::Code { code } => {
+        Block::Code { code, .. } => {
             out.push_str(code);
             out.push('\n');
         }
@@ -220,6 +226,7 @@ pub fn open_text(path: &Path, encoding: Option<&str>) -> Result<FlowDocument, St
             path: String::new(),
             title,
             blocks,
+            anchors: HashMap::new(),
             raw_source: raw,
         }],
         outline: Vec::new(),
@@ -233,6 +240,135 @@ pub fn open_markdown(path: &Path) -> Result<FlowDocument, String> {
     Ok(parse_markdown_document(&raw, base_dir.as_deref()))
 }
 
+fn load_relative_resource(base: &Path, rel: &str, resources: &mut HashMap<String, Vec<u8>>) {
+    if rel.is_empty() || rel.contains("://") || rel.starts_with("data:") || resources.contains_key(rel)
+    {
+        return;
+    }
+    let p = Path::new(rel);
+    if !p
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return;
+    }
+    if let Ok(root) = base.canonicalize()
+        && let Ok(cand) = root.join(p).canonicalize()
+        && cand.starts_with(&root)
+        && let Ok(bytes) = read_bytes(&cand)
+    {
+        resources.insert(rel.to_owned(), bytes);
+    }
+}
+
+pub fn open_html(path: &Path) -> Result<FlowDocument, String> {
+    let bytes = read_bytes(path)?;
+    let html = decode(&bytes, None)?;
+    let file_title = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "HTML 文档".to_owned());
+    let parsed_doc = Html::parse_document(&html);
+    let head_title = scraper::Selector::parse("title")
+        .ok()
+        .and_then(|sel| parsed_doc.select(&sel).next())
+        .map(|el| el.text().collect::<String>().trim().to_owned())
+        .filter(|t| !t.is_empty())
+        .unwrap_or(file_title);
+
+    let (blocks, img_paths, anchors) =
+        parse_xhtml_blocks_with_anchors(&html, "", 0, &HashMap::new());
+    let mut outline = Vec::new();
+    for block in &blocks {
+        if let Block::Heading {
+            level,
+            inlines,
+            anchor,
+        } = block
+        {
+            let mut text = String::new();
+            collect_inline_plain(inlines, &mut text);
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                let indent = "　".repeat(level.saturating_sub(1).min(4) as usize);
+                outline.push(OutlineEntry {
+                    title: format!("{indent}{trimmed}"),
+                    index: 0,
+                    fragment: anchor.clone().unwrap_or_default(),
+                });
+            }
+        }
+    }
+    let mut resources = HashMap::new();
+    if let Some(base) = path.parent() {
+        for rel in img_paths {
+            load_relative_resource(base, &rel, &mut resources);
+        }
+    }
+    Ok(FlowDocument {
+        kind: "html",
+        chapters: vec![FlowChapter {
+            path: String::new(),
+            title: head_title,
+            blocks,
+            anchors,
+            raw_source: html,
+        }],
+        outline,
+        resources,
+    })
+}
+
+pub fn open_xml(path: &Path) -> Result<FlowDocument, String> {
+    let bytes = read_bytes(path)?;
+    let xml = decode(&bytes, None)?;
+    let title = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "XML 文档".to_owned());
+    let mut blocks = Vec::new();
+    if let Ok(doc) = roxmltree::Document::parse(&xml) {
+        let mut lines = Vec::new();
+        for node in doc.descendants() {
+            if node.is_text()
+                && let Some(t) = node.text()
+            {
+                let trimmed = collapse_spaces(t.trim());
+                if !trimmed.is_empty() {
+                    lines.push(trimmed);
+                }
+            }
+        }
+        if lines.is_empty() {
+            blocks.push(Block::Code {
+                lang: "xml".to_owned(),
+                code: xml.clone(),
+            });
+        } else {
+            for line in lines {
+                blocks.push(Block::Paragraph(vec![Inline::Text(line)]));
+            }
+        }
+    } else {
+        blocks.push(Block::Code {
+            lang: "xml".to_owned(),
+            code: xml.clone(),
+        });
+    }
+    Ok(FlowDocument {
+        kind: "xml",
+        chapters: vec![FlowChapter {
+            path: String::new(),
+            title,
+            blocks,
+            anchors: HashMap::new(),
+            raw_source: xml,
+        }],
+        outline: Vec::new(),
+        resources: HashMap::new(),
+    })
+}
+
 pub fn open_epub(path: &Path) -> Result<FlowDocument, String> {
     let file = fs::File::open(path).map_err(|error| error.to_string())?;
     let mut zip = ZipArchive::new(file).map_err(|error| error.to_string())?;
@@ -243,7 +379,8 @@ pub fn open_epub(path: &Path) -> Result<FlowDocument, String> {
     for (idx, ch) in raw_chapters.into_iter().enumerate() {
         let data = zip_entry(&mut zip, &ch.path)?;
         let xhtml = decode(&data, None)?;
-        let (blocks, img_paths) = parse_xhtml_blocks(&xhtml, &ch.path, idx, &index_map);
+        let (blocks, img_paths, anchors) =
+            parse_xhtml_blocks_with_anchors(&xhtml, &ch.path, idx, &index_map);
         for res_path in img_paths {
             if !resources.contains_key(&res_path)
                 && let Ok(bytes) = zip_entry(&mut zip, &res_path)
@@ -255,6 +392,7 @@ pub fn open_epub(path: &Path) -> Result<FlowDocument, String> {
             path: ch.path,
             title: ch.title,
             blocks,
+            anchors,
             raw_source: xhtml,
         });
     }
@@ -314,7 +452,8 @@ pub fn open_kindle(path: &Path) -> Result<FlowDocument, String> {
             .get_section_raw(idx)
             .ok_or_else(|| "章节不存在".to_owned())?;
         let xhtml = section.raw_html.clone();
-        let (blocks, img_paths) = parse_xhtml_blocks(&xhtml, &meta.path, idx, &section_index);
+        let (blocks, img_paths, anchors) =
+            parse_xhtml_blocks_with_anchors(&xhtml, &meta.path, idx, &section_index);
         for res_path in img_paths {
             if !resources.contains_key(&res_path)
                 && let Ok((bytes, _)) = book
@@ -328,6 +467,7 @@ pub fn open_kindle(path: &Path) -> Result<FlowDocument, String> {
             path: meta.path,
             title: meta.title,
             blocks,
+            anchors,
             raw_source: xhtml,
         });
     }
@@ -618,6 +758,8 @@ fn push_inline_into_current(
             italic: style_italic,
             strike: style_strike,
             code: false,
+            superscript: false,
+            subscript: false,
             inlines,
         }]
     } else {
@@ -667,6 +809,7 @@ pub fn parse_markdown_document(raw: &str, base_dir: Option<&Path>) -> FlowDocume
     let mut cur_inlines: Vec<Inline> = Vec::new();
     let mut cur_heading_level = 1u8;
     let mut code_buf = String::new();
+    let mut code_lang = String::new();
     let mut table_headers: Vec<Vec<Inline>> = Vec::new();
     let mut table_rows: Vec<Vec<Vec<Inline>>> = Vec::new();
     let mut cur_row: Vec<Vec<Inline>> = Vec::new();
@@ -737,9 +880,17 @@ pub fn parse_markdown_document(raw: &str, base_dir: Option<&Path>) -> FlowDocume
                     block_stack.push(ContainerKind::ListItem);
                     current_item_blocks.push(Vec::new());
                 }
-                Tag::CodeBlock(_) => {
+                Tag::CodeBlock(kind) => {
                     block_stack.push(ContainerKind::Code);
                     code_buf.clear();
+                    code_lang = match kind {
+                        CodeBlockKind::Fenced(info) => info
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .to_owned(),
+                        CodeBlockKind::Indented => String::new(),
+                    };
                 }
                 Tag::Table(_) => {
                     block_stack.push(ContainerKind::Table);
@@ -871,6 +1022,7 @@ pub fn parse_markdown_document(raw: &str, base_dir: Option<&Path>) -> FlowDocume
                     block_stack.pop();
                     flush_block(
                         Block::Code {
+                            lang: std::mem::take(&mut code_lang),
                             code: std::mem::take(&mut code_buf),
                         },
                         &block_stack,
@@ -918,21 +1070,8 @@ pub fn parse_markdown_document(raw: &str, base_dir: Option<&Path>) -> FlowDocume
                 TagEnd::Image => {
                     in_image = false;
                     let rel = image_url.clone();
-                    if let Some(base) = base_dir
-                        && !rel.is_empty()
-                        && !rel.contains("://")
-                        && !resources.contains_key(&rel)
-                    {
-                        let p = Path::new(&rel);
-                        if p.components()
-                            .all(|c| matches!(c, std::path::Component::Normal(_)))
-                            && let Ok(root) = base.canonicalize()
-                            && let Ok(cand) = root.join(p).canonicalize()
-                            && cand.starts_with(&root)
-                            && let Ok(bytes) = read_bytes(&cand)
-                        {
-                            resources.insert(rel.clone(), bytes);
-                        }
+                    if let Some(base) = base_dir {
+                        load_relative_resource(base, &rel, &mut resources);
                     }
                     pending_blocks.push(Block::Image {
                         path: rel,
@@ -1014,6 +1153,8 @@ pub fn parse_markdown_document(raw: &str, base_dir: Option<&Path>) -> FlowDocume
                         italic: false,
                         strike: false,
                         code: true,
+                        superscript: false,
+                        subscript: false,
                         inlines: vec![Inline::Text(code.into_string())],
                     }],
                     bold,
@@ -1065,6 +1206,11 @@ pub fn parse_markdown_document(raw: &str, base_dir: Option<&Path>) -> FlowDocume
             path: String::new(),
             title: String::new(),
             blocks,
+            anchors: outline
+                .iter()
+                .enumerate()
+                .map(|(i, o)| (o.fragment.clone(), i))
+                .collect(),
             raw_source: raw.to_owned(),
         }],
         outline,
@@ -1072,48 +1218,35 @@ pub fn parse_markdown_document(raw: &str, base_dir: Option<&Path>) -> FlowDocume
     }
 }
 
-pub fn parse_xhtml_blocks(
+pub fn parse_xhtml_blocks_with_anchors(
     xhtml: &str,
     base_path: &str,
     chapter_index: usize,
     chapter_index_map: &HashMap<String, usize>,
-) -> (Vec<Block>, Vec<String>) {
-    let Ok(doc) = roxmltree::Document::parse(xhtml) else {
-        // Lenient fallback: treat readable plain text if non-well-formed HTML
-        let stripped = strip_html_tags(xhtml);
-        return (parse_plain_text_blocks(&stripped), Vec::new());
+) -> (Vec<Block>, Vec<String>, HashMap<String, usize>) {
+    let doc = Html::parse_document(xhtml);
+    let root_ref = if let Some(body_el) = scraper::Selector::parse("body")
+        .ok()
+        .and_then(|sel| doc.select(&sel).next())
+    {
+        *body_el
+    } else {
+        *doc.root_element()
     };
-    let root = doc
-        .descendants()
-        .find(|n| n.has_tag_name("body"))
-        .unwrap_or_else(|| doc.root_element());
     let mut ctx = XhtmlCtx {
         base_path,
         chapter_index,
         chapter_index_map,
         image_paths: Vec::new(),
+        anchors: HashMap::new(),
     };
     let mut blocks = Vec::new();
     let mut loose_inlines = Vec::new();
-    collect_xhtml_blocks(root, &mut ctx, &mut blocks, &mut loose_inlines);
+    collect_xhtml_blocks(root_ref, &mut ctx, &mut blocks, &mut loose_inlines);
     if !loose_inlines.is_empty() {
         blocks.push(Block::Paragraph(loose_inlines));
     }
-    (blocks, ctx.image_paths)
-}
-
-fn strip_html_tags(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut in_tag = false;
-    for ch in raw.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    out
+    (blocks, ctx.image_paths, ctx.anchors)
 }
 
 struct XhtmlCtx<'a> {
@@ -1121,50 +1254,63 @@ struct XhtmlCtx<'a> {
     chapter_index: usize,
     chapter_index_map: &'a HashMap<String, usize>,
     image_paths: Vec<String>,
+    anchors: HashMap<String, usize>,
 }
 
-fn collect_ruby_inlines(ruby_node: roxmltree::Node<'_, '_>, out: &mut Vec<Inline>) {
+fn record_node_anchor(node: NodeRef<'_, Node>, ctx: &mut XhtmlCtx<'_>, block_idx: usize) {
+    if let Node::Element(el) = node.value() {
+        if let Some(id) = el.attr("id").map(str::trim).filter(|s| !s.is_empty()) {
+            ctx.anchors.entry(id.to_owned()).or_insert(block_idx);
+        }
+        if el.name() == "a"
+            && let Some(name) = el.attr("name").map(str::trim).filter(|s| !s.is_empty())
+        {
+            ctx.anchors.entry(name.to_owned()).or_insert(block_idx);
+        }
+    }
+}
+
+fn collect_ruby_inlines(ruby_node: NodeRef<'_, Node>, out: &mut Vec<Inline>) {
     let mut pending_base = String::new();
     let mut has_rt = false;
     for child in ruby_node.children() {
-        if child.is_text() {
-            let t = child.text().unwrap_or("");
-            if !t.trim().is_empty() {
-                pending_base.push_str(t.trim());
-            }
-            continue;
-        }
-        if !child.is_element() {
-            continue;
-        }
-        match child.tag_name().name() {
-            "rp" => {}
-            "rb" | "rbc" => {
-                if has_rt && !pending_base.is_empty() {
-                    out.push(Inline::Text(std::mem::take(&mut pending_base)));
-                    has_rt = false;
+        match child.value() {
+            Node::Text(t) => {
+                let s = t.text.trim();
+                if !s.is_empty() {
+                    pending_base.push_str(s);
                 }
-                collect_plain_element_text(child, &mut pending_base);
             }
-            "rt" | "rtc" => {
-                let mut rt_text = String::new();
-                collect_plain_element_text(child, &mut rt_text);
-                let rt_trimmed = rt_text.trim().to_owned();
-                let base_trimmed = std::mem::take(&mut pending_base).trim().to_owned();
-                if !base_trimmed.is_empty() {
-                    if !rt_trimmed.is_empty() {
-                        out.push(Inline::Ruby {
-                            base: base_trimmed,
-                            annotation: rt_trimmed,
-                        });
-                    } else {
-                        out.push(Inline::Text(base_trimmed));
+            Node::Element(el) => match el.name() {
+                "rp" => {}
+                "rb" | "rbc" => {
+                    if has_rt && !pending_base.is_empty() {
+                        out.push(Inline::Text(std::mem::take(&mut pending_base)));
+                        has_rt = false;
                     }
+                    collect_plain_element_text(child, &mut pending_base);
                 }
-                has_rt = true;
-            }
-            "ruby" => collect_ruby_inlines(child, out),
-            _ => collect_plain_element_text(child, &mut pending_base),
+                "rt" | "rtc" => {
+                    let mut rt_text = String::new();
+                    collect_plain_element_text(child, &mut rt_text);
+                    let rt_trimmed = rt_text.trim().to_owned();
+                    let base_trimmed = std::mem::take(&mut pending_base).trim().to_owned();
+                    if !base_trimmed.is_empty() {
+                        if !rt_trimmed.is_empty() {
+                            out.push(Inline::Ruby {
+                                base: base_trimmed,
+                                annotation: rt_trimmed,
+                            });
+                        } else {
+                            out.push(Inline::Text(base_trimmed));
+                        }
+                    }
+                    has_rt = true;
+                }
+                "ruby" => collect_ruby_inlines(child, out),
+                _ => collect_plain_element_text(child, &mut pending_base),
+            },
+            _ => {}
         }
     }
     if !pending_base.trim().is_empty() {
@@ -1172,13 +1318,14 @@ fn collect_ruby_inlines(ruby_node: roxmltree::Node<'_, '_>, out: &mut Vec<Inline
     }
 }
 
-fn collect_plain_element_text(node: roxmltree::Node<'_, '_>, out: &mut String) {
-    if node.is_text() {
-        out.push_str(node.text().unwrap_or(""));
-        return;
-    }
-    if node.is_element() && node.tag_name().name() == "rp" {
-        return;
+fn collect_plain_element_text(node: NodeRef<'_, Node>, out: &mut String) {
+    match node.value() {
+        Node::Text(t) => {
+            out.push_str(&t.text);
+            return;
+        }
+        Node::Element(el) if el.name() == "rp" => return,
+        _ => {}
     }
     for child in node.children() {
         collect_plain_element_text(child, out);
@@ -1210,417 +1357,440 @@ fn parse_link_target(href: &str, ctx: &XhtmlCtx<'_>) -> Option<LinkTarget> {
     None
 }
 
+fn has_meaningful_following_siblings(node: NodeRef<'_, Node>) -> bool {
+    let mut cur = node.next_sibling();
+    while let Some(sib) = cur {
+        match sib.value() {
+            Node::Text(t) if !t.text.trim().is_empty() => return true,
+            Node::Element(el) if !matches!(el.name(), "script" | "style" | "br") => return true,
+            _ => {}
+        }
+        cur = sib.next_sibling();
+    }
+    false
+}
+
 fn collect_xhtml_inlines(
-    node: roxmltree::Node<'_, '_>,
+    node: NodeRef<'_, Node>,
     ctx: &mut XhtmlCtx<'_>,
     blocks: &mut Vec<Block>,
     cur_inlines: &mut Vec<Inline>,
     ended_with_newline: &mut bool,
 ) {
     for child in node.children() {
-        if child.is_text() {
-            let text = child.text().unwrap_or("");
-            if text.is_empty() {
-                continue;
-            }
-            let collapse_ws = text.replace(['\r', '\t'], " ");
-            if !collapse_ws.contains('$') && !collapse_ws.contains(r"\(") && !collapse_ws.contains(r"\[")
-            {
-                let compacted = collapse_spaces(&collapse_ws);
-                if !compacted.is_empty() {
-                    *ended_with_newline = collapse_ws.ends_with('\n');
-                    push_plain_segment_with_links(&compacted, cur_inlines);
-                } else if collapse_ws.contains('\n') {
-                    *ended_with_newline = true;
+        match child.value() {
+            Node::Text(t) => {
+                let text = t.text.as_ref();
+                if text.is_empty() {
+                    continue;
                 }
-                continue;
-            }
-            let start_nl = *ended_with_newline || cur_inlines.is_empty();
-            for seg in split_math_segments(&collapse_ws, start_nl) {
-                match seg {
-                    MathSegment::Text(t) => {
-                        let compacted = collapse_spaces(t);
-                        if !compacted.is_empty() {
-                            *ended_with_newline = t.ends_with('\n');
-                            push_plain_segment_with_links(&compacted, cur_inlines);
+                let collapse_ws = text.replace(['\r', '\t'], " ");
+                if !collapse_ws.contains('$')
+                    && !collapse_ws.contains(r"\(")
+                    && !collapse_ws.contains(r"\[")
+                {
+                    let compacted = collapse_spaces(&collapse_ws);
+                    if !compacted.is_empty() {
+                        *ended_with_newline = collapse_ws.ends_with('\n');
+                        push_plain_segment_with_links(&compacted, cur_inlines);
+                    } else if collapse_ws.contains('\n') && !cur_inlines.is_empty() {
+                        *ended_with_newline = true;
+                    }
+                    continue;
+                }
+                let start_nl = *ended_with_newline;
+                for seg in split_math_segments(&collapse_ws, start_nl) {
+                    match seg {
+                        MathSegment::Text(t) => {
+                            let compacted = collapse_spaces(t);
+                            if !compacted.is_empty() {
+                                *ended_with_newline = t.ends_with('\n');
+                                push_plain_segment_with_links(&compacted, cur_inlines);
+                            }
+                        }
+                        MathSegment::Inline(latex) => {
+                            *ended_with_newline = false;
+                            cur_inlines.push(Inline::InlineMath { latex });
+                        }
+                        MathSegment::Display(latex) => {
+                            if !cur_inlines.is_empty() {
+                                blocks.push(Block::Paragraph(std::mem::take(cur_inlines)));
+                            }
+                            blocks.push(Block::DisplayMath { latex });
+                            *ended_with_newline = true;
                         }
                     }
-                    MathSegment::Inline(latex) => {
-                        *ended_with_newline = false;
-                        cur_inlines.push(Inline::InlineMath { latex });
+                }
+            }
+            Node::Element(el) => {
+                record_node_anchor(child, ctx, blocks.len());
+                match el.name() {
+                    "script" | "style" | "head" | "rp" => {}
+                    "br" => {
+                        cur_inlines.push(Inline::LineBreak);
+                        *ended_with_newline = true;
                     }
-                    MathSegment::Display(latex) => {
+                    "ruby" => {
+                        *ended_with_newline = false;
+                        collect_ruby_inlines(child, cur_inlines);
+                    }
+                    "math" => {
+                        if let Some(el_ref) = ElementRef::wrap(child) {
+                            let latex = mathml_element_to_latex(el_ref);
+                            if !latex.trim().is_empty() {
+                                let is_sole_in_block =
+                                    cur_inlines.is_empty() && !has_meaningful_following_siblings(child);
+                                let is_block = el.attr("display") == Some("block")
+                                    || *ended_with_newline
+                                    || is_sole_in_block;
+                                if is_block {
+                                    if !cur_inlines.is_empty() {
+                                        blocks.push(Block::Paragraph(std::mem::take(cur_inlines)));
+                                    }
+                                    blocks.push(Block::DisplayMath { latex });
+                                    *ended_with_newline = true;
+                                } else {
+                                    *ended_with_newline = false;
+                                    cur_inlines.push(Inline::InlineMath { latex });
+                                }
+                            }
+                        }
+                    }
+                    "strong" | "b" | "em" | "i" | "s" | "del" | "code" | "kbd" | "sup" | "sub" => {
+                        *ended_with_newline = false;
+                        let tag_name = el.name();
+                        let mut inner = Vec::new();
+                        collect_xhtml_inlines(child, ctx, blocks, &mut inner, ended_with_newline);
+                        if !inner.is_empty() {
+                            cur_inlines.push(Inline::Styled {
+                                bold: matches!(tag_name, "strong" | "b"),
+                                italic: matches!(tag_name, "em" | "i"),
+                                strike: matches!(tag_name, "s" | "del"),
+                                code: matches!(tag_name, "code" | "kbd"),
+                                superscript: tag_name == "sup",
+                                subscript: tag_name == "sub",
+                                inlines: inner,
+                            });
+                        }
+                    }
+                    "a" => {
+                        *ended_with_newline = false;
+                        let mut inner = Vec::new();
+                        collect_xhtml_inlines(child, ctx, blocks, &mut inner, ended_with_newline);
+                        if !inner.is_empty() {
+                            if let Some(target) =
+                                el.attr("href").and_then(|href| parse_link_target(href, ctx))
+                            {
+                                cur_inlines.push(Inline::Link {
+                                    target,
+                                    inlines: inner,
+                                });
+                            } else {
+                                cur_inlines.extend(inner);
+                            }
+                        }
+                    }
+                    "img" | "image" => {
                         if !cur_inlines.is_empty() {
                             blocks.push(Block::Paragraph(std::mem::take(cur_inlines)));
                         }
-                        blocks.push(Block::DisplayMath { latex });
-                        *ended_with_newline = true;
-                    }
-                }
-            }
-            continue;
-        }
-        if !child.is_element() {
-            continue;
-        }
-        match child.tag_name().name() {
-            "script" | "style" | "head" | "rp" => {}
-            "br" => {
-                cur_inlines.push(Inline::LineBreak);
-                *ended_with_newline = true;
-            }
-            "ruby" => {
-                *ended_with_newline = false;
-                collect_ruby_inlines(child, cur_inlines);
-            }
-            "math" => {
-                let latex = mathml_to_latex(child);
-                if !latex.trim().is_empty() {
-                    let is_block = child.attribute("display") == Some("block") || *ended_with_newline;
-                    if is_block {
-                        if !cur_inlines.is_empty() {
-                            blocks.push(Block::Paragraph(std::mem::take(cur_inlines)));
+                        let src = el
+                            .attr("src")
+                            .or_else(|| el.attr("href"))
+                            .or_else(|| el.attr("xlink:href"))
+                            .unwrap_or("");
+                        if let Some((path, _)) = resolve_with_fragment(ctx.base_path, src) {
+                            ctx.image_paths.push(path.clone());
+                            blocks.push(Block::Image {
+                                path,
+                                alt: el.attr("alt").unwrap_or("").to_owned(),
+                            });
                         }
-                        blocks.push(Block::DisplayMath { latex });
                         *ended_with_newline = true;
-                    } else {
-                        *ended_with_newline = false;
-                        cur_inlines.push(Inline::InlineMath { latex });
                     }
+                    _ => collect_xhtml_inlines(child, ctx, blocks, cur_inlines, ended_with_newline),
                 }
             }
-            "strong" | "b" => {
-                *ended_with_newline = false;
-                let mut inner = Vec::new();
-                collect_xhtml_inlines(child, ctx, blocks, &mut inner, ended_with_newline);
-                if !inner.is_empty() {
-                    cur_inlines.push(Inline::Styled {
-                        bold: true,
-                        italic: false,
-                        strike: false,
-                        code: false,
-                        inlines: inner,
-                    });
-                }
-            }
-            "em" | "i" => {
-                *ended_with_newline = false;
-                let mut inner = Vec::new();
-                collect_xhtml_inlines(child, ctx, blocks, &mut inner, ended_with_newline);
-                if !inner.is_empty() {
-                    cur_inlines.push(Inline::Styled {
-                        bold: false,
-                        italic: true,
-                        strike: false,
-                        code: false,
-                        inlines: inner,
-                    });
-                }
-            }
-            "s" | "del" => {
-                *ended_with_newline = false;
-                let mut inner = Vec::new();
-                collect_xhtml_inlines(child, ctx, blocks, &mut inner, ended_with_newline);
-                if !inner.is_empty() {
-                    cur_inlines.push(Inline::Styled {
-                        bold: false,
-                        italic: false,
-                        strike: true,
-                        code: false,
-                        inlines: inner,
-                    });
-                }
-            }
-            "code" | "kbd" => {
-                *ended_with_newline = false;
-                let mut inner = Vec::new();
-                collect_xhtml_inlines(child, ctx, blocks, &mut inner, ended_with_newline);
-                if !inner.is_empty() {
-                    cur_inlines.push(Inline::Styled {
-                        bold: false,
-                        italic: false,
-                        strike: false,
-                        code: true,
-                        inlines: inner,
-                    });
-                }
-            }
-            "a" => {
-                *ended_with_newline = false;
-                let mut inner = Vec::new();
-                collect_xhtml_inlines(child, ctx, blocks, &mut inner, ended_with_newline);
-                if !inner.is_empty() {
-                    if let Some(target) = child
-                        .attribute("href")
-                        .and_then(|href| parse_link_target(href, ctx))
-                    {
-                        cur_inlines.push(Inline::Link {
-                            target,
-                            inlines: inner,
-                        });
-                    } else {
-                        cur_inlines.extend(inner);
-                    }
-                }
-            }
-            "img" | "image" => {
-                if !cur_inlines.is_empty() {
-                    blocks.push(Block::Paragraph(std::mem::take(cur_inlines)));
-                }
-                let src = child
-                    .attribute("src")
-                    .or_else(|| child.attribute("href"))
-                    .or_else(|| child.attribute(("http://www.w3.org/1999/xlink", "href")))
-                    .unwrap_or("");
-                if let Some((path, _)) = resolve_with_fragment(ctx.base_path, src) {
-                    ctx.image_paths.push(path.clone());
-                    blocks.push(Block::Image {
-                        path,
-                        alt: child.attribute("alt").unwrap_or("").to_owned(),
-                    });
-                }
-                *ended_with_newline = true;
-            }
-            _ => collect_xhtml_inlines(child, ctx, blocks, cur_inlines, ended_with_newline),
+            _ => {}
         }
     }
 }
 
+fn extract_code_lang(node: NodeRef<'_, Node>) -> String {
+    for candidate in std::iter::once(node).chain(node.children()) {
+        if let Node::Element(el) = candidate.value()
+            && let Some(cls) = el.attr("class")
+        {
+            for tok in cls.split_whitespace() {
+                if let Some(lang) = tok.strip_prefix("language-").or_else(|| tok.strip_prefix("lang-"))
+                    && !lang.is_empty()
+                {
+                    return lang.to_owned();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 fn collect_xhtml_blocks(
-    node: roxmltree::Node<'_, '_>,
+    node: NodeRef<'_, Node>,
     ctx: &mut XhtmlCtx<'_>,
     blocks: &mut Vec<Block>,
     loose_inlines: &mut Vec<Inline>,
 ) {
-    let mut ended_with_newline = true;
+    let mut ended_with_newline = false;
     for child in node.children() {
-        if child.is_text() {
-            let text = child.text().unwrap_or("");
-            if text.trim().is_empty() {
-                if text.contains('\n') {
-                    ended_with_newline = true;
+        match child.value() {
+            Node::Text(t) => {
+                let text = t.text.as_ref();
+                if text.trim().is_empty() {
+                    if text.contains('\n') && !loose_inlines.is_empty() {
+                        ended_with_newline = true;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            let mut single_inlines = Vec::new();
-            let mut single_node_vec = Vec::new();
-            let start_nl = ended_with_newline || loose_inlines.is_empty();
-            for seg in split_math_segments(text, start_nl) {
-                match seg {
-                    MathSegment::Text(t) => {
-                        let c = collapse_spaces(t);
-                        if !c.is_empty() {
-                            push_plain_segment_with_links(&c, &mut single_inlines);
+                let mut single_inlines = Vec::new();
+                let mut single_node_vec = Vec::new();
+                let start_nl = ended_with_newline;
+                for seg in split_math_segments(text, start_nl) {
+                    match seg {
+                        MathSegment::Text(s) => {
+                            let c = collapse_spaces(s);
+                            if !c.is_empty() {
+                                push_plain_segment_with_links(&c, &mut single_inlines);
+                            }
                         }
-                    }
-                    MathSegment::Inline(latex) => {
-                        single_inlines.push(Inline::InlineMath { latex });
-                    }
-                    MathSegment::Display(latex) => {
-                        if !single_inlines.is_empty() {
-                            single_node_vec.push(Block::Paragraph(std::mem::take(&mut single_inlines)));
+                        MathSegment::Inline(latex) => {
+                            single_inlines.push(Inline::InlineMath { latex });
                         }
-                        single_node_vec.push(Block::DisplayMath { latex });
-                    }
-                }
-            }
-            loose_inlines.extend(single_inlines);
-            if !single_node_vec.is_empty() {
-                if !loose_inlines.is_empty() {
-                    blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
-                }
-                blocks.extend(single_node_vec);
-            }
-            ended_with_newline = text.ends_with('\n');
-            continue;
-        }
-        if !child.is_element() {
-            continue;
-        }
-        let tag = child.tag_name().name();
-        match tag {
-            "script" | "style" | "head" | "title" => {}
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                if !loose_inlines.is_empty() {
-                    blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
-                }
-                let level = tag[1..].parse::<u8>().unwrap_or(1);
-                let mut inlines = Vec::new();
-                let mut sub_blocks = Vec::new();
-                let mut nl = false;
-                collect_xhtml_inlines(child, ctx, &mut sub_blocks, &mut inlines, &mut nl);
-                let anchor = child.attribute("id").map(str::to_owned);
-                if !inlines.is_empty() {
-                    blocks.push(Block::Heading {
-                        level,
-                        inlines,
-                        anchor,
-                    });
-                }
-                blocks.extend(sub_blocks);
-                ended_with_newline = true;
-            }
-            "p" => {
-                if !loose_inlines.is_empty() {
-                    blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
-                }
-                let mut inlines = Vec::new();
-                let mut nl = true;
-                collect_xhtml_inlines(child, ctx, blocks, &mut inlines, &mut nl);
-                if !inlines.is_empty() {
-                    blocks.push(Block::Paragraph(inlines));
-                }
-                ended_with_newline = true;
-            }
-            "blockquote" => {
-                if !loose_inlines.is_empty() {
-                    blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
-                }
-                let mut inner_blocks = Vec::new();
-                let mut inner_loose = Vec::new();
-                collect_xhtml_blocks(child, ctx, &mut inner_blocks, &mut inner_loose);
-                if !inner_loose.is_empty() {
-                    inner_blocks.push(Block::Paragraph(inner_loose));
-                }
-                if !inner_blocks.is_empty() {
-                    blocks.push(Block::Quote(inner_blocks));
-                }
-                ended_with_newline = true;
-            }
-            "pre" => {
-                if !loose_inlines.is_empty() {
-                    blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
-                }
-                let mut code = String::new();
-                collect_plain_element_text(child, &mut code);
-                if !code.is_empty() {
-                    blocks.push(Block::Code { code });
-                }
-                ended_with_newline = true;
-            }
-            "ul" | "ol" => {
-                if !loose_inlines.is_empty() {
-                    blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
-                }
-                let ordered = tag == "ol";
-                let mut items = Vec::new();
-                for li in child.children().filter(|n| n.is_element() && n.tag_name().name() == "li") {
-                    let mut item_blocks = Vec::new();
-                    let mut item_loose = Vec::new();
-                    collect_xhtml_blocks(li, ctx, &mut item_blocks, &mut item_loose);
-                    if !item_loose.is_empty() {
-                        item_blocks.push(Block::Paragraph(item_loose));
-                    }
-                    if !item_blocks.is_empty() {
-                        items.push(item_blocks);
-                    }
-                }
-                if !items.is_empty() {
-                    blocks.push(Block::List { ordered, items });
-                }
-                ended_with_newline = true;
-            }
-            "table" => {
-                if !loose_inlines.is_empty() {
-                    blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
-                }
-                let mut headers = Vec::new();
-                let mut rows = Vec::new();
-                for tr in child.descendants().filter(|n| n.is_element() && n.tag_name().name() == "tr") {
-                    let mut row = Vec::new();
-                    let mut is_header_row = false;
-                    for cell in tr.children().filter(|n| {
-                        n.is_element() && matches!(n.tag_name().name(), "th" | "td")
-                    }) {
-                        if cell.tag_name().name() == "th" {
-                            is_header_row = true;
-                        }
-                        let mut cell_inlines = Vec::new();
-                        let mut cell_blocks = Vec::new();
-                        let mut nl = false;
-                        collect_xhtml_inlines(cell, ctx, &mut cell_blocks, &mut cell_inlines, &mut nl);
-                        row.push(cell_inlines);
-                    }
-                    if !row.is_empty() {
-                        if is_header_row && headers.is_empty() {
-                            headers = row;
-                        } else {
-                            rows.push(row);
+                        MathSegment::Display(latex) => {
+                            if !single_inlines.is_empty() {
+                                single_node_vec
+                                    .push(Block::Paragraph(std::mem::take(&mut single_inlines)));
+                            }
+                            single_node_vec.push(Block::DisplayMath { latex });
                         }
                     }
                 }
-                if !headers.is_empty() || !rows.is_empty() {
-                    blocks.push(Block::Table { headers, rows });
+                loose_inlines.extend(single_inlines);
+                if !single_node_vec.is_empty() {
+                    if !loose_inlines.is_empty() {
+                        blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
+                    }
+                    blocks.extend(single_node_vec);
                 }
-                ended_with_newline = true;
+                ended_with_newline = text.ends_with('\n');
             }
-            "hr" => {
-                if !loose_inlines.is_empty() {
-                    blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
-                }
-                blocks.push(Block::Rule);
-                ended_with_newline = true;
-            }
-            "div" | "section" | "article" | "figure" | "figcaption" | "aside" | "main"
-            | "header" | "footer" | "body" => {
-                if !loose_inlines.is_empty() {
-                    blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
-                }
-                let mut sub_loose = Vec::new();
-                collect_xhtml_blocks(child, ctx, blocks, &mut sub_loose);
-                if !sub_loose.is_empty() {
-                    blocks.push(Block::Paragraph(sub_loose));
-                }
-                ended_with_newline = true;
-            }
-            "math" => {
-                let latex = mathml_to_latex(child);
-                if !latex.trim().is_empty() {
-                    let is_block = child.attribute("display") == Some("block")
-                        || (ended_with_newline && loose_inlines.is_empty());
-                    if is_block {
+            Node::Element(el) => {
+                let flush_block_idx = blocks.len() + usize::from(!loose_inlines.is_empty());
+                record_node_anchor(child, ctx, flush_block_idx);
+                let tag = el.name();
+                match tag {
+                    "script" | "style" | "head" | "title" => {}
+                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                         if !loose_inlines.is_empty() {
                             blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
                         }
-                        blocks.push(Block::DisplayMath { latex });
-                        ended_with_newline = true;
-                    } else {
+                        let level = tag[1..].parse::<u8>().unwrap_or(1);
+                        let mut inlines = Vec::new();
+                        let mut sub_blocks = Vec::new();
+                        let mut nl = false;
+                        collect_xhtml_inlines(child, ctx, &mut sub_blocks, &mut inlines, &mut nl);
+                        let anchor = el.attr("id").map(str::to_owned);
+                        if !inlines.is_empty() {
+                            blocks.push(Block::Heading {
+                                level,
+                                inlines,
+                                anchor,
+                            });
+                        }
+                        blocks.extend(sub_blocks);
                         ended_with_newline = false;
-                        loose_inlines.push(Inline::InlineMath { latex });
+                    }
+                    "p" => {
+                        if !loose_inlines.is_empty() {
+                            blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
+                        }
+                        let mut inlines = Vec::new();
+                        let mut nl = false;
+                        collect_xhtml_inlines(child, ctx, blocks, &mut inlines, &mut nl);
+                        if !inlines.is_empty() {
+                            blocks.push(Block::Paragraph(inlines));
+                        }
+                        ended_with_newline = false;
+                    }
+                    "blockquote" => {
+                        if !loose_inlines.is_empty() {
+                            blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
+                        }
+                        let mut inner_blocks = Vec::new();
+                        let mut inner_loose = Vec::new();
+                        collect_xhtml_blocks(child, ctx, &mut inner_blocks, &mut inner_loose);
+                        if !inner_loose.is_empty() {
+                            inner_blocks.push(Block::Paragraph(inner_loose));
+                        }
+                        if !inner_blocks.is_empty() {
+                            blocks.push(Block::Quote(inner_blocks));
+                        }
+                        ended_with_newline = false;
+                    }
+                    "pre" => {
+                        if !loose_inlines.is_empty() {
+                            blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
+                        }
+                        let lang = extract_code_lang(child);
+                        let mut code = String::new();
+                        collect_plain_element_text(child, &mut code);
+                        if !code.is_empty() {
+                            blocks.push(Block::Code { lang, code });
+                        }
+                        ended_with_newline = false;
+                    }
+                    "ul" | "ol" => {
+                        if !loose_inlines.is_empty() {
+                            blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
+                        }
+                        let ordered = tag == "ol";
+                        let mut items = Vec::new();
+                        for li in child.children().filter(|n| {
+                            matches!(n.value(), Node::Element(e) if e.name() == "li")
+                        }) {
+                            let mut item_blocks = Vec::new();
+                            let mut item_loose = Vec::new();
+                            collect_xhtml_blocks(li, ctx, &mut item_blocks, &mut item_loose);
+                            if !item_loose.is_empty() {
+                                item_blocks.push(Block::Paragraph(item_loose));
+                            }
+                            if !item_blocks.is_empty() {
+                                items.push(item_blocks);
+                            }
+                        }
+                        if !items.is_empty() {
+                            blocks.push(Block::List { ordered, items });
+                        }
+                        ended_with_newline = false;
+                    }
+                    "table" => {
+                        if !loose_inlines.is_empty() {
+                            blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
+                        }
+                        let mut headers = Vec::new();
+                        let mut rows = Vec::new();
+                        if let Some(table_ref) = ElementRef::wrap(child)
+                            && let Ok(tr_sel) = scraper::Selector::parse("tr")
+                        {
+                            for tr in table_ref.select(&tr_sel) {
+                                let mut row = Vec::new();
+                                let mut is_header_row = false;
+                                for cell_ref in tr.child_elements() {
+                                    let cname = cell_ref.value().name();
+                                    if !matches!(cname, "th" | "td") {
+                                        continue;
+                                    }
+                                    if cname == "th" {
+                                        is_header_row = true;
+                                    }
+                                    let mut cell_inlines = Vec::new();
+                                    let mut cell_blocks = Vec::new();
+                                    let mut nl = false;
+                                    collect_xhtml_inlines(
+                                        *cell_ref,
+                                        ctx,
+                                        &mut cell_blocks,
+                                        &mut cell_inlines,
+                                        &mut nl,
+                                    );
+                                    row.push(cell_inlines);
+                                }
+                                if !row.is_empty() {
+                                    if is_header_row && headers.is_empty() {
+                                        headers = row;
+                                    } else {
+                                        rows.push(row);
+                                    }
+                                }
+                            }
+                        }
+                        if !headers.is_empty() || !rows.is_empty() {
+                            blocks.push(Block::Table { headers, rows });
+                        }
+                        ended_with_newline = false;
+                    }
+                    "hr" => {
+                        if !loose_inlines.is_empty() {
+                            blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
+                        }
+                        blocks.push(Block::Rule);
+                        ended_with_newline = false;
+                    }
+                    "div" | "section" | "article" | "figure" | "figcaption" | "aside" | "main"
+                    | "header" | "footer" | "body" => {
+                        if !loose_inlines.is_empty() {
+                            blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
+                        }
+                        let mut sub_loose = Vec::new();
+                        collect_xhtml_blocks(child, ctx, blocks, &mut sub_loose);
+                        if !sub_loose.is_empty() {
+                            blocks.push(Block::Paragraph(sub_loose));
+                        }
+                        ended_with_newline = false;
+                    }
+                    "math" => {
+                        if let Some(el_ref) = ElementRef::wrap(child) {
+                            let latex = mathml_element_to_latex(el_ref);
+                            if !latex.trim().is_empty() {
+                                let is_sole_in_block = loose_inlines.is_empty()
+                                    && !has_meaningful_following_siblings(child);
+                                let is_block = el.attr("display") == Some("block")
+                                    || ended_with_newline
+                                    || is_sole_in_block;
+                                if is_block {
+                                    if !loose_inlines.is_empty() {
+                                        blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
+                                    }
+                                    blocks.push(Block::DisplayMath { latex });
+                                    ended_with_newline = true;
+                                } else {
+                                    ended_with_newline = false;
+                                    loose_inlines.push(Inline::InlineMath { latex });
+                                }
+                            }
+                        }
+                    }
+                    "img" | "image" => {
+                        if !loose_inlines.is_empty() {
+                            blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
+                        }
+                        let src = el
+                            .attr("src")
+                            .or_else(|| el.attr("href"))
+                            .or_else(|| el.attr("xlink:href"))
+                            .unwrap_or("");
+                        if let Some((path, _)) = resolve_with_fragment(ctx.base_path, src) {
+                            ctx.image_paths.push(path.clone());
+                            blocks.push(Block::Image {
+                                path,
+                                alt: el.attr("alt").unwrap_or("").to_owned(),
+                            });
+                        }
+                        ended_with_newline = false;
+                    }
+                    _ => {
+                        let mut nl = ended_with_newline;
+                        let mut sub_inlines = Vec::new();
+                        if tag == "ruby" {
+                            collect_ruby_inlines(child, &mut sub_inlines);
+                            loose_inlines.extend(sub_inlines);
+                            ended_with_newline = false;
+                        } else {
+                            collect_xhtml_inlines(child, ctx, blocks, loose_inlines, &mut nl);
+                            ended_with_newline = nl;
+                        }
                     }
                 }
             }
-            "img" | "image" => {
-                if !loose_inlines.is_empty() {
-                    blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
-                }
-                let src = child
-                    .attribute("src")
-                    .or_else(|| child.attribute("href"))
-                    .or_else(|| child.attribute(("http://www.w3.org/1999/xlink", "href")))
-                    .unwrap_or("");
-                if let Some((path, _)) = resolve_with_fragment(ctx.base_path, src) {
-                    ctx.image_paths.push(path.clone());
-                    blocks.push(Block::Image {
-                        path,
-                        alt: child.attribute("alt").unwrap_or("").to_owned(),
-                    });
-                }
-                ended_with_newline = true;
-            }
-            _ => {
-                // Inline element at block container level
-                let mut nl = ended_with_newline && loose_inlines.is_empty();
-                let mut sub_inlines = Vec::new();
-                if tag == "ruby" {
-                    collect_ruby_inlines(child, &mut sub_inlines);
-                    loose_inlines.extend(sub_inlines);
-                    ended_with_newline = false;
-                } else {
-                    collect_xhtml_inlines(child, ctx, blocks, loose_inlines, &mut nl);
-                    ended_with_newline = nl;
-                }
-            }
+            _ => {}
         }
     }
 }
@@ -2026,11 +2196,14 @@ mod tests {
     #[test]
     fn parses_ruby_furigana_and_mathml_from_xhtml() {
         let xhtml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
-<p><ruby><rb>異世界</rb><rp>(</rp><rt>いせかい</rt><rp>)</rp></ruby>へようこそ！行内数式：<math><msup><mi>x</mi><mn>2</mn></msup></math>。</p>
-<p>单独公式：
+<p id="p1"><ruby><rb>異世界</rb><rp>(</rp><rt>いせかい</rt><rp>)</rp></ruby>へようこそ！行内数式：<math><msup><mi>x</mi><mn>2</mn></msup></math>。</p>
+<p id="p2">单独公式：
 <math><mfrac><mn>1</mn><mn>3</mn></mfrac></math></p>
 </body></html>"#;
-        let (blocks, _) = parse_xhtml_blocks(xhtml, "OEBPS/ch1.xhtml", 0, &HashMap::new());
+        let (blocks, _, anchors) =
+            parse_xhtml_blocks_with_anchors(xhtml, "OEBPS/ch1.xhtml", 0, &HashMap::new());
+        assert_eq!(anchors.get("p1").copied(), Some(0));
+        assert_eq!(anchors.get("p2").copied(), Some(1));
         assert_eq!(
             blocks[0],
             Block::Paragraph(vec![
@@ -2040,7 +2213,7 @@ mod tests {
                 },
                 Inline::Text("へようこそ！行内数式：".to_owned()),
                 Inline::InlineMath {
-                    latex: "{x}^{2}".to_owned()
+                    latex: "x^{2}".to_owned()
                 },
                 Inline::Text("。".to_owned()),
             ])
@@ -2055,6 +2228,28 @@ mod tests {
                 latex: r"\frac{1}{3}".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn parses_html5_clean_mode_and_xml_code_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let html_path = dir.path().join("article.html");
+        fs::write(
+            &html_path,
+            "<!doctype html><html><head><title>测试页</title></head><body><h1>第一章</h1><p>A &times; B<br>欢迎阅读</p></body></html>",
+        )
+        .unwrap();
+        let hdoc = open_html(&html_path).unwrap();
+        assert_eq!(hdoc.kind, "html");
+        assert_eq!(hdoc.chapters[0].title, "测试页");
+        assert!(!hdoc.chapters[0].raw_source.is_empty());
+        assert_eq!(hdoc.outline.len(), 1);
+
+        let xml_path = dir.path().join("data.xml");
+        fs::write(&xml_path, "<root><item id=\"1\">Hello XML</item></root>").unwrap();
+        let xdoc = open_xml(&xml_path).unwrap();
+        assert_eq!(xdoc.kind, "xml");
+        assert!(xdoc.chapters[0].raw_source.contains("<item"));
     }
 
     #[test]

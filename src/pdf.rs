@@ -1,16 +1,29 @@
 use crate::flow::OutlineEntry;
+use flate2::read::GzDecoder;
 use pdfium_render::prelude::*;
 use std::{
-    io::Cursor,
-    path::Path,
+    fs,
+    io::{self, Cursor, Read},
+    path::{Path, PathBuf},
     sync::OnceLock,
 };
+use tar::Archive;
+
+const PDFIUM_WIN_X64_URL: &str =
+    "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F8066/pdfium-win-x64.tgz";
 
 pub struct PdfLinkItem {
     /// Rect in page points, top-left origin: [left, top, width, height]
     pub rect_pt: [f32; 4],
     pub uri: Option<String>,
     pub dest_page: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PdfTextRun {
+    pub text: String,
+    /// Rect in page points, top-left origin: [left, top, width, height]
+    pub rect_pt: [f32; 4],
 }
 
 pub struct RenderedPdfPage {
@@ -27,24 +40,104 @@ pub struct PdfDoc {
     outline: Vec<OutlineEntry>,
 }
 
+fn find_cached_pdfium_dll() -> Option<PathBuf> {
+    let lib_name = Pdfium::pdfium_platform_library_name();
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join(&lib_name));
+    }
+    if let Some(env_path) = std::env::var_os("PDFIUM_LIB_PATH") {
+        candidates.push(PathBuf::from(env_path));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let local_root = PathBuf::from(local).join("HayakuReader").join("pdfium");
+        candidates.push(local_root.join("pdfium-8066").join(&lib_name));
+        candidates.push(local_root.join(&lib_name));
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        let cache_root = PathBuf::from(profile).join(".cache").join("pdfium-bundled");
+        candidates.push(cache_root.join("pdfium-8066").join(&lib_name));
+        if let Ok(entries) = fs::read_dir(&cache_root) {
+            for entry in entries.flatten() {
+                candidates.push(entry.path().join(&lib_name));
+            }
+        }
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+fn download_pdfium_dll() -> Result<PathBuf, String> {
+    let lib_name = Pdfium::pdfium_platform_library_name();
+    let base_dir = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("HayakuReader")
+        .join("pdfium")
+        .join("pdfium-8066");
+    fs::create_dir_all(&base_dir).map_err(|e| format!("无法创建 PDFium 缓存目录：{e}"))?;
+    let dest = base_dir.join(&lib_name);
+    if dest.is_file() {
+        return Ok(dest);
+    }
+
+    let response = ureq::get(PDFIUM_WIN_X64_URL)
+        .call()
+        .map_err(|e| format!("无法下载 PDFium 运行库：{e}"))?;
+    let mut tgz_bytes = Vec::new();
+    response
+        .into_body()
+        .into_reader()
+        .read_to_end(&mut tgz_bytes)
+        .map_err(|e| format!("读取 PDFium 下载流失败：{e}"))?;
+
+    let decoder = GzDecoder::new(Cursor::new(tgz_bytes));
+    let mut archive = Archive::new(decoder);
+    let tmp = base_dir.join(format!("{}.tmp", lib_name.to_string_lossy()));
+    let mut extracted = false;
+    for entry_res in archive
+        .entries()
+        .map_err(|e| format!("解压 PDFium 压缩包失败：{e}"))?
+    {
+        let mut entry = entry_res.map_err(|e| format!("读取 PDFium 压缩包条目失败：{e}"))?;
+        let Ok(path) = entry.path() else {
+            continue;
+        };
+        if path.file_name() == Some(lib_name.as_os_str()) {
+            let mut out =
+                fs::File::create(&tmp).map_err(|e| format!("写入 pdfium.dll 失败：{e}"))?;
+            io::copy(&mut entry, &mut out).map_err(|e| format!("解压 pdfium.dll 失败：{e}"))?;
+            extracted = true;
+            break;
+        }
+    }
+    if !extracted {
+        let _ = fs::remove_file(&tmp);
+        return Err("PDFium 压缩包中未找到 pdfium.dll".to_owned());
+    }
+    fs::rename(&tmp, &dest).map_err(|e| format!("保存 pdfium.dll 失败：{e}"))?;
+    Ok(dest)
+}
+
 fn pdfium_instance() -> Result<&'static Pdfium, String> {
     static PDFIUM: OnceLock<Result<Pdfium, String>> = OnceLock::new();
     let res = PDFIUM.get_or_init(|| {
-        if let Ok(exe) = std::env::current_exe()
-            && let Some(dir) = exe.parent()
-        {
-            let local_lib = dir.join(Pdfium::pdfium_platform_library_name());
-            if local_lib.is_file()
-                && let Ok(bindings) = Pdfium::bind_to_library(&local_lib)
-            {
-                return Ok(Pdfium::new(bindings));
-            }
-        }
-        #[cfg(feature = "bundled-pdfium")]
-        if let Ok(instance) = pdfium_bundled::bind_bundled() {
-            return Ok(instance);
-        }
-        pdfium_bundled::bind_pdfium_silent().map_err(|e| format!("无法初始化 PDF 引擎 (PDFium)：{e}"))
+        let lib_path = if let Some(found) = find_cached_pdfium_dll() {
+            found
+        } else {
+            download_pdfium_dll()?
+        };
+        let bindings = Pdfium::bind_to_library(&lib_path)
+            .or_else(|_| Pdfium::bind_to_system_library())
+            .map_err(|e| {
+                format!(
+                    "无法初始化 PDF 引擎 (PDFium) ({})：{e}",
+                    lib_path.display()
+                )
+            })?;
+        Ok(Pdfium::new(bindings))
     });
     res.as_ref().map_err(Clone::clone)
 }
@@ -279,6 +372,42 @@ impl PdfDoc {
         out
     }
 
+    pub fn page_text_runs(&self, index: usize) -> Vec<PdfTextRun> {
+        let Ok(idx) = i32::try_from(index) else {
+            return Vec::new();
+        };
+        let Ok(page) = self.doc.pages().get(idx) else {
+            return Vec::new();
+        };
+        let ph = page.height().value.max(1.0);
+        let Ok(text_page) = page.text() else {
+            return Vec::new();
+        };
+        let mut runs = Vec::new();
+        for seg in text_page.segments().iter() {
+            let bounds = seg.bounds();
+            let left = bounds.left().value;
+            let top = (ph - bounds.top().value).max(0.0);
+            let width = (bounds.right().value - bounds.left().value).abs();
+            let height = (bounds.top().value - bounds.bottom().value).abs();
+            if width < 0.5 || height < 0.5 {
+                continue;
+            }
+            let text = seg
+                .text()
+                .trim_matches(|c| c == '\r' || c == '\n' || c == '\0')
+                .to_owned();
+            if text.is_empty() {
+                continue;
+            }
+            runs.push(PdfTextRun {
+                text,
+                rect_pt: [left, top, width, height],
+            });
+        }
+        runs
+    }
+
     pub fn page_text(&self, index: usize) -> String {
         let Ok(idx) = i32::try_from(index) else {
             return String::new();
@@ -287,5 +416,20 @@ impl PdfDoc {
             return String::new();
         };
         page.text().map(|t| t.all()).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binds_cached_pdfium_library_if_present() {
+        if find_cached_pdfium_dll().is_some() {
+            assert!(
+                pdfium_instance().is_ok(),
+                "expected cached pdfium.dll to bind cleanly without GetProcAddress error"
+            );
+        }
     }
 }

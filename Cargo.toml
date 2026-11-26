@@ -6,7 +6,6 @@ license = "Apache-2.0"
 
 [features]
 default = []
-bundled-pdfium = ["pdfium-bundled/bundled"]
 
 [dependencies]
 docboss-core = { git = "https://github.com/4thel00z/docboss.git", rev = "2bf47d5a96286e412424f4b2eb7d2eff41855418" }
@@ -16,18 +15,21 @@ docboss-render = { git = "https://github.com/4thel00z/docboss.git", rev = "2bf47
 ebook-rs = { version = "0.19.4", default-features = false }
 eframe = "0.37"
 egui = "0.37"
+ego-tree = "0.10"
 encoding_rs = "0.8"
+flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 latex-rust = { version = "3.0", features = ["png"] }
-pdfium-bundled = "0.2"
-pdfium-render = "0.9"
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_7881", "image_latest", "thread_safe"] }
 pulldown-cmark = "0.13"
 resvg = "0.50"
 rfd = "0.15"
 roxmltree = "0.20"
+scraper = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tar = "0.4"
 tempfile = "3"
 url = "2"
 uuid = { version = "1", features = ["v4"] }

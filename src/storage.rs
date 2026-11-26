@@ -7,7 +7,8 @@ use std::{
 };
 
 pub const EXTENSIONS: &[&str] = &[
-    "pdf", "epub", "txt", "azw3", "azw", "mobi", "doc", "docx", "md", "markdown",
+    "pdf", "epub", "txt", "azw3", "azw", "mobi", "doc", "docx", "md", "markdown", "html", "htm",
+    "xhtml", "xml",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

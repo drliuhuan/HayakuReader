@@ -2,6 +2,7 @@ use latex_rust::{
     Color, Dim, MathFont, MathStyle, PngBackground, PngOptions, layout_with_em_size_pt, parse,
     render_png,
 };
+use scraper::ElementRef;
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
@@ -76,6 +77,97 @@ impl MathCache {
     }
 }
 
+pub fn shared_stix_font() -> Option<&'static MathFont> {
+    static FONT: OnceLock<Option<MathFont>> = OnceLock::new();
+    FONT.get_or_init(|| MathFont::stix_two_math().ok()).as_ref()
+}
+
+pub fn sanitize_latex(raw: &str) -> String {
+    let mut s = raw.trim().to_owned();
+    if let Some(inner) = s.strip_prefix("$$").and_then(|t| t.strip_suffix("$$")) {
+        s = inner.trim().to_owned();
+    } else if let Some(inner) = s.strip_prefix(r"\[").and_then(|t| t.strip_suffix(r"\]")) {
+        s = inner.trim().to_owned();
+    } else if let Some(inner) = s.strip_prefix(r"\(").and_then(|t| t.strip_suffix(r"\)")) {
+        s = inner.trim().to_owned();
+    } else if s.len() >= 2 && s.starts_with('$') && s.ends_with('$') {
+        s = s[1..s.len() - 1].trim().to_owned();
+    }
+
+    // Strip invisible MathML formatting characters that break TeX parsers/glyphs
+    s = s
+        .chars()
+        .filter(|&c| {
+            !matches!(
+                c,
+                '\u{2061}' | '\u{2062}' | '\u{2063}' | '\u{2064}' | '\u{200B}' | '\u{FEFF}'
+            )
+        })
+        .collect();
+
+    // Common LaTeX macros -> latex-rust equivalents
+    let replacements = [
+        (r"\boldsymbol{", r"\mathbf{"),
+        (r"\bm{", r"\mathbf{"),
+        (r"\operatorname{", r"\mathrm{"),
+        (r"\begin{aligned}", r"\begin{matrix}"),
+        (r"\end{aligned}", r"\end{matrix}"),
+        (r"\begin{align*}", r"\begin{matrix}"),
+        (r"\end{align*}", r"\end{matrix}"),
+        (r"\begin{align}", r"\begin{matrix}"),
+        (r"\end{align}", r"\end{matrix}"),
+        (r"\begin{gathered}", r"\begin{matrix}"),
+        (r"\end{gathered}", r"\end{matrix}"),
+        (r"\begin{equation*}", ""),
+        (r"\end{equation*}", ""),
+        (r"\begin{equation}", ""),
+        (r"\end{equation}", ""),
+        (r"\displaystyle", ""),
+        (r"\textstyle", ""),
+        (r"\scriptstyle", ""),
+        (r"\scriptscriptstyle", ""),
+        (r"\nolimits", ""),
+        (r"\limits", ""),
+        (r"\nonumber", ""),
+    ];
+    for (pat, rep) in replacements {
+        if s.contains(pat) {
+            s = s.replace(pat, rep);
+        }
+    }
+    s = strip_macro_arg(&s, r"\label{");
+    s = strip_macro_arg(&s, r"\tag{");
+    s.trim().to_owned()
+}
+
+fn strip_macro_arg(input: &str, macro_prefix: &str) -> String {
+    let mut out = input.to_owned();
+    while let Some(pos) = out.find(macro_prefix) {
+        let brace_start = pos + macro_prefix.len() - 1;
+        let mut depth = 0i32;
+        let mut end = None;
+        for (off, ch) in out[brace_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(brace_start + off + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(e) = end {
+            out.replace_range(pos..e, "");
+        } else {
+            break;
+        }
+    }
+    out
+}
+
 pub fn render_latex(
     latex: &str,
     font: &MathFont,
@@ -84,7 +176,13 @@ pub fn render_latex(
     scale: f32,
     ink: [u8; 4],
 ) -> Result<RenderedMath, String> {
-    let ast = parse(latex).map_err(|e| e.to_string())?;
+    let cleaned = sanitize_latex(latex);
+    let ast = parse(&cleaned)
+        .or_else(|_| {
+            let unicode_translated = translate_symbol(&cleaned);
+            parse(&unicode_translated)
+        })
+        .map_err(|e| e.to_string())?;
     let em_pt = Dim::ratio((font_size_px * 100.0).round() as i64, 100);
     let dpi = Dim::ratio((72.0 * scale * 100.0).round() as i64, 100);
     let style = if display {
@@ -118,48 +216,82 @@ pub fn render_latex(
     })
 }
 
-pub fn shared_stix_font() -> Option<&'static MathFont> {
-    static FONT: OnceLock<Option<MathFont>> = OnceLock::new();
-    FONT.get_or_init(|| MathFont::stix_two_math().ok()).as_ref()
-}
-
-fn translate_symbol(text: &str) -> String {
+pub fn translate_symbol(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
+            // Invisible MathML operators & zero-width marks
+            '\u{2061}' | '\u{2062}' | '\u{2063}' | '\u{2064}' | '\u{200B}' | '\u{FEFF}' => {}
+            '\u{00A0}' | '\u{2009}' | '\u{2005}' | '\u{2004}' | '\u{200A}' => out.push_str(r"\,"),
+            '′' => out.push('\''),
+            '″' => out.push_str("''"),
             '≤' | '⩽' => out.push_str(r"\le "),
             '≥' | '⩾' => out.push_str(r"\ge "),
             '≠' => out.push_str(r"\ne "),
             '≈' => out.push_str(r"\approx "),
+            '≡' => out.push_str(r"\equiv "),
+            '∼' | '˜' => out.push_str(r"\sim "),
+            '≃' => out.push_str(r"\simeq "),
+            '≅' => out.push_str(r"\cong "),
+            '∝' => out.push_str(r"\propto "),
             '×' => out.push_str(r"\times "),
             '÷' => out.push_str(r"\div "),
             '±' => out.push_str(r"\pm "),
             '∓' => out.push_str(r"\mp "),
-            '·' | '⋅' => out.push_str(r"\cdot "),
+            '·' | '⋅' | '∙' => out.push_str(r"\cdot "),
+            '∘' => out.push_str(r"\circ "),
+            '⊕' => out.push_str(r"\oplus "),
+            '⊗' => out.push_str(r"\otimes "),
+            '†' => out.push_str(r"\dagger "),
             '∞' => out.push_str(r"\infty "),
             '∑' => out.push_str(r"\sum "),
             '∏' => out.push_str(r"\prod "),
             '∫' => out.push_str(r"\int "),
+            '∮' => out.push_str(r"\oint "),
             '∂' => out.push_str(r"\partial "),
             '∇' => out.push_str(r"\nabla "),
             '√' => out.push_str(r"\sqrt "),
             '→' | '⟶' => out.push_str(r"\to "),
             '←' | '⟵' => out.push_str(r"\leftarrow "),
-            '⇒' => out.push_str(r"\Rightarrow "),
-            '⇔' => out.push_str(r"\Leftrightarrow "),
+            '↔' | '⟷' => out.push_str(r"\leftrightarrow "),
+            '↦' => out.push_str(r"\mapsto "),
+            '⇒' | '⟹' => out.push_str(r"\Rightarrow "),
+            '⇐' => out.push_str(r"\Leftarrow "),
+            '⇔' | '⟺' => out.push_str(r"\Leftrightarrow "),
+            '↑' => out.push_str(r"\uparrow "),
+            '↓' => out.push_str(r"\downarrow "),
             '∈' => out.push_str(r"\in "),
             '∉' => out.push_str(r"\notin "),
             '⊂' => out.push_str(r"\subset "),
+            '⊃' => out.push_str(r"\supset "),
             '⊆' => out.push_str(r"\subseteq "),
+            '⊇' => out.push_str(r"\supseteq "),
             '∪' => out.push_str(r"\cup "),
             '∩' => out.push_str(r"\cap "),
+            '∖' => out.push_str(r"\setminus "),
+            '∧' => out.push_str(r"\land "),
+            '∨' => out.push_str(r"\lor "),
+            '¬' => out.push_str(r"\neg "),
+            '⊥' => out.push_str(r"\perp "),
+            '∥' => out.push_str(r"\parallel "),
+            '⟨' | '〈' => out.push_str(r"\langle "),
+            '⟩' | '〉' => out.push_str(r"\rangle "),
+            '‖' => out.push_str(r"\| "),
             '∀' => out.push_str(r"\forall "),
             '∃' => out.push_str(r"\exists "),
             '∅' => out.push_str(r"\emptyset "),
             '…' | '⋯' => out.push_str(r"\cdots "),
             '⋮' => out.push_str(r"\vdots "),
             '⋱' => out.push_str(r"\ddots "),
-            '−' => out.push('-'),
+            'ℕ' => out.push_str(r"\mathbb{N}"),
+            'ℤ' => out.push_str(r"\mathbb{Z}"),
+            'ℚ' => out.push_str(r"\mathbb{Q}"),
+            'ℝ' => out.push_str(r"\mathbb{R}"),
+            'ℂ' => out.push_str(r"\mathbb{C}"),
+            'ℓ' => out.push_str(r"\ell "),
+            'ℏ' => out.push_str(r"\hbar "),
+            'ℵ' => out.push_str(r"\aleph "),
+            '−' | '–' => out.push('-'),
             'α' => out.push_str(r"\alpha "),
             'β' => out.push_str(r"\beta "),
             'γ' => out.push_str(r"\gamma "),
@@ -199,130 +331,330 @@ fn translate_symbol(text: &str) -> String {
     out
 }
 
-pub fn mathml_to_latex(node: roxmltree::Node<'_, '_>) -> String {
-    let children: Vec<roxmltree::Node<'_, '_>> =
-        node.children().filter(|c| c.is_element()).collect();
-    let tag = node.tag_name().name();
+fn is_big_operator(latex: &str) -> bool {
+    matches!(
+        latex.trim(),
+        r"\sum"
+            | r"\prod"
+            | r"\int"
+            | r"\oint"
+            | r"\bigcup"
+            | r"\bigcap"
+            | r"\bigoplus"
+            | r"\bigotimes"
+            | r"\lim"
+            | r"\limsup"
+            | r"\liminf"
+            | r"\sup"
+            | r"\inf"
+            | r"\max"
+            | r"\min"
+    )
+}
+
+fn wrap_script_base(base: &str) -> String {
+    let trimmed = base.trim();
+    if is_big_operator(trimmed)
+        || (trimmed.len() == 1 && trimmed.chars().all(|c| c.is_ascii_alphanumeric()))
+    {
+        trimmed.to_owned()
+    } else {
+        format!("{{{trimmed}}}")
+    }
+}
+
+fn is_standard_math_func(name: &str) -> bool {
+    matches!(
+        name,
+        "sin"
+            | "cos"
+            | "tan"
+            | "cot"
+            | "sec"
+            | "csc"
+            | "arcsin"
+            | "arccos"
+            | "arctan"
+            | "sinh"
+            | "cosh"
+            | "tanh"
+            | "coth"
+            | "log"
+            | "ln"
+            | "lg"
+            | "exp"
+            | "lim"
+            | "limsup"
+            | "liminf"
+            | "sup"
+            | "inf"
+            | "max"
+            | "min"
+            | "det"
+            | "dim"
+            | "gcd"
+            | "lcm"
+            | "ker"
+            | "arg"
+            | "deg"
+            | "Pr"
+    )
+}
+
+fn escape_fence(delim: &str) -> String {
+    let t = delim.trim();
+    if t.is_empty() {
+        return ".".to_owned();
+    }
+    match t {
+        "{" => r"\{".to_owned(),
+        "}" => r"\}".to_owned(),
+        "⟨" => r"\langle".to_owned(),
+        "⟩" => r"\rangle".to_owned(),
+        "‖" => r"\|".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn element_text(el: ElementRef<'_>) -> String {
+    el.text().collect::<Vec<_>>().join("")
+}
+
+pub fn mathml_element_to_latex(el: ElementRef<'_>) -> String {
+    let tag = el.value().name();
+    let children: Vec<ElementRef<'_>> = el.child_elements().collect();
     match tag {
-        "math" | "mrow" | "mstyle" | "mpadded" | "mphantom" => {
-            if children.is_empty() {
-                return translate_symbol(node.text().unwrap_or("").trim());
+        "annotation" | "annotation-xml" => String::new(),
+        "semantics" => {
+            for child in &children {
+                if child.value().name() == "annotation" {
+                    let enc = child
+                        .value()
+                        .attr("encoding")
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if enc.contains("tex") || enc.contains("latex") {
+                        let candidate = sanitize_latex(&element_text(*child));
+                        if !candidate.is_empty() && parse(&candidate).is_ok() {
+                            return candidate;
+                        }
+                    }
+                }
             }
             children
                 .into_iter()
-                .map(mathml_to_latex)
+                .find(|c| !matches!(c.value().name(), "annotation" | "annotation-xml"))
+                .map(mathml_element_to_latex)
+                .unwrap_or_default()
+        }
+        "math" | "mrow" | "mstyle" | "mpadded" | "mphantom" => {
+            if children.is_empty() {
+                return translate_symbol(element_text(el).trim());
+            }
+            children
+                .into_iter()
+                .map(mathml_element_to_latex)
+                .filter(|s| !s.trim().is_empty())
                 .collect::<Vec<_>>()
                 .join(" ")
         }
-        "mi" | "mn" | "mo" => translate_symbol(node.text().unwrap_or("").trim()),
+        "mi" => {
+            let raw = element_text(el);
+            let translated = translate_symbol(raw.trim());
+            let trimmed = translated.trim();
+            if trimmed.is_empty() {
+                return String::new();
+            }
+            if is_standard_math_func(trimmed) {
+                return format!(r"\{trimmed} ");
+            }
+            let variant = el.value().attr("mathvariant").unwrap_or("");
+            if trimmed.chars().all(|c| c.is_ascii_alphanumeric()) && trimmed.len() > 1 {
+                return match variant {
+                    "bold" | "bold-italic" => format!(r"\mathbf{{{trimmed}}}"),
+                    _ => format!(r"\mathrm{{{trimmed}}}"),
+                };
+            }
+            match variant {
+                "bold" => format!(r"\mathbf{{{trimmed}}}"),
+                "double-struck" => format!(r"\mathbb{{{trimmed}}}"),
+                "script" => format!(r"\mathcal{{{trimmed}}}"),
+                _ => trimmed.to_owned(),
+            }
+        }
+        "mn" | "mo" => translate_symbol(element_text(el).trim()).trim().to_owned(),
         "mtext" => {
-            let text = node.text().unwrap_or("").trim();
-            if text.is_empty() {
+            let text = element_text(el);
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
                 String::new()
             } else {
-                format!(r"\text{{{}}}", text.replace(['{', '}'], ""))
+                let safe = trimmed.replace(['{', '}'], "");
+                format!(r"\text{{{safe}}}")
             }
         }
         "mspace" => r"\,".to_owned(),
         "mfrac" => {
-            let num = children.first().copied().map(mathml_to_latex).unwrap_or_default();
-            let den = children.get(1).copied().map(mathml_to_latex).unwrap_or_default();
+            let num = children
+                .first()
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
+            let den = children
+                .get(1)
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
             format!(r"\frac{{{num}}}{{{den}}}")
         }
         "msqrt" => {
             let inner = children
                 .into_iter()
-                .map(mathml_to_latex)
+                .map(mathml_element_to_latex)
+                .filter(|s| !s.trim().is_empty())
                 .collect::<Vec<_>>()
                 .join(" ");
             format!(r"\sqrt{{{inner}}}")
         }
         "mroot" => {
-            let base = children.first().copied().map(mathml_to_latex).unwrap_or_default();
-            let idx = children.get(1).copied().map(mathml_to_latex).unwrap_or_default();
+            let base = children
+                .first()
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
+            let idx = children
+                .get(1)
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
             format!(r"\sqrt[{idx}]{{{base}}}")
         }
         "msup" => {
-            let base = children.first().copied().map(mathml_to_latex).unwrap_or_default();
-            let sup = children.get(1).copied().map(mathml_to_latex).unwrap_or_default();
-            format!("{{{base}}}^{{{sup}}}")
+            let base = children
+                .first()
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
+            let sup = children
+                .get(1)
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
+            format!("{}^{{{sup}}}", wrap_script_base(&base))
         }
         "msub" => {
-            let base = children.first().copied().map(mathml_to_latex).unwrap_or_default();
-            let sub = children.get(1).copied().map(mathml_to_latex).unwrap_or_default();
-            format!("{{{base}}}_{{{sub}}}")
+            let base = children
+                .first()
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
+            let sub = children
+                .get(1)
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
+            format!("{}_{{{sub}}}", wrap_script_base(&base))
         }
-        "msubsup" => {
-            let base = children.first().copied().map(mathml_to_latex).unwrap_or_default();
-            let sub = children.get(1).copied().map(mathml_to_latex).unwrap_or_default();
-            let sup = children.get(2).copied().map(mathml_to_latex).unwrap_or_default();
-            format!("{{{base}}}_{{{sub}}}^{{{sup}}}")
+        "msubsup" | "munderover" => {
+            let base = children
+                .first()
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
+            let sub = children
+                .get(1)
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
+            let sup = children
+                .get(2)
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
+            format!("{}_{{{sub}}}^{{{sup}}}", wrap_script_base(&base))
         }
         "mover" => {
-            let base = children.first().copied().map(mathml_to_latex).unwrap_or_default();
-            let over = children.get(1).copied().map(mathml_to_latex).unwrap_or_default();
-            let over_trim = over.trim();
-            match over_trim {
+            let base = children
+                .first()
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
+            let over = children
+                .get(1)
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
+            match over.trim() {
                 "¯" | "‾" | "-" => format!(r"\overline{{{base}}}"),
                 "^" | "ˆ" => format!(r"\hat{{{base}}}"),
-                "~" | "˜" => format!(r"\tilde{{{base}}}"),
+                "~" | "˜" | r"\sim" => format!(r"\tilde{{{base}}}"),
                 "→" | r"\to" => format!(r"\vec{{{base}}}"),
                 "˙" | "." => format!(r"\dot{{{base}}}"),
-                _ => format!(r"\overset{{{over}}}{{{base}}}"),
+                _ => format!("{}^{{{over}}}", wrap_script_base(&base)),
             }
         }
         "munder" => {
-            let base = children.first().copied().map(mathml_to_latex).unwrap_or_default();
-            let under = children.get(1).copied().map(mathml_to_latex).unwrap_or_default();
-            if matches!(under.trim(), "_" | "‾" | "¯") {
-                format!(r"\underline{{{base}}}")
-            } else {
-                format!(r"\underset{{{under}}}{{{base}}}")
+            let base = children
+                .first()
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
+            let under = children
+                .get(1)
+                .copied()
+                .map(mathml_element_to_latex)
+                .unwrap_or_default();
+            match under.trim() {
+                "_" | "‾" | "¯" => format!(r"\underline{{{base}}}"),
+                _ => format!("{}_{{{under}}}", wrap_script_base(&base)),
             }
         }
-        "munderover" => {
-            let base = children.first().copied().map(mathml_to_latex).unwrap_or_default();
-            let sub = children.get(1).copied().map(mathml_to_latex).unwrap_or_default();
-            let sup = children.get(2).copied().map(mathml_to_latex).unwrap_or_default();
-            format!("{{{base}}}_{{{sub}}}^{{{sup}}}")
-        }
         "mfenced" => {
-            let open = node.attribute("open").unwrap_or("(");
-            let close = node.attribute("close").unwrap_or(")");
+            let open = escape_fence(el.value().attr("open").unwrap_or("("));
+            let close = escape_fence(el.value().attr("close").unwrap_or(")"));
+            let sep = el.value().attr("separators").unwrap_or(",");
+            let joiner = if sep.is_empty() {
+                " ".to_owned()
+            } else {
+                let first_sep = sep.chars().next().unwrap_or(',');
+                format!("{first_sep} ")
+            };
             let body = children
                 .into_iter()
-                .map(mathml_to_latex)
+                .map(mathml_element_to_latex)
+                .filter(|s| !s.trim().is_empty())
                 .collect::<Vec<_>>()
-                .join(", ");
-            let left = if open.is_empty() { "." } else { open };
-            let right = if close.is_empty() { "." } else { close };
-            format!(r"\left{left} {body} \right{right}")
+                .join(&joiner);
+            format!(r"\left{open} {body} \right{close}")
         }
         "mtable" => {
             let rows = children
                 .into_iter()
-                .map(mathml_to_latex)
+                .map(mathml_element_to_latex)
+                .filter(|s| !s.trim().is_empty())
                 .collect::<Vec<_>>()
                 .join(r" \\ ");
             format!(r"\begin{{matrix}} {rows} \end{{matrix}}")
         }
-        "mtr" => children
+        "mtr" | "mlabeledtr" => children
             .into_iter()
-            .map(mathml_to_latex)
+            .map(mathml_element_to_latex)
             .collect::<Vec<_>>()
             .join(" & "),
         "mtd" => children
             .into_iter()
-            .map(mathml_to_latex)
+            .map(mathml_element_to_latex)
+            .filter(|s| !s.trim().is_empty())
             .collect::<Vec<_>>()
             .join(" "),
         _ => {
             if children.is_empty() {
-                translate_symbol(node.text().unwrap_or("").trim())
+                translate_symbol(element_text(el).trim())
             } else {
                 children
                     .into_iter()
-                    .map(mathml_to_latex)
+                    .map(mathml_element_to_latex)
+                    .filter(|s| !s.trim().is_empty())
                     .collect::<Vec<_>>()
                     .join(" ")
             }
@@ -333,6 +665,14 @@ pub fn mathml_to_latex(node: roxmltree::Node<'_, '_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scraper::{Html, Selector};
+
+    fn parse_math_fragment(html_str: &str) -> String {
+        let doc = Html::parse_fragment(html_str);
+        let sel = Selector::parse("math").unwrap();
+        let el = doc.select(&sel).next().unwrap();
+        mathml_element_to_latex(el)
+    }
 
     #[test]
     fn renders_inline_and_display_latex_with_baseline() {
@@ -350,12 +690,27 @@ mod tests {
     }
 
     #[test]
-    fn converts_academic_mathml_to_latex() {
-        let xml = r#"<math xmlns="http://www.w3.org/1998/Math/MathML"><mfrac><msqrt><mi>a</mi><mo>+</mo><mi>b</mi></msqrt><msup><mi>c</mi><mn>2</mn></msup></mfrac></math>"#;
-        let doc = roxmltree::Document::parse(xml).unwrap();
-        let latex = mathml_to_latex(doc.root_element());
-        assert_eq!(latex, r"\frac{\sqrt{a + b}}{{c}^{2}}");
+    fn converts_academic_mathml_semantics_and_invisible_ops() {
+        let mml = r#"<math xmlns="http://www.w3.org/1998/Math/MathML">
+            <semantics>
+                <mrow><munderover><mo>∑</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi>n</mi></munderover><msub><mi>x</mi><mi>i</mi></msub></mrow>
+                <annotation encoding="application/x-tex">\sum_{i=1}^{n} x_i</annotation>
+            </semantics>
+        </math>"#;
+        let tex = parse_math_fragment(mml);
+        assert_eq!(tex, r"\sum_{i=1}^{n} x_i");
         let font = shared_stix_font().unwrap();
-        assert!(render_latex(&latex, font, true, 18.0, 1.0, [0, 0, 0, 255]).is_ok());
+        assert!(render_latex(&tex, font, true, 18.0, 1.0, [0, 0, 0, 255]).is_ok());
+
+        // Fallback structural MathML without TeX annotation + U+2062 invisible times
+        let pure_mml = "<math><mfrac><msqrt><mi>a</mi><mo>\u{2062}</mo><mi>b</mi></msqrt><msup><mi>c</mi><mn>2</mn></msup></mfrac></math>";
+        let pure_tex = parse_math_fragment(pure_mml);
+        assert_eq!(pure_tex, r"\frac{\sqrt{a b}}{c^{2}}");
+        assert!(render_latex(&pure_tex, font, false, 18.0, 1.0, [0, 0, 0, 255]).is_ok());
+
+        // Big sum without TeX annotation
+        let sum_mml = "<math><munderover><mo>∑</mo><mrow><mi>k</mi><mo>=</mo><mn>0</mn></mrow><mi>∞</mi></munderover><mfrac><msup><mi>x</mi><mi>k</mi></msup><mrow><mi>k</mi><mo>!</mo></mrow></mfrac></math>";
+        let sum_tex = parse_math_fragment(sum_mml);
+        assert!(render_latex(&sum_tex, font, true, 18.0, 1.0, [0, 0, 0, 255]).is_ok());
     }
 }

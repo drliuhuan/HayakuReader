@@ -1,7 +1,8 @@
 use crate::{
     flow::{Block, FlowDocument, Inline, LinkTarget, OutlineEntry},
+    highlight::{self, CodeLang},
     math::MathCache,
-    pdf::{PdfDoc, PdfLinkItem},
+    pdf::{PdfDoc, PdfLinkItem, PdfTextRun},
     platform::{self, DownloadProgress, InstallationStatus, Release},
     storage::{
         self, Annotation, BookState, EXTENSIONS, Position, Recent, Settings, TabEntry, Workspace,
@@ -13,7 +14,8 @@ use egui::{
     Align, CentralPanel, Color32, ColorImage, Context, CornerRadius, CursorIcon, FontData,
     FontDefinitions, FontFamily, FontId, Frame, Id, Key, Margin, Panel, PointerButton, Pos2, Rect,
     ResizeDirection, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle,
-    TextureOptions, Ui, Vec2, ViewportCommand,
+    TextureOptions, Ui, UiBuilder, Vec2, ViewportCommand,
+    text::{CCursor, LayoutJob},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -27,7 +29,7 @@ use std::{
 enum LoadedSource {
     Pdf(PdfDoc),
     Word(Word),
-    Flow(FlowDocument),
+    Flow(Arc<FlowDocument>),
 }
 
 struct OpenBook {
@@ -42,6 +44,7 @@ struct OpenBook {
 #[derive(Clone, Debug)]
 struct PendingJump {
     chapter: usize,
+    fragment: String,
     fraction: f32,
 }
 
@@ -49,6 +52,7 @@ struct CachedPageTexture {
     scale_key: u32,
     smart_invert: bool,
     links: Vec<PdfLinkItem>,
+    pdf_runs: Vec<PdfTextRun>,
     word_runs: Vec<WordTextRun>,
     texture: TextureHandle,
     last_used: u64,
@@ -74,6 +78,7 @@ struct ImageContextMenu {
     label: String,
     filename: String,
     png_bytes: Option<Vec<u8>>,
+    selected_text: Option<String>,
     extra_text: Option<String>,
 }
 
@@ -92,6 +97,82 @@ enum SidebarTab {
     Recent,
     Contents,
     Notes,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct FlowTextPos {
+    item_idx: usize,
+    char_idx: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct FixedTextPos {
+    page: usize,
+    run_idx: usize,
+    char_idx: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct FlowCacheKey {
+    book_id: String,
+    is_code_mode: bool,
+    width_px: i32,
+    font_size_tenths: u32,
+    line_height_hundredths: u32,
+    dark: bool,
+}
+
+struct HitLinkBox {
+    rel_rect: Rect,
+    target: LinkTarget,
+}
+
+enum FlowVisual {
+    Separator,
+    FallbackBlock,
+    SingleGalley {
+        galley: Arc<egui::Galley>,
+        pad_top: f32,
+        links: Vec<HitLinkBox>,
+        code_box: bool,
+        quote_bar: bool,
+    },
+    CodeLine {
+        line_no_galley: Arc<egui::Galley>,
+        code_galley: Arc<egui::Galley>,
+    },
+    RichLines {
+        lines: Vec<MeasuredLine>,
+        char_boxes: Vec<Rect>,
+        pad_top: f32,
+        extra_gap: f32,
+        base_ascent: f32,
+    },
+}
+
+enum FlowSourceRef {
+    Separator,
+    Block { chapter_idx: usize, block_idx: usize },
+    CodeLine {
+        line_no: usize,
+        text: String,
+        lang: CodeLang,
+    },
+}
+
+struct FlowItemEntry {
+    chapter_idx: usize,
+    source: FlowSourceRef,
+    height: f32,
+    visual: Option<FlowVisual>,
+    plain: String,
+}
+
+struct FlowLayoutCache {
+    key: FlowCacheKey,
+    items: Vec<FlowItemEntry>,
+    chapter_first_item: Vec<usize>,
+    anchor_to_item: HashMap<(usize, String), usize>,
 }
 
 enum BgEvent {
@@ -119,10 +200,25 @@ pub struct HayakuApp {
     page_cache: HashMap<(String, usize), CachedPageTexture>,
     use_tick: u64,
     pending_jump: Option<PendingJump>,
+    pending_scroll_y: Option<f32>,
+    last_scroll_y: f32,
+    last_viewport_h: f32,
+    last_content_h: f32,
+
+    flow_cache: Option<FlowLayoutCache>,
+    flow_sel_anchor: Option<FlowTextPos>,
+    flow_sel_head: Option<FlowTextPos>,
+    flow_sel_dragging: bool,
+
+    fixed_sel_anchor: Option<FixedTextPos>,
+    fixed_sel_head: Option<FixedTextPos>,
+    fixed_sel_dragging: bool,
+    fixed_all_selected: bool,
 
     math_cache: MathCache,
     math_textures: HashMap<MathTexKey, Option<CachedMathTex>>,
     image_textures: HashMap<(String, String), Option<TextureHandle>>,
+    logo_texture: Option<TextureHandle>,
 
     status_msg: Option<(String, Option<Instant>)>,
     context_menu: Option<ImageContextMenu>,
@@ -153,6 +249,14 @@ impl HayakuApp {
         mut dropped: VecDeque<PathBuf>,
     ) -> Self {
         install_system_fonts(&cc.egui_ctx);
+        let logo_texture = render_app_icon().map(|icon| {
+            let img = ColorImage::from_rgba_unmultiplied(
+                [icon.width as usize, icon.height as usize],
+                &icon.rgba,
+            );
+            cc.egui_ctx
+                .load_texture("app_logo", img, TextureOptions::LINEAR)
+        });
         let settings: Settings = storage::read_json(&data.join("settings.json")).unwrap_or_default();
         let recent: Vec<Recent> = storage::read_json(&data.join("recent.json")).unwrap_or_default();
         let workspace: Workspace =
@@ -192,9 +296,22 @@ impl HayakuApp {
             page_cache: HashMap::new(),
             use_tick: 0,
             pending_jump: None,
+            pending_scroll_y: None,
+            last_scroll_y: 0.0,
+            last_viewport_h: 600.0,
+            last_content_h: 600.0,
+            flow_cache: None,
+            flow_sel_anchor: None,
+            flow_sel_head: None,
+            flow_sel_dragging: false,
+            fixed_sel_anchor: None,
+            fixed_sel_head: None,
+            fixed_sel_dragging: false,
+            fixed_all_selected: false,
             math_cache: MathCache::default(),
             math_textures: HashMap::new(),
             image_textures: HashMap::new(),
+            logo_texture,
             status_msg: None,
             context_menu: None,
             link_warning: None,
@@ -329,22 +446,28 @@ impl HayakuApp {
             .find(|r| r.path == normalized || (r.digest == digest && !r.path.exists()))
             .map(|r| r.id.clone());
         let id = existing_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let state: BookState =
+        let mut state: BookState =
             storage::read_json(&self.data.join(format!("{id}.json"))).unwrap_or_default();
 
         let source_res = match ext.as_str() {
             "pdf" => PdfDoc::open(&normalized).map(LoadedSource::Pdf),
             "doc" | "docx" => Word::open(&normalized).map(LoadedSource::Word),
             "txt" => crate::flow::open_text(&normalized, state.encoding.as_deref())
-                .map(LoadedSource::Flow),
+                .map(|f| LoadedSource::Flow(Arc::new(f))),
             "md" | "markdown" => {
-                crate::flow::open_markdown(&normalized).map(LoadedSource::Flow)
+                crate::flow::open_markdown(&normalized).map(|f| LoadedSource::Flow(Arc::new(f)))
             }
-            "epub" => crate::flow::open_epub(&normalized).map(LoadedSource::Flow),
+            "html" | "htm" | "xhtml" => {
+                crate::flow::open_html(&normalized).map(|f| LoadedSource::Flow(Arc::new(f)))
+            }
+            "xml" => crate::flow::open_xml(&normalized).map(|f| LoadedSource::Flow(Arc::new(f))),
+            "epub" => crate::flow::open_epub(&normalized).map(|f| LoadedSource::Flow(Arc::new(f))),
             "azw" | "azw3" | "mobi" => {
-                crate::flow::open_kindle(&normalized).map(LoadedSource::Flow)
+                crate::flow::open_kindle(&normalized).map(|f| LoadedSource::Flow(Arc::new(f)))
             }
-            _ => Err("不支持此文件格式（原生版已移除 HTML 网页解析，支持 PDF/Word/EPUB/Kindle/Markdown/TXT）".to_owned()),
+            _ => Err(
+                "不支持此文件格式（支持 PDF/Word/EPUB/Kindle/HTML/XML/Markdown/TXT）".to_owned(),
+            ),
         };
 
         let source = match source_res {
@@ -360,6 +483,9 @@ impl HayakuApp {
             LoadedSource::Word(_) => "word",
             LoadedSource::Flow(f) => f.kind,
         };
+        if kind == "xml" && state.view_mode.is_none() {
+            state.view_mode = Some("code".to_owned());
+        }
 
         self.recent.retain(|r| r.id != id);
         self.recent.insert(
@@ -387,10 +513,15 @@ impl HayakuApp {
         self.pending_jump = if pos.index > 0 || pos.fraction > 0.0 {
             Some(PendingJump {
                 chapter: pos.index,
+                fragment: String::new(),
                 fraction: pos.fraction,
             })
         } else {
-            None
+            Some(PendingJump {
+                chapter: 0,
+                fragment: String::new(),
+                fraction: 0.0,
+            })
         };
 
         let has_outline = match &source {
@@ -416,6 +547,14 @@ impl HayakuApp {
         });
         self.fixed_zoom = None;
         self.page_cache.clear();
+        self.flow_cache = None;
+        self.flow_sel_anchor = None;
+        self.flow_sel_head = None;
+        self.flow_sel_dragging = false;
+        self.fixed_sel_anchor = None;
+        self.fixed_sel_head = None;
+        self.fixed_sel_dragging = false;
+        self.fixed_all_selected = false;
         self.search_matches.clear();
         self.search_cursor = 0;
         self.save_workspace();
@@ -427,6 +566,7 @@ impl HayakuApp {
         if self.active_book.as_ref().is_some_and(|b| b.id == id) {
             self.save_active_book();
             self.active_book = None;
+            self.flow_cache = None;
         }
         self.tabs.retain(|t| t.id != id);
         if self.active_book.is_none()
@@ -452,9 +592,10 @@ impl HayakuApp {
 
     fn handle_link_click(&mut self, target: &LinkTarget) {
         match target {
-            LinkTarget::Internal { chapter, .. } => {
+            LinkTarget::Internal { chapter, fragment } => {
                 self.pending_jump = Some(PendingJump {
                     chapter: *chapter,
+                    fragment: fragment.clone(),
                     fraction: 0.0,
                 });
                 self.current_unit = *chapter;
@@ -467,6 +608,108 @@ impl HayakuApp {
                 });
             }
         }
+    }
+
+    fn selected_flow_text(&self) -> String {
+        let Some(cache) = &self.flow_cache else {
+            return String::new();
+        };
+        let (Some(a), Some(b)) = (self.flow_sel_anchor, self.flow_sel_head) else {
+            return String::new();
+        };
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        if start == end {
+            return String::new();
+        }
+        let mut out = Vec::new();
+        let end_idx = end.item_idx.min(cache.items.len().saturating_sub(1));
+        for (idx, item) in cache.items[..=end_idx].iter().enumerate().skip(start.item_idx) {
+            let text = &item.plain;
+            if text.is_empty() {
+                continue;
+            }
+            let total_chars = text.chars().count();
+            let c0 = if idx == start.item_idx {
+                start.char_idx.min(total_chars)
+            } else {
+                0
+            };
+            let c1 = if idx == end.item_idx {
+                end.char_idx.min(total_chars)
+            } else {
+                total_chars
+            };
+            if c1 > c0 {
+                out.push(slice_chars(text, c0, c1));
+            }
+        }
+        out.join("\n")
+    }
+
+    fn selected_fixed_text(&self) -> String {
+        let Some(book) = &self.active_book else {
+            return String::new();
+        };
+        if self.fixed_all_selected {
+            return match &book.source {
+                LoadedSource::Pdf(pdf) => (0..pdf.page_count())
+                    .map(|p| pdf.page_text(p))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                LoadedSource::Word(word) => (0..word.metadata.pages.len())
+                    .filter_map(|p| word.text_runs(p).ok())
+                    .map(|runs| word_runs_plain(&runs))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                LoadedSource::Flow(_) => String::new(),
+            };
+        }
+        let (Some(a), Some(b)) = (self.fixed_sel_anchor, self.fixed_sel_head) else {
+            return String::new();
+        };
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        if start == end {
+            return String::new();
+        }
+        let mut parts = Vec::new();
+        for page in start.page..=end.page {
+            let key = (book.id.clone(), page);
+            let Some(cached) = self.page_cache.get(&key) else {
+                continue;
+            };
+            let run_count = cached.pdf_runs.len().max(cached.word_runs.len());
+            if run_count == 0 {
+                continue;
+            }
+            let r_start = if page == start.page { start.run_idx } else { 0 };
+            let r_end = if page == end.page {
+                end.run_idx.min(run_count.saturating_sub(1))
+            } else {
+                run_count.saturating_sub(1)
+            };
+            for ri in r_start..=r_end {
+                let text = if !cached.pdf_runs.is_empty() {
+                    &cached.pdf_runs[ri].text
+                } else {
+                    &cached.word_runs[ri].text
+                };
+                let len = text.chars().count();
+                let c0 = if page == start.page && ri == start.run_idx {
+                    start.char_idx.min(len)
+                } else {
+                    0
+                };
+                let c1 = if page == end.page && ri == end.run_idx {
+                    end.char_idx.min(len)
+                } else {
+                    len
+                };
+                if c1 > c0 {
+                    parts.push(slice_chars(text, c0, c1));
+                }
+            }
+        }
+        parts.join("")
     }
 
     fn run_search(&mut self) {
@@ -492,10 +735,7 @@ impl HayakuApp {
             LoadedSource::Word(word) => {
                 for i in 0..word.metadata.pages.len() {
                     if let Ok(runs) = word.text_runs(i) {
-                        let txt: String = runs
-                            .into_iter()
-                            .map(|r| if r.line_break { format!("\n{}", r.text) } else { r.text })
-                            .collect();
+                        let txt = word_runs_plain(&runs);
                         if let Some(pos) = txt.to_lowercase().find(&query) {
                             let snippet = extract_snippet(&txt, pos);
                             self.search_matches.push(SearchMatch { unit: i, snippet });
@@ -516,6 +756,7 @@ impl HayakuApp {
         if let Some(first) = self.search_matches.first() {
             self.pending_jump = Some(PendingJump {
                 chapter: first.unit,
+                fragment: String::new(),
                 fraction: 0.0,
             });
             self.current_unit = first.unit;
@@ -581,6 +822,9 @@ impl HayakuApp {
     }
 
     fn apply_egui_visuals(&self, ctx: &Context) {
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            ctx.style_mut_of(theme, |s| s.interaction.selectable_labels = false);
+        }
         let p = self.palette();
         let mut visuals = if self.theme_mode() == ThemeMode::Dark {
             egui::Visuals::dark()
@@ -612,23 +856,55 @@ impl HayakuApp {
         if modal_open {
             return;
         }
-        let (open, find, side, close_tab, next_tab, zoom_in, zoom_out, zoom_reset, f11, esc, wheel) =
-            ctx.input(|i| {
-                let ctrl = i.modifiers.ctrl || i.modifiers.command;
-                (
-                    ctrl && i.key_pressed(Key::O),
-                    ctrl && i.key_pressed(Key::F),
-                    ctrl && i.key_pressed(Key::B),
-                    ctrl && i.key_pressed(Key::W),
-                    ctrl && i.key_pressed(Key::Tab),
-                    ctrl && (i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals)),
-                    ctrl && i.key_pressed(Key::Minus),
-                    ctrl && i.key_pressed(Key::Num0),
-                    i.key_pressed(Key::F11),
-                    i.key_pressed(Key::Escape),
-                    if ctrl { i.smooth_scroll_delta.y } else { 0.0 },
-                )
-            });
+        let typing = ctx.egui_wants_keyboard_input();
+        let (
+            open,
+            find,
+            side,
+            close_tab,
+            next_tab,
+            zoom_in,
+            zoom_out,
+            zoom_reset,
+            f11,
+            esc,
+            wheel,
+            copy,
+            select_all,
+            home,
+            end,
+            pg_up,
+            pg_dn,
+            space,
+            shift,
+            up,
+            down,
+        ) = ctx.input(|i| {
+            let ctrl = i.modifiers.ctrl || i.modifiers.command;
+            (
+                ctrl && i.key_pressed(Key::O),
+                ctrl && i.key_pressed(Key::F),
+                ctrl && i.key_pressed(Key::B),
+                ctrl && i.key_pressed(Key::W),
+                ctrl && i.key_pressed(Key::Tab),
+                ctrl && (i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals)),
+                ctrl && i.key_pressed(Key::Minus),
+                ctrl && i.key_pressed(Key::Num0),
+                i.key_pressed(Key::F11),
+                i.key_pressed(Key::Escape),
+                if ctrl { i.smooth_scroll_delta.y } else { 0.0 },
+                ctrl && i.key_pressed(Key::C),
+                ctrl && i.key_pressed(Key::A),
+                !typing && !ctrl && i.key_pressed(Key::Home),
+                !typing && !ctrl && i.key_pressed(Key::End),
+                !typing && !ctrl && i.key_pressed(Key::PageUp),
+                !typing && !ctrl && i.key_pressed(Key::PageDown),
+                !typing && !ctrl && i.key_pressed(Key::Space),
+                i.modifiers.shift,
+                !typing && !ctrl && i.key_pressed(Key::ArrowUp),
+                !typing && !ctrl && i.key_pressed(Key::ArrowDown),
+            )
+        });
 
         if open {
             self.pick_and_open_files();
@@ -667,6 +943,69 @@ impl HayakuApp {
                 self.show_search = false;
             }
         }
+
+        if copy && !typing && self.active_book.is_some() {
+            let is_flow = self
+                .active_book
+                .as_ref()
+                .is_some_and(|b| matches!(b.source, LoadedSource::Flow(_)));
+            let txt = if is_flow {
+                self.selected_flow_text()
+            } else {
+                self.selected_fixed_text()
+            };
+            if !txt.is_empty() {
+                ctx.copy_text(txt);
+                self.set_status("已复制选中文字。", Some(2));
+            }
+        }
+
+        if select_all && !typing && let Some(book) = &self.active_book {
+            match &book.source {
+                LoadedSource::Flow(_) => {
+                    if let Some(cache) = &self.flow_cache
+                        && !cache.items.is_empty()
+                    {
+                        let last = cache.items.len() - 1;
+                        let last_chars = cache.items[last].plain.chars().count();
+                        self.flow_sel_anchor = Some(FlowTextPos {
+                            item_idx: 0,
+                            char_idx: 0,
+                        });
+                        self.flow_sel_head = Some(FlowTextPos {
+                            item_idx: last,
+                            char_idx: last_chars,
+                        });
+                        self.set_status("已全选正文（Ctrl+C 可复制）。", Some(2));
+                    }
+                }
+                LoadedSource::Pdf(_) | LoadedSource::Word(_) => {
+                    self.fixed_all_selected = true;
+                    self.fixed_sel_anchor = None;
+                    self.fixed_sel_head = None;
+                    self.set_status("已全选全文内容（Ctrl+C 可复制）。", Some(2));
+                }
+            }
+        }
+
+        if self.active_book.is_some() && !typing {
+            let max_y = (self.last_content_h - self.last_viewport_h).max(0.0);
+            let step_page = (self.last_viewport_h * 0.88).max(120.0);
+            if home {
+                self.pending_scroll_y = Some(0.0);
+            } else if end {
+                self.pending_scroll_y = Some(max_y);
+            } else if pg_dn || (space && !shift) {
+                self.pending_scroll_y = Some((self.last_scroll_y + step_page).min(max_y));
+            } else if pg_up || (space && shift) {
+                self.pending_scroll_y = Some((self.last_scroll_y - step_page).max(0.0));
+            } else if down {
+                self.pending_scroll_y = Some((self.last_scroll_y + 72.0).min(max_y));
+            } else if up {
+                self.pending_scroll_y = Some((self.last_scroll_y - 72.0).max(0.0));
+            }
+        }
+
         if self.active_book.is_some() && (zoom_in || zoom_out || zoom_reset || wheel != 0.0) {
             let is_fixed = self
                 .active_book
@@ -802,13 +1141,26 @@ impl HayakuApp {
             )
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
-                    if ui
-                        .button("☰")
-                        .on_hover_text("切换侧栏 (Ctrl+B)")
-                        .clicked()
-                    {
+                    if let Some(logo) = &self.logo_texture {
+                        ui.add(egui::Image::new((logo.id(), Vec2::splat(22.0))));
+                    }
+                    let (side_rect, side_resp) =
+                        ui.allocate_exact_size(Vec2::new(30.0, 28.0), Sense::click());
+                    let side_resp = side_resp.on_hover_text("切换侧栏 (Ctrl+B)");
+                    if side_resp.hovered() || self.sidebar_open {
+                        ui.painter().rect_filled(side_rect, 5.0, p.side);
+                    }
+                    let sc = side_rect.center();
+                    for dy in [-4.5f32, 0.0, 4.5] {
+                        ui.painter().line_segment(
+                            [Pos2::new(sc.x - 6.5, sc.y + dy), Pos2::new(sc.x + 6.5, sc.y + dy)],
+                            Stroke::new(1.6, p.ink),
+                        );
+                    }
+                    if side_resp.clicked() {
                         self.sidebar_open = !self.sidebar_open;
                     }
+
                     if ui
                         .add(
                             egui::Button::new(RichText::new("打开文件").color(p.accent_ink))
@@ -823,7 +1175,7 @@ impl HayakuApp {
                         .as_ref()
                         .map(|b| b.title.as_str())
                         .unwrap_or("HayakuReader");
-                    let controls_reserve = 320.0;
+                    let controls_reserve = 360.0;
                     let drag_width = (ui.available_width() - controls_reserve).max(40.0);
                     let (drag_rect, drag_resp) = ui.allocate_exact_size(
                         Vec2::new(drag_width, 36.0),
@@ -832,7 +1184,7 @@ impl HayakuApp {
                     ui.painter().text(
                         drag_rect.left_center() + Vec2::new(6.0, 0.0),
                         egui::Align2::LEFT_CENTER,
-                        title,
+                        truncate_str(title, 48),
                         FontId::proportional(14.5),
                         p.ink,
                     );
@@ -844,46 +1196,89 @@ impl HayakuApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        let close_resp = ui
-                            .add_sized(
-                                [44.0, 44.0],
-                                egui::Button::new("✕").frame(false),
-                            )
-                            .on_hover_text("关闭");
+                        // Close button
+                        let (close_rect, close_resp) =
+                            ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::click());
+                        let close_resp = close_resp.on_hover_text("关闭");
                         if close_resp.hovered() {
-                            ui.painter()
-                                .rect_filled(close_resp.rect, 0.0, Color32::from_rgb(0xc4, 0x2b, 0x1c));
-                            ui.painter().text(
-                                close_resp.rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "✕",
-                                FontId::proportional(14.0),
-                                Color32::WHITE,
+                            ui.painter().rect_filled(
+                                close_rect,
+                                0.0,
+                                Color32::from_rgb(0xc4, 0x2b, 0x1c),
                             );
                         }
+                        let x_col = if close_resp.hovered() { Color32::WHITE } else { p.ink };
+                        let cc = close_rect.center();
+                        ui.painter().line_segment(
+                            [cc - Vec2::splat(5.0), cc + Vec2::splat(5.0)],
+                            Stroke::new(1.5, x_col),
+                        );
+                        ui.painter().line_segment(
+                            [cc + Vec2::new(-5.0, 5.0), cc + Vec2::new(5.0, -5.0)],
+                            Stroke::new(1.5, x_col),
+                        );
                         if close_resp.clicked() {
                             self.save_active_book();
                             self.save_workspace();
                             ui.ctx().send_viewport_cmd(ViewportCommand::Close);
                         }
-                        if ui
-                            .add_sized(
-                                [44.0, 44.0],
-                                egui::Button::new(if maximized { "❐" } else { "□" }).frame(false),
-                            )
-                            .on_hover_text(if maximized { "还原" } else { "最大化" })
-                            .clicked()
-                        {
+
+                        // Maximize / Restore button
+                        let (max_rect, max_resp) =
+                            ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::click());
+                        let max_resp =
+                            max_resp.on_hover_text(if maximized { "还原" } else { "最大化" });
+                        if max_resp.hovered() {
+                            ui.painter().rect_filled(max_rect, 0.0, p.side);
+                        }
+                        let mc = max_rect.center();
+                        if maximized {
+                            ui.painter().rect_stroke(
+                                Rect::from_center_size(mc + Vec2::new(1.5, -1.5), Vec2::splat(8.0)),
+                                0.0,
+                                Stroke::new(1.3, p.ink),
+                                StrokeKind::Inside,
+                            );
+                            ui.painter().rect_filled(
+                                Rect::from_center_size(mc + Vec2::new(-1.5, 1.5), Vec2::splat(8.0)),
+                                0.0,
+                                p.surface,
+                            );
+                            ui.painter().rect_stroke(
+                                Rect::from_center_size(mc + Vec2::new(-1.5, 1.5), Vec2::splat(8.0)),
+                                0.0,
+                                Stroke::new(1.3, p.ink),
+                                StrokeKind::Inside,
+                            );
+                        } else {
+                            ui.painter().rect_stroke(
+                                Rect::from_center_size(mc, Vec2::splat(10.0)),
+                                0.0,
+                                Stroke::new(1.3, p.ink),
+                                StrokeKind::Inside,
+                            );
+                        }
+                        if max_resp.clicked() {
                             ui.ctx()
                                 .send_viewport_cmd(ViewportCommand::Maximized(!maximized));
                         }
-                        if ui
-                            .add_sized([44.0, 44.0], egui::Button::new("—").frame(false))
-                            .on_hover_text("最小化")
-                            .clicked()
-                        {
+
+                        // Minimize button
+                        let (min_rect, min_resp) =
+                            ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::click());
+                        let min_resp = min_resp.on_hover_text("最小化");
+                        if min_resp.hovered() {
+                            ui.painter().rect_filled(min_rect, 0.0, p.side);
+                        }
+                        let mnc = min_rect.center();
+                        ui.painter().line_segment(
+                            [mnc - Vec2::new(5.5, 0.0), mnc + Vec2::new(5.5, 0.0)],
+                            Stroke::new(1.4, p.ink),
+                        );
+                        if min_resp.clicked() {
                             ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true));
                         }
+
                         ui.separator();
                         if ui.button("阅读设置").clicked() {
                             self.show_settings = !self.show_settings;
@@ -898,7 +1293,7 @@ impl HayakuApp {
                             if self
                                 .active_book
                                 .as_ref()
-                                .is_some_and(|b| b.kind == "markdown")
+                                .is_some_and(|b| matches!(b.kind, "markdown" | "html" | "xml"))
                             {
                                 let is_code = self
                                     .active_book
@@ -919,6 +1314,9 @@ impl HayakuApp {
                                         &self.data.join(format!("{}.json", b.id)),
                                         &b.state,
                                     );
+                                    self.flow_cache = None;
+                                    self.flow_sel_anchor = None;
+                                    self.flow_sel_head = None;
                                 }
                             }
                         }
@@ -1113,6 +1511,7 @@ impl HayakuApp {
                                 if ui.selectable_label(active, text).clicked() {
                                     self.pending_jump = Some(PendingJump {
                                         chapter: entry.index,
+                                        fragment: entry.fragment,
                                         fraction: 0.0,
                                     });
                                     self.current_unit = entry.index;
@@ -1153,6 +1552,7 @@ impl HayakuApp {
                         if let Some((unit, fraction)) = jump_to {
                             self.pending_jump = Some(PendingJump {
                                 chapter: unit,
+                                fragment: String::new(),
                                 fraction,
                             });
                             self.current_unit = unit;
@@ -1266,6 +1666,7 @@ impl HayakuApp {
                                 self.current_unit = next;
                                 self.pending_jump = Some(PendingJump {
                                     chapter: next,
+                                    fragment: String::new(),
                                     fraction: 0.0,
                                 });
                             }
@@ -1274,6 +1675,7 @@ impl HayakuApp {
                                 self.current_unit = prev;
                                 self.pending_jump = Some(PendingJump {
                                     chapter: prev,
+                                    fragment: String::new(),
                                     fraction: 0.0,
                                 });
                             }
@@ -1288,10 +1690,19 @@ impl HayakuApp {
         ScrollArea::vertical().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(36.0);
-                ui.label(RichText::new("HayakuReader (Native v2)").size(28.0).strong().color(p.ink));
+                if let Some(logo) = &self.logo_texture {
+                    ui.add(egui::Image::new((logo.id(), Vec2::splat(56.0))));
+                    ui.add_space(10.0);
+                }
+                ui.label(
+                    RichText::new("HayakuReader (Native v2)")
+                        .size(28.0)
+                        .strong()
+                        .color(p.ink),
+                );
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new("轻量原生 GPU 阅读器 · 支持 PDF、Word、EPUB、Kindle (AZW3/MOBI)、Markdown、TXT\n轻小说振假名（Ruby）与学术公式（行内 / 独行）原生高精度排版")
+                    RichText::new("轻量原生 GPU 阅读器 · 支持 PDF、Word、EPUB、Kindle、HTML、XML、Markdown、TXT\n轻小说振假名（Ruby）与学术公式（行内 / 独行）原生高精度排版")
                         .color(p.muted),
                 );
                 ui.add_space(16.0);
@@ -1363,12 +1774,13 @@ impl HayakuApp {
 
     fn draw_fixed_viewer(&mut self, ui: &mut Ui) {
         let smart_invert = self.is_smart_invert();
+        let p = self.palette();
         let avail_w = (ui.available_width() - 32.0).max(200.0);
         let ppp = ui.ctx().pixels_per_point();
-        let (book_id, is_pdf, page_sizes) = match self.active_book.as_ref() {
+        let (book_id, page_sizes) = match self.active_book.as_ref() {
             Some(book) => match &book.source {
-                LoadedSource::Pdf(pdf) => (book.id.clone(), true, pdf.page_sizes().to_vec()),
-                LoadedSource::Word(w) => (book.id.clone(), false, w.metadata.pages.clone()),
+                LoadedSource::Pdf(pdf) => (book.id.clone(), pdf.page_sizes().to_vec()),
+                LoadedSource::Word(w) => (book.id.clone(), w.metadata.pages.clone()),
                 LoadedSource::Flow(_) => return,
             },
             None => return,
@@ -1388,7 +1800,9 @@ impl HayakuApp {
         }
 
         let mut scroll = ScrollArea::vertical().id_salt("fixed_scroll");
-        if let Some(jump) = self.pending_jump.take()
+        if let Some(target_y) = self.pending_scroll_y.take() {
+            scroll = scroll.vertical_scroll_offset(target_y.max(0.0));
+        } else if let Some(jump) = self.pending_jump.take()
             && let Some(&(top, _, h)) = page_tops.get(jump.chapter)
         {
             scroll = scroll.vertical_scroll_offset((top - 12.0 + h * jump.fraction).max(0.0));
@@ -1398,7 +1812,14 @@ impl HayakuApp {
         let mut clicked_page: Option<usize> = None;
         let mut requested_menu: Option<ImageContextMenu> = None;
 
-        scroll.show_viewport(ui, |ui, viewport| {
+        let pointer_pos = ui.ctx().pointer_latest_pos();
+        let primary_pressed = ui.ctx().input(|i| i.pointer.primary_pressed());
+        let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
+        if !primary_down {
+            self.fixed_sel_dragging = false;
+        }
+
+        let scroll_out = scroll.show_viewport(ui, |ui, viewport| {
             let (rect, _) = ui.allocate_exact_size(
                 Vec2::new(avail_w.max(viewport.width()), total_h),
                 Sense::hover(),
@@ -1452,6 +1873,7 @@ impl HayakuApp {
                                     TextureOptions::LINEAR,
                                 );
                                 let links = pdf.page_links(idx);
+                                let pdf_runs = pdf.page_text_runs(idx);
                                 self.use_tick += 1;
                                 self.page_cache.insert(
                                     cache_key.clone(),
@@ -1459,6 +1881,7 @@ impl HayakuApp {
                                         scale_key,
                                         smart_invert,
                                         links,
+                                        pdf_runs,
                                         word_runs: Vec::new(),
                                         texture: tex,
                                         last_used: self.use_tick,
@@ -1499,6 +1922,7 @@ impl HayakuApp {
                                         scale_key,
                                         smart_invert,
                                         links: Vec::new(),
+                                        pdf_runs: Vec::new(),
                                         word_runs,
                                         texture: tex,
                                         last_used: self.use_tick,
@@ -1540,6 +1964,116 @@ impl HayakuApp {
                         Color32::WHITE,
                     );
 
+                    // Paint selected text runs
+                    if self.fixed_all_selected {
+                        for run in &cached.pdf_runs {
+                            let rr = Rect::from_min_size(
+                                Pos2::new(
+                                    page_rect.left() + run.rect_pt[0] * factor,
+                                    page_rect.top() + run.rect_pt[1] * factor,
+                                ),
+                                Vec2::new(run.rect_pt[2] * factor, run.rect_pt[3] * factor),
+                            );
+                            ui.painter().rect_filled(rr, 1.0, p.selection);
+                        }
+                        for run in &cached.word_runs {
+                            let rr = Rect::from_min_size(
+                                Pos2::new(
+                                    page_rect.left() + run.left * factor,
+                                    page_rect.top() + run.top * factor,
+                                ),
+                                Vec2::new(run.width * factor, (run.size * 1.2) * factor),
+                            );
+                            ui.painter().rect_filled(rr, 1.0, p.selection);
+                        }
+                    } else if let (Some(a), Some(b)) = (self.fixed_sel_anchor, self.fixed_sel_head) {
+                        let (s, e) = if a <= b { (a, b) } else { (b, a) };
+                        if s != e && idx >= s.page && idx <= e.page {
+                            let run_len = cached.pdf_runs.len().max(cached.word_runs.len());
+                            for ri in 0..run_len {
+                                let (rr, text_chars) = if !cached.pdf_runs.is_empty() {
+                                    let run = &cached.pdf_runs[ri];
+                                    (
+                                        Rect::from_min_size(
+                                            Pos2::new(
+                                                page_rect.left() + run.rect_pt[0] * factor,
+                                                page_rect.top() + run.rect_pt[1] * factor,
+                                            ),
+                                            Vec2::new(run.rect_pt[2] * factor, run.rect_pt[3] * factor),
+                                        ),
+                                        run.text.chars().count().max(1),
+                                    )
+                                } else {
+                                    let run = &cached.word_runs[ri];
+                                    (
+                                        Rect::from_min_size(
+                                            Pos2::new(
+                                                page_rect.left() + run.left * factor,
+                                                page_rect.top() + run.top * factor,
+                                            ),
+                                            Vec2::new(run.width * factor, (run.size * 1.2) * factor),
+                                        ),
+                                        run.text.chars().count().max(1),
+                                    )
+                                };
+                                let in_range = (idx > s.page || ri >= s.run_idx)
+                                    && (idx < e.page || ri <= e.run_idx);
+                                if !in_range {
+                                    continue;
+                                }
+                                let c0 = if idx == s.page && ri == s.run_idx {
+                                    s.char_idx.min(text_chars)
+                                } else {
+                                    0
+                                };
+                                let c1 = if idx == e.page && ri == e.run_idx {
+                                    e.char_idx.min(text_chars)
+                                } else {
+                                    text_chars
+                                };
+                                if c1 > c0 {
+                                    let f0 = c0 as f32 / text_chars as f32;
+                                    let f1 = c1 as f32 / text_chars as f32;
+                                    let sub = Rect::from_min_max(
+                                        Pos2::new(rr.left() + rr.width() * f0, rr.top()),
+                                        Pos2::new(rr.left() + rr.width() * f1, rr.bottom()),
+                                    );
+                                    ui.painter().rect_filled(sub, 1.0, p.selection);
+                                }
+                            }
+                        }
+                    }
+
+                    // Pointer drag selection over runs
+                    if let Some(pos) = pointer_pos
+                        && page_rect.contains(pos)
+                    {
+                        let hit = hit_test_fixed_page(
+                            idx,
+                            pos,
+                            page_rect,
+                            factor,
+                            &cached.pdf_runs,
+                            &cached.word_runs,
+                        );
+                        if hit.is_some() {
+                            ui.ctx().set_cursor_icon(CursorIcon::Text);
+                        }
+                        if primary_pressed {
+                            self.fixed_all_selected = false;
+                            if let Some(h) = hit {
+                                self.fixed_sel_anchor = Some(h);
+                                self.fixed_sel_head = Some(h);
+                                self.fixed_sel_dragging = true;
+                            } else {
+                                self.fixed_sel_anchor = None;
+                                self.fixed_sel_head = None;
+                            }
+                        } else if self.fixed_sel_dragging && primary_down && let Some(h) = hit {
+                            self.fixed_sel_head = Some(h);
+                        }
+                    }
+
                     // Interactive links overlay
                     for link in &cached.links {
                         let lr = Rect::from_min_size(
@@ -1549,7 +2083,12 @@ impl HayakuApp {
                             ),
                             Vec2::new(link.rect_pt[2] * factor, link.rect_pt[3] * factor),
                         );
-                        let resp = ui.interact(lr, ui.scope_id().with(("pdf-link", idx, lr.min.x as i32, lr.min.y as i32)), Sense::click());
+                        let resp = ui.interact(
+                            lr,
+                            ui.scope_id()
+                                .with(("pdf-link", idx, lr.min.x as i32, lr.min.y as i32)),
+                            Sense::click(),
+                        );
                         if resp.hovered() {
                             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                             ui.painter().rect_filled(
@@ -1561,8 +2100,8 @@ impl HayakuApp {
                         if resp.clicked() {
                             if let Some(u) = &link.uri {
                                 clicked_external = Some(u.clone());
-                            } else if let Some(p) = link.dest_page {
-                                clicked_page = Some(p);
+                            } else if let Some(dest_p) = link.dest_page {
+                                clicked_page = Some(dest_p);
                             }
                         }
                     }
@@ -1576,7 +2115,8 @@ impl HayakuApp {
                                 ),
                                 Vec2::new(run.width * factor, (run.size * 1.2) * factor),
                             );
-                            let resp = ui.interact(lr, ui.scope_id().with(("wlink", idx, ri)), Sense::click());
+                            let resp =
+                                ui.interact(lr, ui.scope_id().with(("wlink", idx, ri)), Sense::click());
                             if resp.hovered() {
                                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                                 ui.painter().rect_filled(
@@ -1621,25 +2161,23 @@ impl HayakuApp {
                                     }
                                 }
                                 LoadedSource::Word(word) => {
-                                    let hit_box = word
-                                        .metadata
-                                        .images
-                                        .get(idx)
-                                        .and_then(|boxes| {
-                                            boxes
-                                                .iter()
-                                                .filter(|[x, y, w, h]| {
-                                                    *w >= 8.0
-                                                        && *h >= 8.0
-                                                        && px_pt >= *x
-                                                        && px_pt <= *x + *w
-                                                        && py_pt >= *y
-                                                        && py_pt <= *y + *h
-                                                })
-                                                .min_by(|a, b| (a[2] * a[3]).total_cmp(&(b[2] * b[3])))
-                                                .copied()
-                                        });
-                                    if let Ok((rw, rh, rgba)) = word.render_rgba(idx, Some(desired_scale)) {
+                                    let hit_box = word.metadata.images.get(idx).and_then(|boxes| {
+                                        boxes
+                                            .iter()
+                                            .filter(|[x, y, w, h]| {
+                                                *w >= 8.0
+                                                    && *h >= 8.0
+                                                    && px_pt >= *x
+                                                    && px_pt <= *x + *w
+                                                    && py_pt >= *y
+                                                    && py_pt <= *y + *h
+                                            })
+                                            .min_by(|a, b| (a[2] * a[3]).total_cmp(&(b[2] * b[3])))
+                                            .copied()
+                                    });
+                                    if let Ok((rw, rh, rgba)) =
+                                        word.render_rgba(idx, Some(desired_scale))
+                                    {
                                         if let Some([bx, by, bw, bh]) = hit_box {
                                             let [pw, ph] = word.metadata.pages[idx];
                                             let sx = rw as f32 / pw.max(1.0);
@@ -1660,16 +2198,7 @@ impl HayakuApp {
                                         }
                                     }
                                     if let Ok(runs) = word.text_runs(idx) {
-                                        let wt: String = runs
-                                            .into_iter()
-                                            .map(|r| {
-                                                if r.line_break {
-                                                    format!("\n{}", r.text)
-                                                } else {
-                                                    r.text
-                                                }
-                                            })
-                                            .collect();
+                                        let wt = word_runs_plain(&runs);
                                         if !wt.trim().is_empty() {
                                             copy_text = Some(wt);
                                         }
@@ -1678,15 +2207,15 @@ impl HayakuApp {
                                 LoadedSource::Flow(_) => {}
                             }
                         }
-                        if let Some(png) = extracted_png {
-                            requested_menu = Some(ImageContextMenu {
-                                pos: pointer,
-                                label: kind_label.to_owned(),
-                                filename,
-                                png_bytes: Some(png),
-                                extra_text: copy_text,
-                            });
-                        }
+                        let sel = self.selected_fixed_text();
+                        requested_menu = Some(ImageContextMenu {
+                            pos: pointer,
+                            label: kind_label.to_owned(),
+                            filename,
+                            png_bytes: extracted_png,
+                            selected_text: (!sel.is_empty()).then_some(sel),
+                            extra_text: copy_text,
+                        });
                     }
                 } else {
                     ui.painter().rect_filled(page_rect, 0.0, Color32::WHITE);
@@ -1699,13 +2228,17 @@ impl HayakuApp {
             self.scroll_fraction = (vis_top / max_scroll).clamp(0.0, 1.0);
         });
 
-        let _ = is_pdf;
+        self.last_scroll_y = scroll_out.state.clamped_offset().y;
+        self.last_viewport_h = scroll_out.inner_rect.height();
+        self.last_content_h = scroll_out.content_size.y;
+
         if let Some(url) = clicked_external {
             self.handle_link_click(&LinkTarget::External(url));
         }
         if let Some(p) = clicked_page {
             self.pending_jump = Some(PendingJump {
                 chapter: p,
+                fragment: String::new(),
                 fraction: 0.0,
             });
             self.current_unit = p;
@@ -1715,85 +2248,556 @@ impl HayakuApp {
         }
     }
 
-    fn draw_flow_viewer(&mut self, ui: &mut Ui) {
-        let p = self.palette();
+    fn ensure_flow_cache(&mut self, ui: &Ui, measure: f32) {
+        let Some(book) = &self.active_book else {
+            self.flow_cache = None;
+            return;
+        };
+        let LoadedSource::Flow(flow) = &book.source else {
+            return;
+        };
+        let is_code_mode = book.state.view_mode.as_deref() == Some("code");
         let font_size = self.settings.font_size;
         let line_height = self.settings.line_height;
-        let measure = self.settings.text_width.min((ui.available_width() - 48.0).max(260.0));
+        let dark = self.theme_mode() == ThemeMode::Dark;
+        let key = FlowCacheKey {
+            book_id: book.id.clone(),
+            is_code_mode,
+            width_px: (measure.round() as i32).max(120),
+            font_size_tenths: (font_size * 10.0).round() as u32,
+            line_height_hundredths: (line_height * 100.0).round() as u32,
+            dark,
+        };
+        if self
+            .flow_cache
+            .as_ref()
+            .is_some_and(|c| c.key == key)
+        {
+            return;
+        }
+
+        let mut items = Vec::new();
+        let mut chapter_first_item = Vec::with_capacity(flow.chapters.len());
+        let mut anchor_to_item = HashMap::new();
+
+        if is_code_mode {
+            let lang = match book.kind {
+                "xml" | "html" => CodeLang::XmlHtml,
+                "markdown" => CodeLang::Markdown,
+                _ => CodeLang::Code,
+            };
+            let row_h = ((font_size * 0.88).max(12.0) * 1.48).ceil();
+            for (ci, ch) in flow.chapters.iter().enumerate() {
+                chapter_first_item.push(items.len());
+                if ci > 0 {
+                    items.push(FlowItemEntry {
+                        chapter_idx: ci,
+                        source: FlowSourceRef::Separator,
+                        height: 28.0,
+                        visual: None,
+                        plain: String::new(),
+                    });
+                }
+                for (ln, line) in ch.raw_source.split('\n').enumerate() {
+                    let clean_line = line.strip_suffix('\r').unwrap_or(line).to_owned();
+                    items.push(FlowItemEntry {
+                        chapter_idx: ci,
+                        source: FlowSourceRef::CodeLine {
+                            line_no: ln + 1,
+                            text: clean_line.clone(),
+                            lang,
+                        },
+                        height: row_h,
+                        visual: None,
+                        plain: clean_line,
+                    });
+                }
+            }
+        } else {
+            let chars_per_line = (measure / (font_size * 0.92)).max(12.0);
+            let line_px = font_size * line_height;
+            for (ci, ch) in flow.chapters.iter().enumerate() {
+                chapter_first_item.push(items.len());
+                let block_base = items.len();
+                if ci > 0 {
+                    items.push(FlowItemEntry {
+                        chapter_idx: ci,
+                        source: FlowSourceRef::Separator,
+                        height: 36.0,
+                        visual: None,
+                        plain: String::new(),
+                    });
+                }
+                let content_start = items.len();
+                for (bi, block) in ch.blocks.iter().enumerate() {
+                    let plain = block_plain_text(block);
+                    let est = estimate_block_height(block, &plain, chars_per_line, line_px, font_size);
+                    items.push(FlowItemEntry {
+                        chapter_idx: ci,
+                        source: FlowSourceRef::Block {
+                            chapter_idx: ci,
+                            block_idx: bi,
+                        },
+                        height: est,
+                        visual: None,
+                        plain,
+                    });
+                }
+                if content_start < items.len() {
+                    for (frag, &b_idx) in &ch.anchors {
+                        let mapped = (content_start + b_idx).min(items.len() - 1);
+                        anchor_to_item.insert((ci, frag.clone()), mapped);
+                    }
+                } else {
+                    anchor_to_item.insert((ci, String::new()), block_base);
+                }
+            }
+        }
+
+        let _ = ui;
+        self.flow_cache = Some(FlowLayoutCache {
+            key,
+            items,
+            chapter_first_item,
+            anchor_to_item,
+        });
+        self.flow_sel_anchor = None;
+        self.flow_sel_head = None;
+    }
+
+    fn draw_flow_viewer(&mut self, ui: &mut Ui) {
+        let p = self.palette();
+        let mode = self.theme_mode();
+        let font_size = self.settings.font_size;
+        let line_height = self.settings.line_height;
+        let avail_w = ui.available_width().max(260.0);
         let is_code_mode = self
             .active_book
             .as_ref()
             .and_then(|b| b.state.view_mode.as_deref())
             == Some("code");
+        let measure = if is_code_mode {
+            (avail_w - 64.0).clamp(320.0, 1180.0)
+        } else {
+            self.settings.text_width.min((avail_w - 48.0).max(260.0))
+        };
 
-        let (book_id, chapters, resources) = match self.active_book.as_ref() {
+        let (book_id, flow) = match self.active_book.as_ref() {
             Some(book) => match &book.source {
-                LoadedSource::Flow(flow) => {
-                    (book.id.clone(), flow.chapters.clone(), flow.resources.clone())
-                }
+                LoadedSource::Flow(flow) => (book.id.clone(), Arc::clone(flow)),
                 _ => return,
             },
             None => return,
         };
 
+        self.ensure_flow_cache(ui, measure);
+        if self.flow_cache.is_none() {
+            return;
+        }
+
+        // Resolve PendingJump into scroll offset before ScrollArea renders
+        let mut initial_scroll_offset: Option<f32> = self.pending_scroll_y.take();
+        if initial_scroll_offset.is_none()
+            && let Some(jump) = self.pending_jump.take()
+            && let Some(cache) = self.flow_cache.as_mut()
+        {
+            let target_item = if !jump.fragment.is_empty() {
+                cache
+                    .anchor_to_item
+                    .get(&(jump.chapter, jump.fragment.clone()))
+                    .copied()
+                    .or_else(|| cache.chapter_first_item.get(jump.chapter).copied())
+            } else {
+                cache.chapter_first_item.get(jump.chapter).copied()
+            };
+            if let Some(ti) = target_item {
+                let mut offset_y: f32 = 24.0
+                    + cache.items[..ti.min(cache.items.len())]
+                        .iter()
+                        .map(|it| it.height)
+                        .sum::<f32>();
+                if jump.fraction > 0.0 && jump.fragment.is_empty() {
+                    let ch_start = cache
+                        .chapter_first_item
+                        .get(jump.chapter)
+                        .copied()
+                        .unwrap_or(0);
+                    let ch_end = cache
+                        .chapter_first_item
+                        .get(jump.chapter + 1)
+                        .copied()
+                        .unwrap_or(cache.items.len());
+                    let ch_h: f32 = cache.items[ch_start..ch_end].iter().map(|it| it.height).sum();
+                    offset_y += ch_h * jump.fraction.clamp(0.0, 1.0);
+                }
+                initial_scroll_offset = Some((offset_y - 16.0).max(0.0));
+            }
+        }
+
+        let mut scroll = ScrollArea::vertical().id_salt("flow_scroll");
+        if let Some(target_y) = initial_scroll_offset {
+            scroll = scroll.vertical_scroll_offset(target_y);
+        }
+
         let mut clicked_link: Option<LinkTarget> = None;
         let mut requested_menu: Option<ImageContextMenu> = None;
 
-        ScrollArea::vertical()
-            .id_salt("flow_scroll")
-            .show(ui, |ui| {
-                let total_w = ui.available_width();
-                let side_pad = ((total_w - measure) * 0.5).max(16.0);
-                Frame::new()
-                    .inner_margin(Margin {
-                        left: side_pad as i8,
-                        right: side_pad as i8,
-                        top: 24,
-                        bottom: 64,
-                    })
-                    .show(ui, |ui| {
-                        ui.set_max_width(measure);
-                        if is_code_mode {
-                            for ch in &chapters {
-                                for (ln, line) in ch.raw_source.lines().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new(format!("{:>4} ", ln + 1))
-                                                .monospace()
-                                                .color(p.muted),
-                                        );
-                                        ui.label(RichText::new(line).monospace().color(p.ink));
-                                    });
+        let pointer_pos = ui.ctx().pointer_latest_pos();
+        let primary_pressed = ui.ctx().input(|i| i.pointer.primary_pressed());
+        let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
+        if !primary_down {
+            self.flow_sel_dragging = false;
+        }
+
+        let mut total_h = 88.0f32;
+        if let Some(cache) = &self.flow_cache {
+            total_h += cache.items.iter().map(|it| it.height).sum::<f32>();
+        }
+
+        let scroll_out = scroll.show_viewport(ui, |ui, viewport| {
+            let (canvas_rect, canvas_resp) =
+                ui.allocate_exact_size(Vec2::new(avail_w.max(viewport.width()), total_h), Sense::click());
+            let col_left = canvas_rect.left() + ((canvas_rect.width() - measure) * 0.5).max(16.0);
+            let vis_top = viewport.min.y;
+            let vis_bot = viewport.max.y;
+
+            let Some(cache) = self.flow_cache.as_mut() else {
+                return;
+            };
+
+            let mut cur_y = 24.0f32;
+            let mut first_visible_chapter: Option<usize> = None;
+            let sel_range = match (self.flow_sel_anchor, self.flow_sel_head) {
+                (Some(a), Some(b)) if a != b => {
+                    if a <= b {
+                        Some((a, b))
+                    } else {
+                        Some((b, a))
+                    }
+                }
+                _ => None,
+            };
+
+            let mut new_hit_pos: Option<FlowTextPos> = None;
+            let mut hover_text_cursor = false;
+
+            for idx in 0..cache.items.len() {
+                let item_h = cache.items[idx].height;
+                let item_top = cur_y;
+                let item_bot = cur_y + item_h;
+                cur_y = item_bot;
+
+                if item_bot >= vis_top && item_top <= vis_bot && first_visible_chapter.is_none() {
+                    first_visible_chapter = Some(cache.items[idx].chapter_idx);
+                }
+
+                if item_bot < vis_top - 450.0 || item_top > vis_bot + 450.0 {
+                    continue;
+                }
+
+                // Lazily build cached layout for visible item
+                if cache.items[idx].visual.is_none() {
+                    let mut ctx = FlowDrawCtx {
+                        book_id: &book_id,
+                        palette: p,
+                        mode,
+                        font_size,
+                        line_height,
+                        max_width: measure,
+                        resources: &flow.resources,
+                        math_cache: &mut self.math_cache,
+                        math_textures: &mut self.math_textures,
+                        image_textures: &mut self.image_textures,
+                        clicked_link: &mut clicked_link,
+                        requested_menu: &mut requested_menu,
+                    };
+                    let (visual, real_h) =
+                        build_flow_item_visual(ui, &cache.items[idx].source, &flow, &mut ctx);
+                    cache.items[idx].visual = Some(visual);
+                    cache.items[idx].height = real_h;
+                }
+
+                let actual_h = cache.items[idx].height;
+                let item_rect = Rect::from_min_size(
+                    Pos2::new(col_left, canvas_rect.top() + item_top),
+                    Vec2::new(measure, actual_h),
+                );
+
+                // Selection highlight + paint
+                let item_sel = sel_range.and_then(|(s, e)| {
+                    if idx < s.item_idx || idx > e.item_idx {
+                        return None;
+                    }
+                    let total_c = cache.items[idx].plain.chars().count();
+                    let c0 = if idx == s.item_idx {
+                        s.char_idx.min(total_c)
+                    } else {
+                        0
+                    };
+                    let c1 = if idx == e.item_idx {
+                        e.char_idx.min(total_c)
+                    } else {
+                        total_c
+                    };
+                    (c1 > c0).then_some((c0, c1))
+                });
+
+                if let Some(visual) = cache.items[idx].visual.as_ref() {
+                    match visual {
+                        FlowVisual::Separator => {
+                            let mid_y = item_rect.center().y;
+                            ui.painter().line_segment(
+                                [
+                                    Pos2::new(item_rect.left(), mid_y),
+                                    Pos2::new(item_rect.right(), mid_y),
+                                ],
+                                Stroke::new(1.0, p.line),
+                            );
+                        }
+                        FlowVisual::SingleGalley {
+                            galley,
+                            pad_top,
+                            links,
+                            code_box,
+                            quote_bar,
+                        } => {
+                            let content_pos = Pos2::new(
+                                item_rect.left()
+                                    + if *code_box {
+                                        10.0
+                                    } else if *quote_bar {
+                                        14.0
+                                    } else {
+                                        0.0
+                                    },
+                                item_rect.top() + *pad_top,
+                            );
+                            if *code_box {
+                                let box_r = Rect::from_min_size(
+                                    Pos2::new(item_rect.left(), item_rect.top() + 2.0),
+                                    Vec2::new(
+                                        (galley.rect.width() + 20.0).min(measure),
+                                        galley.rect.height() + 18.0,
+                                    ),
+                                );
+                                ui.painter().rect_filled(box_r, 8.0, p.code_bg);
+                                ui.painter().rect_stroke(
+                                    box_r,
+                                    8.0,
+                                    Stroke::new(1.0, p.line),
+                                    StrokeKind::Inside,
+                                );
+                            } else if *quote_bar {
+                                ui.painter().line_segment(
+                                    [
+                                        Pos2::new(item_rect.left() + 4.0, item_rect.top() + 4.0),
+                                        Pos2::new(
+                                            item_rect.left() + 4.0,
+                                            item_rect.top() + galley.rect.height() + 6.0,
+                                        ),
+                                    ],
+                                    Stroke::new(3.0, p.accent),
+                                );
+                            }
+                            if let Some((c0, c1)) = item_sel {
+                                paint_galley_selection(ui, galley, content_pos, c0, c1, p.selection);
+                            }
+                            ui.painter().galley(content_pos, galley.clone(), p.ink);
+
+                            for lb in links {
+                                let lr = lb.rel_rect.translate(content_pos.to_vec2());
+                                let resp = ui.interact(
+                                    lr,
+                                    ui.scope_id()
+                                        .with(("flow-link", idx, lr.min.x as i32, lr.min.y as i32)),
+                                    Sense::click(),
+                                );
+                                if resp.hovered() {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                                if resp.clicked() {
+                                    clicked_link = Some(lb.target.clone());
                                 }
                             }
-                            return;
-                        }
-                        let mut ctx = FlowDrawCtx {
-                            book_id: &book_id,
-                            palette: p,
-                            font_size,
-                            line_height,
-                            max_width: measure,
-                            resources: &resources,
-                            math_cache: &mut self.math_cache,
-                            math_textures: &mut self.math_textures,
-                            image_textures: &mut self.image_textures,
-                            clicked_link: &mut clicked_link,
-                            requested_menu: &mut requested_menu,
-                        };
-                        for (idx, chapter) in chapters.iter().enumerate() {
-                            if idx > 0 {
-                                ui.add_space(18.0);
-                                ui.separator();
-                                ui.add_space(18.0);
-                            }
-                            for block in &chapter.blocks {
-                                draw_flow_block(ui, block, &mut ctx);
-                                ui.add_space(font_size * 0.55);
+
+                            if let Some(pos) = pointer_pos
+                                && item_rect.contains(pos)
+                            {
+                                hover_text_cursor = true;
+                                let local = pos - content_pos;
+                                let cursor = galley.cursor_from_pos(local);
+                                new_hit_pos = Some(FlowTextPos {
+                                    item_idx: idx,
+                                    char_idx: cursor.index.into(),
+                                });
                             }
                         }
+                        FlowVisual::CodeLine {
+                            line_no_galley,
+                            code_galley,
+                        } => {
+                            let num_w = 52.0;
+                            ui.painter().galley(
+                                Pos2::new(item_rect.left(), item_rect.top() + 2.0),
+                                line_no_galley.clone(),
+                                p.muted,
+                            );
+                            let code_pos =
+                                Pos2::new(item_rect.left() + num_w, item_rect.top() + 2.0);
+                            if let Some((c0, c1)) = item_sel {
+                                paint_galley_selection(
+                                    ui,
+                                    code_galley,
+                                    code_pos,
+                                    c0,
+                                    c1,
+                                    p.selection,
+                                );
+                            }
+                            ui.painter().galley(code_pos, code_galley.clone(), p.ink);
+                            if let Some(pos) = pointer_pos
+                                && item_rect.contains(pos)
+                            {
+                                hover_text_cursor = true;
+                                let cursor = code_galley.cursor_from_pos(pos - code_pos);
+                                new_hit_pos = Some(FlowTextPos {
+                                    item_idx: idx,
+                                    char_idx: cursor.index.into(),
+                                });
+                            }
+                        }
+                        FlowVisual::RichLines {
+                            lines,
+                            char_boxes,
+                            pad_top,
+                            extra_gap,
+                            base_ascent,
+                        } => {
+                            if let Some((c0, c1)) = item_sel {
+                                for r in &char_boxes[c0..c1.min(char_boxes.len())] {
+                                    ui.painter().rect_filled(
+                                        r.translate(item_rect.min.to_vec2() + Vec2::new(0.0, *pad_top)),
+                                        1.0,
+                                        p.selection,
+                                    );
+                                }
+                            }
+                            let mut click_hit_boxes = Vec::new();
+                            paint_measured_lines(
+                                ui,
+                                lines,
+                                Pos2::new(item_rect.left(), item_rect.top() + *pad_top),
+                                *base_ascent,
+                                *extra_gap,
+                                p,
+                                &mut click_hit_boxes,
+                            );
+                            for (lr, target) in click_hit_boxes {
+                                let resp = ui.interact(
+                                    lr,
+                                    ui.scope_id()
+                                        .with(("rich-link", idx, lr.min.x as i32, lr.min.y as i32)),
+                                    Sense::click(),
+                                );
+                                if resp.hovered() {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                                if resp.clicked() {
+                                    clicked_link = Some(target);
+                                }
+                            }
+                            if let Some(pos) = pointer_pos
+                                && item_rect.contains(pos)
+                            {
+                                hover_text_cursor = true;
+                                let origin = item_rect.min + Vec2::new(0.0, *pad_top);
+                                let rel = pos - origin;
+                                let ci = hit_test_char_boxes(rel, char_boxes);
+                                new_hit_pos = Some(FlowTextPos {
+                                    item_idx: idx,
+                                    char_idx: ci,
+                                });
+                            }
+                        }
+                        FlowVisual::FallbackBlock => {
+                            if let FlowSourceRef::Block {
+                                chapter_idx,
+                                block_idx,
+                            } = &cache.items[idx].source
+                            {
+                                let block = &flow.chapters[*chapter_idx].blocks[*block_idx];
+                                let mut ctx = FlowDrawCtx {
+                                    book_id: &book_id,
+                                    palette: p,
+                                    mode,
+                                    font_size,
+                                    line_height,
+                                    max_width: measure,
+                                    resources: &flow.resources,
+                                    math_cache: &mut self.math_cache,
+                                    math_textures: &mut self.math_textures,
+                                    image_textures: &mut self.image_textures,
+                                    clicked_link: &mut clicked_link,
+                                    requested_menu: &mut requested_menu,
+                                };
+                                let unclipped = Rect::from_min_size(
+                                    item_rect.min,
+                                    Vec2::new(measure, 10_000.0),
+                                );
+                                let scoped =
+                                    ui.scope_builder(UiBuilder::new().max_rect(unclipped), |ui| {
+                                        draw_flow_block_fallback(ui, block, &mut ctx);
+                                    });
+                                let real_h =
+                                    (scoped.response.rect.height() + font_size * 0.55).max(20.0);
+                                cache.items[idx].height = real_h;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if hover_text_cursor {
+                ui.ctx().set_cursor_icon(CursorIcon::Text);
+            }
+            if primary_pressed && canvas_resp.hovered() {
+                if let Some(pos) = new_hit_pos {
+                    self.flow_sel_anchor = Some(pos);
+                    self.flow_sel_head = Some(pos);
+                    self.flow_sel_dragging = true;
+                } else {
+                    self.flow_sel_anchor = None;
+                    self.flow_sel_head = None;
+                }
+            } else if self.flow_sel_dragging && primary_down && let Some(pos) = new_hit_pos {
+                self.flow_sel_head = Some(pos);
+            }
+            if canvas_resp.secondary_clicked()
+                && let Some(pointer) = pointer_pos
+            {
+                let sel = self.selected_flow_text();
+                if !sel.is_empty() {
+                    requested_menu = Some(ImageContextMenu {
+                        pos: pointer,
+                        label: String::new(),
+                        filename: String::new(),
+                        png_bytes: None,
+                        selected_text: Some(sel),
+                        extra_text: None,
                     });
-            });
+                }
+            }
+
+            if let Some(cu) = first_visible_chapter {
+                self.current_unit = cu;
+            }
+            let max_s = (total_h - viewport.height()).max(1.0);
+            self.scroll_fraction = (vis_top / max_s).clamp(0.0, 1.0);
+        });
+
+        self.last_scroll_y = scroll_out.state.clamped_offset().y;
+        self.last_viewport_h = scroll_out.inner_rect.height();
+        self.last_content_h = scroll_out.content_size.y;
 
         if let Some(target) = clicked_link {
             self.handle_link_click(&target);
@@ -1847,10 +2851,10 @@ impl HayakuApp {
                         .inner_margin(Margin::same(6))
                         .show(ui, |ui| {
                             ui.set_min_width(150.0);
-                            if let Some(txt) = &menu.extra_text
-                                && ui.button("复制本页文字").clicked()
+                            if let Some(sel) = &menu.selected_text
+                                && ui.button("复制选中文字").clicked()
                             {
-                                copy_text = Some(txt.clone());
+                                copy_text = Some(sel.clone());
                                 keep = false;
                             }
                             if let Some(bytes) = &menu.png_bytes {
@@ -1858,29 +2862,29 @@ impl HayakuApp {
                                     copy_bytes = Some(bytes.clone());
                                     keep = false;
                                 }
-                                let save_lbl = if menu.label == "复制图像" {
-                                    "图像另存为…"
-                                } else {
-                                    "此页另存为图片…"
-                                };
-                                if ui.button(save_lbl).clicked() {
+                                if ui.button("图像另存为 PNG…").clicked() {
                                     save_req = Some((bytes.clone(), menu.filename.clone()));
                                     keep = false;
                                 }
                             }
+                            if let Some(txt) = &menu.extra_text
+                                && ui.button("复制本页文字").clicked()
+                            {
+                                copy_text = Some(txt.clone());
+                                keep = false;
+                            }
+                            if ui.button("取消").clicked() {
+                                keep = false;
+                            }
                         })
                         .response;
-                    if ctx.input(|i| i.pointer.any_pressed())
-                        && !frame_resp.rect.contains(
-                            ctx.pointer_interact_pos().unwrap_or(Pos2::ZERO),
-                        )
-                    {
+                    if ctx.input(|i| i.pointer.primary_pressed()) && !frame_resp.hovered() {
                         keep = false;
                     }
                 });
             if let Some(txt) = copy_text {
                 ctx.copy_text(txt);
-                self.set_status("已复制文字。", Some(2));
+                self.set_status("已复制文字到剪贴板。", Some(2));
             }
             if let Some(bytes) = copy_bytes {
                 match platform::set_clipboard_png(&bytes) {
@@ -2059,6 +3063,7 @@ impl HayakuApp {
                 });
             if changed {
                 self.page_cache.clear();
+                self.flow_cache = None;
                 self.save_settings();
                 self.maybe_trigger_smart_invert_hint();
             }
@@ -2120,6 +3125,7 @@ impl HayakuApp {
                 let unit = self.search_matches[self.search_cursor].unit;
                 self.pending_jump = Some(PendingJump {
                     chapter: unit,
+                    fragment: String::new(),
                     fraction: 0.0,
                 });
                 self.current_unit = unit;
@@ -2334,6 +3340,7 @@ impl eframe::App for HayakuApp {
 struct FlowDrawCtx<'a> {
     book_id: &'a str,
     palette: Palette,
+    mode: ThemeMode,
     font_size: f32,
     line_height: f32,
     max_width: f32,
@@ -2348,17 +3355,20 @@ struct FlowDrawCtx<'a> {
 enum LineItem {
     Text {
         galley: Arc<egui::Galley>,
+        text: String,
         link: Option<LinkTarget>,
         code_bg: bool,
     },
     Ruby {
         base: Arc<egui::Galley>,
         rt: Arc<egui::Galley>,
+        base_str: String,
     },
     Math {
         tex: egui::TextureId,
         size: Vec2,
         baseline_from_top: f32,
+        latex: String,
     },
 }
 
@@ -2368,11 +3378,458 @@ struct MeasuredLine {
     descent: f32,
 }
 
-fn flatten_inline_tokens(
+enum FlatToken {
+    Text {
+        text: String,
+        italic: bool,
+        strike: bool,
+        code: bool,
+        superscript: bool,
+        subscript: bool,
+        link: Option<LinkTarget>,
+    },
+    Ruby {
+        base: String,
+        annotation: String,
+    },
+    Math {
+        latex: String,
+    },
+    LineBreak,
+}
+
+fn contains_ruby_or_math(inlines: &[Inline]) -> bool {
+    inlines.iter().any(|inl| match inl {
+        Inline::Ruby { .. } | Inline::InlineMath { .. } => true,
+        Inline::Styled {
+            superscript,
+            subscript,
+            inlines,
+            ..
+        } => *superscript || *subscript || contains_ruby_or_math(inlines),
+        Inline::Link { inlines, .. } => contains_ruby_or_math(inlines),
+        _ => false,
+    })
+}
+
+fn inlines_plain_text(inlines: &[Inline], out: &mut String) {
+    for inl in inlines {
+        match inl {
+            Inline::Text(t) => out.push_str(t),
+            Inline::Styled { inlines, .. } | Inline::Link { inlines, .. } => {
+                inlines_plain_text(inlines, out);
+            }
+            Inline::Ruby { base, .. } => out.push_str(base),
+            Inline::InlineMath { latex } => out.push_str(latex),
+            Inline::LineBreak => out.push('\n'),
+        }
+    }
+}
+
+fn block_plain_text(block: &Block) -> String {
+    let mut s = String::new();
+    match block {
+        Block::Heading { inlines, .. } | Block::Paragraph(inlines) => {
+            inlines_plain_text(inlines, &mut s);
+        }
+        Block::Code { code, .. } => s.push_str(code),
+        Block::DisplayMath { latex } => s.push_str(latex),
+        Block::Quote(inner) => {
+            for b in inner {
+                let sub = block_plain_text(b);
+                if !sub.is_empty() {
+                    if !s.is_empty() {
+                        s.push('\n');
+                    }
+                    s.push_str(&sub);
+                }
+            }
+        }
+        Block::List { items, .. } => {
+            for item in items {
+                for b in item {
+                    let sub = block_plain_text(b);
+                    if !sub.is_empty() {
+                        if !s.is_empty() {
+                            s.push('\n');
+                        }
+                        s.push_str(&sub);
+                    }
+                }
+            }
+        }
+        Block::Table { headers, rows } => {
+            for cell in headers {
+                inlines_plain_text(cell, &mut s);
+                s.push('\t');
+            }
+            for row in rows {
+                if !s.is_empty() {
+                    s.push('\n');
+                }
+                for cell in row {
+                    inlines_plain_text(cell, &mut s);
+                    s.push('\t');
+                }
+            }
+        }
+        Block::Image { alt, .. } => s.push_str(alt),
+        Block::Rule => {}
+    }
+    s
+}
+
+fn estimate_block_height(
+    block: &Block,
+    plain: &str,
+    chars_per_line: f32,
+    line_px: f32,
+    font_size: f32,
+) -> f32 {
+    let gap = font_size * 0.55;
+    match block {
+        Block::Heading { level, .. } => {
+            let mul = match level {
+                1 => 1.65,
+                2 => 1.38,
+                3 => 1.2,
+                _ => 1.08,
+            };
+            let lines = ((plain.chars().count() as f32) / (chars_per_line / mul)).ceil().max(1.0);
+            lines * line_px * mul + 8.0 + gap
+        }
+        Block::Paragraph(_) => {
+            let lines = ((plain.chars().count() as f32) / chars_per_line).ceil().max(1.0);
+            lines * line_px + gap
+        }
+        Block::Code { code, .. } => {
+            let lines = code.lines().count().max(1) as f32;
+            lines * (font_size * 0.85 * 1.4) + 22.0 + gap
+        }
+        Block::DisplayMath { .. } => font_size * 2.8 + 14.0 + gap,
+        Block::Image { .. } => 260.0 + gap,
+        Block::Rule => 14.0 + gap,
+        Block::Quote(inner) => {
+            let sum: f32 = inner
+                .iter()
+                .map(|b| estimate_block_height(b, &block_plain_text(b), chars_per_line, line_px, font_size))
+                .sum();
+            sum + 12.0 + gap
+        }
+        Block::List { items, .. } => {
+            let mut sum = gap;
+            for item in items {
+                for b in item {
+                    sum += estimate_block_height(b, &block_plain_text(b), chars_per_line, line_px, font_size);
+                }
+            }
+            sum
+        }
+        Block::Table { rows, .. } => (rows.len().max(1) as f32 + 1.0) * (line_px + 6.0) + 16.0 + gap,
+    }
+}
+
+fn build_single_galley_inlines(
+    ui: &Ui,
+    inlines: &[Inline],
+    fsize: f32,
+    palette: Palette,
+    max_w: f32,
+) -> (Arc<egui::Galley>, String, Vec<HitLinkBox>) {
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = max_w;
+    let mut plain = String::new();
+    let mut link_spans: Vec<(usize, usize, LinkTarget)> = Vec::new();
+    append_job_inlines(
+        inlines,
+        false,
+        false,
+        false,
+        None,
+        fsize,
+        palette,
+        &mut job,
+        &mut plain,
+        &mut link_spans,
+    );
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let mut hit_links = Vec::new();
+    for (c0, c1, target) in link_spans {
+        if c1 > c0 {
+            let mut offset = 0usize;
+            for row in &galley.rows {
+                let len = row.row.glyphs.len();
+                let end = offset + len + usize::from(row.ends_with_newline);
+                if c1 > offset && c0 < offset + len {
+                    let s0 = c0.saturating_sub(offset).min(len);
+                    let s1 = c1.saturating_sub(offset).min(len);
+                    if s1 > s0 {
+                        let x0 = row.pos.x + row.row.glyphs[s0].pos.x;
+                        let last = &row.row.glyphs[s1 - 1];
+                        let x1 = row.pos.x + last.pos.x + last.advance_width;
+                        let r = Rect::from_min_max(
+                            Pos2::new(x0, row.pos.y),
+                            Pos2::new(x1, row.pos.y + row.rect().height()),
+                        );
+                        hit_links.push(HitLinkBox {
+                            rel_rect: r,
+                            target: target.clone(),
+                        });
+                    }
+                }
+                offset = end;
+            }
+        }
+    }
+    (galley, plain, hit_links)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_job_inlines(
     inlines: &[Inline],
     italic: bool,
     strike: bool,
     code: bool,
+    link: Option<LinkTarget>,
+    fsize: f32,
+    palette: Palette,
+    job: &mut LayoutJob,
+    plain: &mut String,
+    link_spans: &mut Vec<(usize, usize, LinkTarget)>,
+) {
+    for inl in inlines {
+        match inl {
+            Inline::Text(text) => {
+                let start = plain.chars().count();
+                plain.push_str(text);
+                let end = plain.chars().count();
+                let color = if link.is_some() { palette.accent } else { palette.ink };
+                let fid = if code {
+                    FontId::monospace(fsize * 0.92)
+                } else {
+                    FontId::proportional(fsize)
+                };
+                job.append(
+                    text,
+                    0.0,
+                    egui::TextFormat {
+                        font_id: fid,
+                        color,
+                        background: if code { palette.code_bg } else { Color32::TRANSPARENT },
+                        italics: italic,
+                        underline: if link.is_some() {
+                            Stroke::new(1.0, palette.accent)
+                        } else {
+                            Stroke::NONE
+                        },
+                        strikethrough: if strike { Stroke::new(1.0, color) } else { Stroke::NONE },
+                        ..Default::default()
+                    },
+                );
+                if let Some(t) = &link {
+                    link_spans.push((start, end, t.clone()));
+                }
+            }
+            Inline::LineBreak => {
+                plain.push('\n');
+                job.append(
+                    "\n",
+                    0.0,
+                    egui::TextFormat {
+                        font_id: FontId::proportional(fsize),
+                        color: palette.ink,
+                        ..Default::default()
+                    },
+                );
+            }
+            Inline::Styled {
+                italic: it,
+                strike: st,
+                code: cd,
+                inlines,
+                ..
+            } => append_job_inlines(
+                inlines,
+                italic || *it,
+                strike || *st,
+                code || *cd,
+                link.clone(),
+                fsize,
+                palette,
+                job,
+                plain,
+                link_spans,
+            ),
+            Inline::Link { target, inlines } => append_job_inlines(
+                inlines,
+                italic,
+                strike,
+                code,
+                Some(target.clone()),
+                fsize,
+                palette,
+                job,
+                plain,
+                link_spans,
+            ),
+            Inline::Ruby { .. } | Inline::InlineMath { .. } => {}
+        }
+    }
+}
+
+fn build_flow_item_visual(
+    ui: &mut Ui,
+    source: &FlowSourceRef,
+    flow: &FlowDocument,
+    ctx: &mut FlowDrawCtx<'_>,
+) -> (FlowVisual, f32) {
+    let gap = ctx.font_size * 0.55;
+    match source {
+        FlowSourceRef::Separator => (FlowVisual::Separator, 36.0),
+        FlowSourceRef::CodeLine {
+            line_no,
+            text,
+            lang,
+        } => {
+            let fsize = (ctx.font_size * 0.88).max(12.0);
+            let num_galley = ui.fonts_mut(|f| {
+                f.layout_no_wrap(format!("{line_no:>5}"), FontId::monospace(fsize), ctx.palette.muted)
+            });
+            let mut job = highlight::highlight_line(text, *lang, ctx.mode, fsize);
+            job.wrap.max_width = (ctx.max_width - 56.0).max(120.0);
+            let code_galley = ui.fonts_mut(|f| f.layout_job(job));
+            let h = (code_galley.rect.height() + 6.0).max(fsize * 1.48);
+            (
+                FlowVisual::CodeLine {
+                    line_no_galley: num_galley,
+                    code_galley,
+                },
+                h,
+            )
+        }
+        FlowSourceRef::Block {
+            chapter_idx,
+            block_idx,
+        } => {
+            let block = &flow.chapters[*chapter_idx].blocks[*block_idx];
+            match block {
+                Block::Heading { level, inlines, .. } => {
+                    let mul = match level {
+                        1 => 1.65,
+                        2 => 1.38,
+                        3 => 1.2,
+                        _ => 1.08,
+                    };
+                    if contains_ruby_or_math(inlines) {
+                        let (lines, _, char_boxes, extra_gap, base_ascent, total_h) =
+                            measure_rich_lines(ui, inlines, mul, ctx);
+                        (
+                            FlowVisual::RichLines {
+                                lines,
+                                char_boxes,
+                                pad_top: 6.0,
+                                extra_gap,
+                                base_ascent,
+                            },
+                            total_h + 6.0 + gap,
+                        )
+                    } else {
+                        let (galley, _, links) = build_single_galley_inlines(
+                            ui,
+                            inlines,
+                            ctx.font_size * mul,
+                            ctx.palette,
+                            ctx.max_width,
+                        );
+                        let h = galley.rect.height() + 8.0 + gap;
+                        (
+                            FlowVisual::SingleGalley {
+                                galley,
+                                pad_top: 6.0,
+                                links,
+                                code_box: false,
+                                quote_bar: false,
+                            },
+                            h,
+                        )
+                    }
+                }
+                Block::Paragraph(inlines) => {
+                    if contains_ruby_or_math(inlines) {
+                        let (lines, _, char_boxes, extra_gap, base_ascent, total_h) =
+                            measure_rich_lines(ui, inlines, 1.0, ctx);
+                        (
+                            FlowVisual::RichLines {
+                                lines,
+                                char_boxes,
+                                pad_top: 0.0,
+                                extra_gap,
+                                base_ascent,
+                            },
+                            total_h + gap,
+                        )
+                    } else {
+                        let (galley, _, links) = build_single_galley_inlines(
+                            ui,
+                            inlines,
+                            ctx.font_size,
+                            ctx.palette,
+                            ctx.max_width,
+                        );
+                        let h = galley.rect.height() + gap;
+                        (
+                            FlowVisual::SingleGalley {
+                                galley,
+                                pad_top: 0.0,
+                                links,
+                                code_box: false,
+                                quote_bar: false,
+                            },
+                            h,
+                        )
+                    }
+                }
+                Block::Code { lang, code } => {
+                    let fsize = (ctx.font_size * 0.85).max(12.0);
+                    let detected = highlight::detect_lang(lang);
+                    let mut job = highlight::highlight_block(code, detected, ctx.mode, fsize);
+                    job.wrap.max_width = (ctx.max_width - 24.0).max(120.0);
+                    let galley = ui.fonts_mut(|f| f.layout_job(job));
+                    let h = galley.rect.height() + 22.0 + gap;
+                    (
+                        FlowVisual::SingleGalley {
+                            galley,
+                            pad_top: 10.0,
+                            links: Vec::new(),
+                            code_box: true,
+                            quote_bar: false,
+                        },
+                        h,
+                    )
+                }
+                Block::Rule => (FlowVisual::Separator, 18.0 + gap),
+                Block::Quote(_)
+                | Block::List { .. }
+                | Block::Table { .. }
+                | Block::DisplayMath { .. }
+                | Block::Image { .. } => (FlowVisual::FallbackBlock, 48.0),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct InlineFlags {
+    italic: bool,
+    strike: bool,
+    code: bool,
+    superscript: bool,
+    subscript: bool,
+}
+
+fn flatten_inline_tokens(
+    inlines: &[Inline],
+    flags: InlineFlags,
     link: Option<LinkTarget>,
     out: &mut Vec<FlatToken>,
 ) {
@@ -2382,9 +3839,11 @@ fn flatten_inline_tokens(
                 for tok in split_wrap_tokens(text) {
                     out.push(FlatToken::Text {
                         text: tok,
-                        italic,
-                        strike,
-                        code,
+                        italic: flags.italic,
+                        strike: flags.strike,
+                        code: flags.code,
+                        superscript: flags.superscript,
+                        subscript: flags.subscript,
                         link: link.clone(),
                     });
                 }
@@ -2394,24 +3853,23 @@ fn flatten_inline_tokens(
                 italic: it,
                 strike: st,
                 code: cd,
+                superscript: sup,
+                subscript: sub,
                 inlines,
             } => flatten_inline_tokens(
                 inlines,
-                italic || *it,
-                strike || *st,
-                code || *cd,
+                InlineFlags {
+                    italic: flags.italic || *it,
+                    strike: flags.strike || *st,
+                    code: flags.code || *cd,
+                    superscript: flags.superscript || *sup,
+                    subscript: flags.subscript || *sub,
+                },
                 link.clone(),
                 out,
             ),
             Inline::Link { target, inlines } => {
-                flatten_inline_tokens(
-                    inlines,
-                    italic,
-                    strike,
-                    code,
-                    Some(target.clone()),
-                    out,
-                );
+                flatten_inline_tokens(inlines, flags, Some(target.clone()), out);
             }
             Inline::Ruby { base, annotation } => {
                 out.push(FlatToken::Ruby {
@@ -2429,24 +3887,6 @@ fn flatten_inline_tokens(
     }
 }
 
-enum FlatToken {
-    Text {
-        text: String,
-        italic: bool,
-        strike: bool,
-        code: bool,
-        link: Option<LinkTarget>,
-    },
-    Ruby {
-        base: String,
-        annotation: String,
-    },
-    Math {
-        latex: String,
-    },
-    LineBreak,
-}
-
 fn split_wrap_tokens(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut ascii_buf = String::new();
@@ -2462,18 +3902,7 @@ fn split_wrap_tokens(text: &str) -> Vec<String> {
             if !ascii_buf.is_empty() {
                 tokens.push(std::mem::take(&mut ascii_buf));
             }
-            if ch == ' ' {
-                if let Some(last) = tokens.last_mut()
-                    && !last.ends_with(' ')
-                    && !last.ends_with('\n')
-                {
-                    last.push(' ');
-                } else {
-                    tokens.push(" ".to_owned());
-                }
-            } else {
-                tokens.push(ch.to_string());
-            }
+            tokens.push(ch.to_string());
         }
     }
     if !ascii_buf.is_empty() {
@@ -2491,10 +3920,10 @@ fn get_or_load_math(
     math_cache: &mut MathCache,
     textures: &mut HashMap<MathTexKey, Option<CachedMathTex>>,
 ) -> Option<(egui::TextureId, Vec2, f32)> {
-    let ppp = ctx_ui.ctx().pixels_per_point();
     let color = [ink.r(), ink.g(), ink.b(), ink.a()];
+    let ppp = ctx_ui.ctx().pixels_per_point();
     let key = MathTexKey {
-        latex: latex.trim().to_owned(),
+        latex: latex.to_owned(),
         display,
         size_tenths: (font_size * 10.0).round() as u32,
         scale_hundredths: (ppp * 100.0).round() as u32,
@@ -2529,19 +3958,17 @@ fn get_or_load_math(
     out
 }
 
-fn draw_inline_flow(
+fn measure_rich_lines(
     ui: &mut Ui,
     inlines: &[Inline],
     scale_mul: f32,
-    _force_bold: bool,
     ctx: &mut FlowDrawCtx<'_>,
-) {
+) -> (Vec<MeasuredLine>, String, Vec<Rect>, f32, f32, f32) {
     let fsize = ctx.font_size * scale_mul;
-    let ppp = ui.ctx().pixels_per_point();
     let mut tokens = Vec::new();
-    flatten_inline_tokens(inlines, false, false, false, None, &mut tokens);
+    flatten_inline_tokens(inlines, InlineFlags::default(), None, &mut tokens);
 
-    let max_w = ui.available_width().min(ctx.max_width).max(60.0);
+    let max_w = ctx.max_width.max(60.0);
     let base_ascent = fsize * 0.92;
     let base_descent = fsize * 0.28;
     let rt_size = (fsize * 0.48).max(9.0);
@@ -2568,6 +3995,8 @@ fn draw_inline_flow(
                 italic,
                 strike,
                 code,
+                superscript,
+                subscript,
                 link,
             } => {
                 if text == "\n" {
@@ -2584,12 +4013,19 @@ fn draw_inline_flow(
                 } else {
                     ctx.palette.ink
                 };
-                let fid = if code {
-                    FontId::monospace(fsize * 0.92)
+                let eff_size = if superscript || subscript {
+                    (fsize * 0.72).max(10.0)
+                } else if code {
+                    fsize * 0.92
                 } else {
-                    FontId::proportional(fsize)
+                    fsize
                 };
-                let mut job = egui::text::LayoutJob::default();
+                let fid = if code {
+                    FontId::monospace(eff_size)
+                } else {
+                    FontId::proportional(eff_size)
+                };
+                let mut job = LayoutJob::default();
                 job.append(
                     &text,
                     0.0,
@@ -2623,6 +4059,7 @@ fn draw_inline_flow(
                 if let Some(line) = lines.last_mut() {
                     line.items.push(LineItem::Text {
                         galley,
+                        text,
                         link,
                         code_bg: code,
                     });
@@ -2631,7 +4068,7 @@ fn draw_inline_flow(
             }
             FlatToken::Ruby { base, annotation } => {
                 let base_galley = ui.fonts_mut(|f| {
-                    f.layout_no_wrap(base, FontId::proportional(fsize), ctx.palette.ink)
+                    f.layout_no_wrap(base.clone(), FontId::proportional(fsize), ctx.palette.ink)
                 });
                 let rt_galley = ui.fonts_mut(|f| {
                     f.layout_no_wrap(annotation, FontId::proportional(rt_size), ctx.palette.muted)
@@ -2651,6 +4088,7 @@ fn draw_inline_flow(
                     line.items.push(LineItem::Ruby {
                         base: base_galley,
                         rt: rt_galley,
+                        base_str: base,
                     });
                     cur_x += atom_w;
                 }
@@ -2680,13 +4118,15 @@ fn draw_inline_flow(
                             tex,
                             size,
                             baseline_from_top,
+                            latex,
                         });
                         cur_x += size.x;
                     }
                 } else {
+                    let fallback = format!("${latex}$");
                     let galley = ui.fonts_mut(|f| {
                         f.layout_no_wrap(
-                            format!("${latex}$"),
+                            fallback.clone(),
                             FontId::monospace(fsize * 0.9),
                             ctx.palette.accent,
                         )
@@ -2703,6 +4143,7 @@ fn draw_inline_flow(
                     if let Some(line) = lines.last_mut() {
                         line.items.push(LineItem::Text {
                             galley,
+                            text: fallback,
                             link: None,
                             code_bg: true,
                         });
@@ -2713,22 +4154,99 @@ fn draw_inline_flow(
         }
     }
 
-    let _ = ppp;
     let extra_gap = (fsize * (ctx.line_height - 1.35)).max(2.0);
     let total_h: f32 = lines
         .iter()
         .map(|l| l.ascent + l.descent + extra_gap)
         .sum::<f32>()
         .max(fsize);
-    let (block_rect, _) = ui.allocate_exact_size(Vec2::new(max_w, total_h), Sense::hover());
-    let mut y = block_rect.top();
+
+    let mut plain = String::new();
+    let mut char_boxes = Vec::new();
+    let mut y = 0.0f32;
+    for line in &lines {
+        let baseline = y + line.ascent;
+        let mut x = 0.0f32;
+        for item in &line.items {
+            match item {
+                LineItem::Text { galley, text, .. } => {
+                    let gw = galley.rect.width();
+                    let gh = galley.rect.height();
+                    let top = baseline - base_ascent;
+                    let cnt = text.chars().count().max(1);
+                    let cw = gw / cnt as f32;
+                    for (ci, ch) in text.chars().enumerate() {
+                        plain.push(ch);
+                        char_boxes.push(Rect::from_min_size(
+                            Pos2::new(x + ci as f32 * cw, top),
+                            Vec2::new(cw, gh),
+                        ));
+                    }
+                    x += gw;
+                }
+                LineItem::Ruby {
+                    base,
+                    rt: _,
+                    base_str,
+                } => {
+                    let atom_w = base.rect.width().max(2.0);
+                    let gh = base.rect.height();
+                    let top = baseline - base_ascent;
+                    let cnt = base_str.chars().count().max(1);
+                    let cw = atom_w / cnt as f32;
+                    for (ci, ch) in base_str.chars().enumerate() {
+                        plain.push(ch);
+                        char_boxes.push(Rect::from_min_size(
+                            Pos2::new(x + ci as f32 * cw, top),
+                            Vec2::new(cw, gh),
+                        ));
+                    }
+                    x += atom_w;
+                }
+                LineItem::Math {
+                    size,
+                    baseline_from_top,
+                    latex,
+                    ..
+                } => {
+                    let top = baseline - baseline_from_top;
+                    let cnt = latex.chars().count().max(1);
+                    let cw = size.x / cnt as f32;
+                    for (ci, ch) in latex.chars().enumerate() {
+                        plain.push(ch);
+                        char_boxes.push(Rect::from_min_size(
+                            Pos2::new(x + ci as f32 * cw, top),
+                            Vec2::new(cw, size.y),
+                        ));
+                    }
+                    x += size.x;
+                }
+            }
+        }
+        y += line.ascent + line.descent + extra_gap;
+    }
+
+    (lines, plain, char_boxes, extra_gap, base_ascent, total_h)
+}
+
+fn paint_measured_lines(
+    ui: &Ui,
+    lines: &[MeasuredLine],
+    origin: Pos2,
+    base_ascent: f32,
+    extra_gap: f32,
+    palette: Palette,
+    links_out: &mut Vec<(Rect, LinkTarget)>,
+) {
+    let mut y = origin.y;
     for line in lines {
         let baseline = y + line.ascent;
-        let mut x = block_rect.left();
-        for item in line.items {
+        let mut x = origin.x;
+        for item in &line.items {
             match item {
                 LineItem::Text {
                     galley,
+                    text: _,
                     link,
                     code_bg,
                 } => {
@@ -2736,27 +4254,16 @@ fn draw_inline_flow(
                     let gh = galley.rect.height();
                     let pos = Pos2::new(x, baseline - base_ascent);
                     let r = Rect::from_min_size(pos, Vec2::new(gw, gh));
-                    if code_bg {
-                        ui.painter()
-                            .rect_filled(r.expand(2.0), 3.0, ctx.palette.code_bg);
+                    if *code_bg {
+                        ui.painter().rect_filled(r.expand(2.0), 3.0, palette.code_bg);
                     }
-                    ui.painter().galley(pos, galley, ctx.palette.ink);
+                    ui.painter().galley(pos, galley.clone(), palette.ink);
                     if let Some(target) = link {
-                        let resp = ui.interact(
-                            r,
-                            ui.scope_id().with(("flow-link", r.min.x as i32, r.min.y as i32)),
-                            Sense::click(),
-                        );
-                        if resp.hovered() {
-                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                        }
-                        if resp.clicked() {
-                            *ctx.clicked_link = Some(target);
-                        }
+                        links_out.push((r, target.clone()));
                     }
                     x += gw;
                 }
-                LineItem::Ruby { base, rt } => {
+                LineItem::Ruby { base, rt, .. } => {
                     let bw = base.rect.width();
                     let rw = rt.rect.width();
                     let atom_w = bw.max(rw) + 2.0;
@@ -2764,19 +4271,22 @@ fn draw_inline_flow(
                     let rt_x = x + (atom_w - rw) * 0.5;
                     let base_y = baseline - base_ascent;
                     let rt_y = base_y - rt.rect.height() - 1.0;
-                    ui.painter().galley(Pos2::new(rt_x, rt_y), rt, ctx.palette.muted);
-                    ui.painter().galley(Pos2::new(base_x, base_y), base, ctx.palette.ink);
+                    ui.painter()
+                        .galley(Pos2::new(rt_x, rt_y), rt.clone(), palette.muted);
+                    ui.painter()
+                        .galley(Pos2::new(base_x, base_y), base.clone(), palette.ink);
                     x += atom_w;
                 }
                 LineItem::Math {
                     tex,
                     size,
                     baseline_from_top,
+                    ..
                 } => {
                     let pos = Pos2::new(x, baseline - baseline_from_top);
-                    let r = Rect::from_min_size(pos, size);
+                    let r = Rect::from_min_size(pos, *size);
                     ui.painter().image(
-                        tex,
+                        *tex,
                         r,
                         Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                         Color32::WHITE,
@@ -2789,7 +4299,43 @@ fn draw_inline_flow(
     }
 }
 
-fn draw_flow_block(ui: &mut Ui, block: &Block, ctx: &mut FlowDrawCtx<'_>) {
+fn draw_inline_flow(
+    ui: &mut Ui,
+    inlines: &[Inline],
+    scale_mul: f32,
+    ctx: &mut FlowDrawCtx<'_>,
+) {
+    let (lines, _, _, extra_gap, base_ascent, total_h) =
+        measure_rich_lines(ui, inlines, scale_mul, ctx);
+    let max_w = ui.available_width().min(ctx.max_width).max(60.0);
+    let (block_rect, _) = ui.allocate_exact_size(Vec2::new(max_w, total_h), Sense::hover());
+    let mut links = Vec::new();
+    paint_measured_lines(
+        ui,
+        &lines,
+        block_rect.min,
+        base_ascent,
+        extra_gap,
+        ctx.palette,
+        &mut links,
+    );
+    for (lr, target) in links {
+        let resp = ui.interact(
+            lr,
+            ui.scope_id()
+                .with(("inline-link", lr.min.x as i32, lr.min.y as i32)),
+            Sense::click(),
+        );
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            *ctx.clicked_link = Some(target);
+        }
+    }
+}
+
+fn draw_flow_block_fallback(ui: &mut Ui, block: &Block, ctx: &mut FlowDrawCtx<'_>) {
     match block {
         Block::Heading { level, inlines, .. } => {
             let mul = match level {
@@ -2799,10 +4345,10 @@ fn draw_flow_block(ui: &mut Ui, block: &Block, ctx: &mut FlowDrawCtx<'_>) {
                 _ => 1.08,
             };
             ui.add_space(6.0);
-            draw_inline_flow(ui, inlines, mul, true, ctx);
+            draw_inline_flow(ui, inlines, mul, ctx);
         }
         Block::Paragraph(inlines) => {
-            draw_inline_flow(ui, inlines, 1.0, false, ctx);
+            draw_inline_flow(ui, inlines, 1.0, ctx);
         }
         Block::Quote(inner) => {
             Frame::new()
@@ -2815,7 +4361,7 @@ fn draw_flow_block(ui: &mut Ui, block: &Block, ctx: &mut FlowDrawCtx<'_>) {
                 .stroke(Stroke::new(1.0, ctx.palette.line))
                 .show(ui, |ui| {
                     for b in inner {
-                        draw_flow_block(ui, b, ctx);
+                        draw_flow_block_fallback(ui, b, ctx);
                     }
                 });
         }
@@ -2830,25 +4376,24 @@ fn draw_flow_block(ui: &mut Ui, block: &Block, ctx: &mut FlowDrawCtx<'_>) {
                     ui.label(RichText::new(prefix).color(ctx.palette.muted));
                     ui.vertical(|ui| {
                         for b in item {
-                            draw_flow_block(ui, b, ctx);
+                            draw_flow_block_fallback(ui, b, ctx);
                         }
                     });
                 });
             }
         }
-        Block::Code { code } => {
+        Block::Code { lang, code } => {
+            let fsize = (ctx.font_size * 0.85).max(12.0);
+            let mut job =
+                highlight::highlight_block(code, highlight::detect_lang(lang), ctx.mode, fsize);
+            job.wrap.max_width = (ctx.max_width - 24.0).max(120.0);
             Frame::new()
                 .fill(ctx.palette.code_bg)
                 .stroke(Stroke::new(1.0, ctx.palette.line))
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(Margin::same(10))
                 .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(code)
-                            .monospace()
-                            .size((ctx.font_size * 0.85).max(12.0))
-                            .color(ctx.palette.ink),
-                    );
+                    ui.label(job);
                 });
         }
         Block::Table { headers, rows } => {
@@ -2861,7 +4406,7 @@ fn draw_flow_block(ui: &mut Ui, block: &Block, ctx: &mut FlowDrawCtx<'_>) {
                             let col_w = (ctx.max_width / headers.len().max(1) as f32).max(60.0);
                             for cell in headers {
                                 ui.allocate_ui(Vec2::new(col_w, 20.0), |ui| {
-                                    draw_inline_flow(ui, cell, 0.95, true, ctx);
+                                    draw_inline_flow(ui, cell, 0.95, ctx);
                                 });
                             }
                         });
@@ -2872,7 +4417,7 @@ fn draw_flow_block(ui: &mut Ui, block: &Block, ctx: &mut FlowDrawCtx<'_>) {
                             let col_w = (ctx.max_width / row.len().max(1) as f32).max(60.0);
                             for cell in row {
                                 ui.allocate_ui(Vec2::new(col_w, 20.0), |ui| {
-                                    draw_inline_flow(ui, cell, 0.95, false, ctx);
+                                    draw_inline_flow(ui, cell, 0.95, ctx);
                                 });
                             }
                         });
@@ -2969,6 +4514,7 @@ fn draw_flow_block(ui: &mut Ui, block: &Block, ctx: &mut FlowDrawCtx<'_>) {
                         label: "复制图像".to_owned(),
                         filename: fname,
                         png_bytes: Some(png),
+                        selected_text: None,
                         extra_text: None,
                     });
                 }
@@ -2980,6 +4526,131 @@ fn draw_flow_block(ui: &mut Ui, block: &Block, ctx: &mut FlowDrawCtx<'_>) {
             ui.separator();
         }
     }
+}
+
+fn paint_galley_selection(
+    ui: &Ui,
+    galley: &egui::Galley,
+    pos: Pos2,
+    c0: usize,
+    c1: usize,
+    color: Color32,
+) {
+    let mut offset = 0usize;
+    for row in &galley.rows {
+        let len = row.row.glyphs.len();
+        let row_end = offset + len + usize::from(row.ends_with_newline);
+        if c1 > offset && c0 < offset + len && len > 0 {
+            let s0 = c0.saturating_sub(offset).min(len);
+            let s1 = c1.saturating_sub(offset).min(len);
+            if s1 > s0 {
+                let x0 = pos.x + row.pos.x + row.row.glyphs[s0].pos.x;
+                let last = &row.row.glyphs[s1 - 1];
+                let x1 = pos.x + row.pos.x + last.pos.x + last.advance_width;
+                let r = Rect::from_min_max(
+                    Pos2::new(x0, pos.y + row.pos.y),
+                    Pos2::new(x1, pos.y + row.pos.y + row.rect().height()),
+                );
+                ui.painter().rect_filled(r, 1.0, color);
+            }
+        }
+        let _ = CCursor::new(c0);
+        offset = row_end;
+    }
+}
+
+fn hit_test_char_boxes(rel: Vec2, boxes: &[Rect]) -> usize {
+    if boxes.is_empty() {
+        return 0;
+    }
+    let pt = Pos2::new(rel.x, rel.y);
+    let mut best_i = 0usize;
+    let mut best_d = f32::INFINITY;
+    for (i, r) in boxes.iter().enumerate() {
+        if r.contains(pt) {
+            return i + usize::from(pt.x > r.center().x);
+        }
+        let dy = (pt.y - r.center().y).abs();
+        let dx = (pt.x - r.center().x).abs();
+        let d = dy * 4.0 + dx;
+        if d < best_d {
+            best_d = d;
+            best_i = i;
+        }
+    }
+    best_i
+}
+
+fn hit_test_fixed_page(
+    page: usize,
+    pointer: Pos2,
+    page_rect: Rect,
+    factor: f32,
+    pdf_runs: &[PdfTextRun],
+    word_runs: &[WordTextRun],
+) -> Option<FixedTextPos> {
+    let run_count = pdf_runs.len().max(word_runs.len());
+    if run_count == 0 {
+        return None;
+    }
+    let mut best: Option<(f32, FixedTextPos)> = None;
+    for ri in 0..run_count {
+        let (rr, len) = if !pdf_runs.is_empty() {
+            let run = &pdf_runs[ri];
+            (
+                Rect::from_min_size(
+                    Pos2::new(
+                        page_rect.left() + run.rect_pt[0] * factor,
+                        page_rect.top() + run.rect_pt[1] * factor,
+                    ),
+                    Vec2::new(run.rect_pt[2] * factor, run.rect_pt[3] * factor),
+                ),
+                run.text.chars().count().max(1),
+            )
+        } else {
+            let run = &word_runs[ri];
+            (
+                Rect::from_min_size(
+                    Pos2::new(
+                        page_rect.left() + run.left * factor,
+                        page_rect.top() + run.top * factor,
+                    ),
+                    Vec2::new(run.width * factor, (run.size * 1.2) * factor),
+                ),
+                run.text.chars().count().max(1),
+            )
+        };
+        let expanded = rr.expand2(Vec2::new(12.0, 6.0));
+        if expanded.contains(pointer) {
+            let t = ((pointer.x - rr.left()) / rr.width().max(1.0)).clamp(0.0, 1.0);
+            let char_idx = (t * len as f32).round() as usize;
+            let dist = (pointer.y - rr.center().y).abs() * 4.0 + (pointer.x - rr.center().x).abs();
+            let cand = FixedTextPos {
+                page,
+                run_idx: ri,
+                char_idx,
+            };
+            if best.is_none_or(|(d, _)| dist < d) {
+                best = Some((dist, cand));
+            }
+        }
+    }
+    best.map(|(_, pos)| pos)
+}
+
+fn slice_chars(text: &str, c0: usize, c1: usize) -> String {
+    text.chars().skip(c0).take(c1.saturating_sub(c0)).collect()
+}
+
+fn word_runs_plain(runs: &[WordTextRun]) -> String {
+    let mut out = String::new();
+    for r in runs {
+        if r.line_break && !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&r.text);
+    }
+    out
 }
 
 fn decode_resource_image(path: &str, bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
@@ -3005,11 +4676,11 @@ fn decode_resource_image(path: &str, bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)
 
 fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
     let img = image::RgbaImage::from_raw(width, height, rgba.to_vec())?;
-    let mut out = Cursor::new(Vec::new());
+    let mut buf = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut out, image::ImageFormat::Png)
+        .write_to(&mut buf, image::ImageFormat::Png)
         .ok()?;
-    Some(out.into_inner())
+    Some(buf.into_inner())
 }
 
 fn crop_rgba_png(
@@ -3022,36 +4693,39 @@ fn crop_rgba_png(
     h: u32,
 ) -> Option<Vec<u8>> {
     let img = image::RgbaImage::from_raw(src_w, src_h, rgba.to_vec())?;
-    let cw = w.min(src_w.saturating_sub(x)).max(1);
-    let ch = h.min(src_h.saturating_sub(y)).max(1);
-    let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
-    let mut out = Cursor::new(Vec::new());
+    let cx = x.min(src_w.saturating_sub(1));
+    let cy = y.min(src_h.saturating_sub(1));
+    let cw = w.min(src_w - cx).max(1);
+    let ch = h.min(src_h - cy).max(1);
+    let cropped = image::imageops::crop_imm(&img, cx, cy, cw, ch).to_image();
+    let mut buf = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(cropped)
-        .write_to(&mut out, image::ImageFormat::Png)
+        .write_to(&mut buf, image::ImageFormat::Png)
         .ok()?;
-    Some(out.into_inner())
+    Some(buf.into_inner())
 }
 
 fn truncate_str(s: &str, max_chars: usize) -> String {
-    let mut chars = s.chars();
-    let head: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{head}…")
-    } else {
-        head
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i + 1 >= max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
     }
+    out
 }
 
 fn extract_snippet(text: &str, match_byte: usize) -> String {
-    let start = text[..match_byte]
-        .char_indices()
-        .rev()
-        .nth(18)
-        .map_or(0, |(i, _)| i);
-    let end = text[match_byte..]
-        .char_indices()
-        .nth(48)
-        .map_or(text.len(), |(i, _)| match_byte + i);
+    let mut start = match_byte.saturating_sub(40);
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (match_byte + 80).min(text.len());
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
     text[start..end].replace('\n', " ")
 }
 
