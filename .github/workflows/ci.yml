@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, v2-native]
   pull_request:
 
 jobs:
@@ -10,11 +10,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - name: Install front-end assets
-        run: npm ci --ignore-scripts --omit=optional
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

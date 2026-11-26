@@ -9,6 +9,17 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+#[derive(Clone)]
+pub struct WordTextRun {
+    pub text: String,
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub size: f32,
+    pub line_break: bool,
+    pub url: Option<String>,
+}
+
 #[derive(Clone, Serialize)]
 pub struct Metadata {
     pub pages: Vec<[f32; 2]>,
@@ -400,7 +411,7 @@ fn page_images(page: &Page) -> Vec<[f32; 4]> {
 
 impl Word {
     pub fn open(path: &Path) -> Result<Self, String> {
-        let data = crate::formats::read_bytes(path)?;
+        let data = crate::flow::read_bytes(path)?;
         let document = docboss_core::read(&data).map_err(|error| match error {
             Error::Encrypted | Error::Crypt(_) => "此 Word 文件受密码保护".to_owned(),
             other => format!("无法解析 Word 文件：{other}"),
@@ -534,6 +545,25 @@ impl Word {
         })
     }
 
+    pub fn render_rgba(
+        &self,
+        index: usize,
+        requested_scale: Option<f32>,
+    ) -> Result<(u32, u32, Vec<u8>), String> {
+        let [width, height] = *self.metadata.pages.get(index).ok_or("页码不存在")?;
+        let max_scale = (16_000_000.0 / (width * height).max(1.0))
+            .sqrt()
+            .clamp(0.5, 6.0);
+        let scale = requested_scale
+            .filter(|value| value.is_finite())
+            .unwrap_or(2.0)
+            .clamp(0.5, max_scale);
+        let pixmap = docboss_render::render_page(&self.layout, index, scale)
+            .map_err(|error| error.to_string())?;
+        Ok((pixmap.width, pixmap.height, pixmap.data))
+    }
+
+    #[allow(dead_code)]
     pub fn image(&self, index: usize, requested_scale: Option<f32>) -> Result<Vec<u8>, String> {
         let [width, height] = *self.metadata.pages.get(index).ok_or("页码不存在")?;
         let max_scale = (16_000_000.0 / (width * height).max(1.0))
@@ -593,6 +623,22 @@ impl Word {
             });
         }
         Ok(result)
+    }
+
+    pub fn text_runs(&self, index: usize) -> Result<Vec<WordTextRun>, String> {
+        let runs = self.text(index)?;
+        Ok(runs
+            .into_iter()
+            .map(|r| WordTextRun {
+                text: r.text.to_owned(),
+                left: r.left,
+                top: r.top,
+                width: r.width,
+                size: r.size,
+                line_break: r.line_break,
+                url: r.url,
+            })
+            .collect())
     }
 
     fn bounds(&self, run: &GlyphRun) -> (f32, f32) {

@@ -1,5 +1,4 @@
 param(
-    [switch]$SkipAssets,
     [switch]$Offline
 )
 
@@ -7,13 +6,11 @@ $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $PSScriptRoot
 Push-Location $project
 try {
-    if (-not $SkipAssets) {
-        npm.cmd ci --ignore-scripts --omit=optional
-        if ($LASTEXITCODE -ne 0) { throw 'Could not install front-end assets.' }
-    }
-
     $flags = @('--locked', '--release', '--target', 'x86_64-pc-windows-msvc')
     if ($Offline) { $flags += '--offline' }
+    if ($env:PDFIUM_BUNDLE_LIB -and (Test-Path -LiteralPath $env:PDFIUM_BUNDLE_LIB)) {
+        $flags += @('--features', 'bundled-pdfium')
+    }
     $messages = cargo build @flags --message-format=json-render-diagnostics |
         ForEach-Object { $_ | ConvertFrom-Json }
     if ($LASTEXITCODE -ne 0) { throw 'Cargo build failed.' }
