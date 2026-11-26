@@ -37,10 +37,55 @@ let installDismissed = false;
 let drainingDrops = false;
 let rawBookRules = [];
 let lastSmartInvert = false;
+let smartInvertEnabled = true;
+let smartInvertHintSeen = false;
 const textEncoder = new TextEncoder();
 
 function isSmartInvertActive() {
-  return $("theme").value === "dark" && $("smart-invert").checked;
+  return $("theme").value === "dark" && smartInvertEnabled;
+}
+
+function updateSmartInvertToggle() {
+  const btn = $("smart-invert-toggle");
+  if (!btn) return;
+  btn.hidden = $("theme").value !== "dark";
+  btn.dataset.active = String(smartInvertEnabled);
+  btn.setAttribute("aria-pressed", String(smartInvertEnabled));
+  btn.textContent = smartInvertEnabled
+    ? translate("已启用智能反色", "Smart invert: ON")
+    : translate("已关闭智能反色", "Smart invert: OFF");
+}
+
+function positionSmartInvertHint() {
+  const dialog = $("smart-invert-hint");
+  const btn = $("smart-invert-toggle");
+  if (!dialog) return;
+  if (!btn || btn.hidden || btn.offsetParent === null) {
+    dialog.style.setProperty("--bubble-left", "50%");
+    dialog.style.setProperty("--bubble-tx", "-50%");
+    dialog.style.setProperty("--bubble-bottom", "72px");
+    dialog.style.setProperty("--arrow-left", "50%");
+    return;
+  }
+  const rect = btn.getBoundingClientRect();
+  const dlgWidth = Math.min(340, window.innerWidth * 0.88);
+  const btnCenter = rect.left + rect.width / 2;
+  const left = Math.max(12, Math.min(window.innerWidth - dlgWidth - 12, btnCenter - dlgWidth / 2));
+  dialog.style.setProperty("--bubble-left", left + "px");
+  dialog.style.setProperty("--bubble-tx", "0");
+  dialog.style.setProperty("--bubble-bottom", Math.max(16, window.innerHeight - rect.top + 12) + "px");
+  dialog.style.setProperty("--arrow-left", Math.max(20, Math.min(dlgWidth - 20, btnCenter - left)) + "px");
+}
+
+function maybeShowSmartInvertHint() {
+  if (!started || !book || reader.hidden || !isSmartInvertActive() || smartInvertHintSeen) return;
+  if (document.querySelector("dialog[open]")) return;
+  const dialog = $("smart-invert-hint");
+  if (!dialog) return;
+  $("settings").hidden = true;
+  $("settings-toggle").setAttribute("aria-expanded", "false");
+  positionSmartInvertHint();
+  dialog.showModal();
 }
 
 async function request(url, options = {}) {
@@ -390,6 +435,7 @@ async function present(next) {
     renderDocumentTabs();
     persistWorkspace();
     await renderSidebar();
+    maybeShowSmartInvertHint();
   } catch (error) {
     reader.hidden = true;
     $("progress").hidden = true;
@@ -1008,22 +1054,25 @@ function settingsValues() {
   return {
     ...Object.fromEntries(["theme", "font-size", "line-height", "text-width"].map(id => [id, $(id).value])),
     "restore-session": $("restore-session").checked,
-    "smart-invert": $("smart-invert").checked,
+    "smart-invert": smartInvertEnabled,
+    "smart-invert-hint-seen": smartInvertHintSeen,
     "auto-update": $("auto-update").checked,
     "install-dismissed": installDismissed
   };
 }
 
 function applySettings(values) {
-  for (const id of ["restore-session", "smart-invert", "auto-update"]) {
+  for (const id of ["restore-session", "auto-update"]) {
     if (values?.[id] != null) $(id).checked = Boolean(values[id]);
   }
+  if (values?.["smart-invert"] != null) smartInvertEnabled = Boolean(values["smart-invert"]);
+  if (values?.["smart-invert-hint-seen"] != null) smartInvertHintSeen = Boolean(values["smart-invert-hint-seen"]);
   for (const id of ["theme", "font-size", "line-height", "text-width"]) {
     if (values?.[id] != null) $(id).value = values[id];
   }
   const root = document.documentElement;
   root.dataset.theme = $("theme").value;
-  $("smart-invert-label").hidden = $("theme").value !== "dark";
+  updateSmartInvertToggle();
   const invert = isSmartInvertActive();
   root.dataset.smartInvert = String(invert);
   root.style.setProperty("--size", $("font-size").value + "px");
@@ -1037,6 +1086,7 @@ function applySettings(values) {
     pdf?.refreshTheme?.();
     if (book && !pdf) applyFlowColors();
   }
+  maybeShowSmartInvertHint();
 }
 
 for (const id of ["open-file", "welcome-open"]) {
@@ -1132,12 +1182,26 @@ for (const id of ["theme", "font-size", "line-height", "text-width"]) {
   $(id).addEventListener("input", () => applySettings());
   $(id).addEventListener("change", () => post("/api/settings", settingsValues()).catch(report));
 }
-for (const id of ["restore-session", "smart-invert", "auto-update"]) {
+for (const id of ["restore-session", "auto-update"]) {
   $(id).addEventListener("change", () => {
     applySettings();
     post("/api/settings", settingsValues()).catch(report);
   });
 }
+$("smart-invert-toggle").addEventListener("click", () => {
+  smartInvertEnabled = !smartInvertEnabled;
+  applySettings();
+  post("/api/settings", settingsValues()).catch(report);
+});
+$("smart-invert-hint").addEventListener("cancel", event => event.preventDefault());
+$("smart-invert-ack").addEventListener("click", () => {
+  smartInvertHintSeen = true;
+  $("smart-invert-hint").close();
+  post("/api/settings", settingsValues()).catch(report);
+});
+window.addEventListener("resize", () => {
+  if ($("smart-invert-hint").open) positionSmartInvertHint();
+});
 $("view-mode").addEventListener("click", async () => {
   if (!book || !["markdown", "html"].includes(book.kind)) return;
   const position = activePosition();
@@ -1410,8 +1474,10 @@ function localizeStaticUi() {
   labelText("encoding", "TXT encoding ");
   text('#encoding option[value=""]', "Auto");
   labelText("restore-session", "Restore tabs on startup");
-  labelText("smart-invert", "Smart page inversion");
   labelText("auto-update", "Install updates automatically");
+  updateSmartInvertToggle();
+  $("smart-invert-hint-text").textContent = "Smart inversion is enabled for dark mode (vivid colors and inserted images are preserved; scanned PDFs are inverted cleanly). Click \"Smart invert: ON\" in the bottom bar anytime to view original colors.";
+  $("smart-invert-ack").textContent = "Got it";
   updateViewModeButton();
   labelText("note-text", "Note ");
   labelText("color", "Color ");
@@ -1539,6 +1605,7 @@ async function start() {
   else {
     release.then(info => showRelease(info)).catch(report);
     drainDropped().catch(report);
+    maybeShowSmartInvertHint();
   }
 }
 
@@ -1584,6 +1651,7 @@ $("installation").addEventListener("close", async () => {
       installDismissed = true;
       post("/api/settings", settingsValues()).catch(report);
     }
+    maybeShowSmartInvertHint();
     return;
   }
   const extensions = [...$("association-list").querySelectorAll("input:checked")].map(box => box.value);
@@ -1667,6 +1735,7 @@ $("check-updates").onclick = () => request("/api/release").then(response => resp
   .then(info => showRelease(info, true)).catch(showUpdateFailure);
 $("update-dialog").addEventListener("close", () => {
   if ($("update-dialog").returnValue === "update") installUpdate();
+  else maybeShowSmartInvertHint();
 });
 
 async function drainDropped() {

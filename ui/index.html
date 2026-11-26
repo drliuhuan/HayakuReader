@@ -46,7 +46,6 @@
       <label>阅读宽度 <input id="text-width" type="range" min="480" max="1150" step="10" value="760"><output id="text-width-val">760px</output></label>
       <label id="encoding-label" hidden>TXT 编码 <select id="encoding"><option value="">自动</option><option value="utf-8">UTF-8</option><option value="utf-16le">UTF-16 LE</option><option value="utf-16be">UTF-16 BE</option><option value="gb18030">GB18030</option></select></label>
       <label><input id="restore-session" type="checkbox" checked>启动时恢复标签页</label>
-      <label id="smart-invert-label" hidden><input id="smart-invert" type="checkbox" checked>页面智能反色</label>
       <label id="auto-update-label" hidden><input id="auto-update" type="checkbox">自动安装更新</label>
       <div class="settings-actions">
         <button type="button" id="reset-settings">恢复默认</button>
@@ -81,6 +80,7 @@
     </div>
     <footer id="progress" hidden>
       <span id="location"></span>
+      <button type="button" id="smart-invert-toggle" hidden aria-pressed="true">已启用智能反色</button>
       <div id="pdf-tools" hidden>
         <button id="previous" aria-label="上一页">‹</button>
         <input id="page-number" type="number" min="1" aria-label="跳到页码">
@@ -136,6 +136,12 @@
         <button value="update" class="primary" id="update-apply">立即更新</button>
       </div>
     </form>
+  </dialog>
+  <dialog id="smart-invert-hint" class="callout-dialog">
+    <p id="smart-invert-hint-text">已自动启用智能反色以适配深色阅读（保留鲜亮色彩与插图，扫描 PDF 整页反色）。如需查看文档原始色彩，可随时点击下方状态栏的「已启用智能反色」切换关闭。</p>
+    <div class="dialog-actions">
+      <button type="button" id="smart-invert-ack" class="primary">我知道了</button>
+    </div>
   </dialog>
 </body>
 </html>
