@@ -3611,7 +3611,6 @@ impl HayakuApp {
         self.last_content_h = scroll_out.content_size.y;
         self.last_selection_rect = sel_bounds;
         self.hovered_note = hovered_note;
-        self.hovered_note = hovered_note;
 
         if let Some(ann_id) = clicked_annotation_id
             && let Some(ann) = self
@@ -4643,6 +4642,7 @@ impl HayakuApp {
 
     fn draw_popups(&mut self, ctx: &Context) {
         let p = self.palette();
+        let dark = self.theme_mode() == ThemeMode::Dark;
 
         if let Some((msg, deadline)) = self.status_msg.clone() {
             if deadline.is_some_and(|d| Instant::now() >= d) {
