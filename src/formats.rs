@@ -103,17 +103,21 @@ pub fn decode(bytes: &[u8], label: Option<&str>) -> Result<String, String> {
 }
 
 pub fn markdown(path: &Path) -> Result<String, String> {
-    use pulldown_cmark::{Event, Options, Parser, html};
     let source = decode(&read_bytes(path)?, None)?;
+    Ok(render_markdown(&source))
+}
+
+pub fn render_markdown(source: &str) -> String {
+    use pulldown_cmark::{Event, Options, Parser, html};
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    let events = Parser::new_ext(&source, options).map(|event| match event {
+    let events = Parser::new_ext(source, options).map(|event| match event {
         Event::Html(text) | Event::InlineHtml(text) => Event::Text(text),
         other => other,
     });
     let mut markup = String::new();
     html::push_html(&mut markup, events);
-    Ok(markup)
+    markup
 }
 
 fn bounded_read(reader: impl Read) -> Result<Vec<u8>, String> {

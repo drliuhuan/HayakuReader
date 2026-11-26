@@ -1,6 +1,6 @@
 [package]
 name = "hayaku-reader"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -26,4 +26,9 @@ zip = { version = "4", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 tao = "0.38"
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+winreg = "0.55"
 wry = "0.58"
+
+[build-dependencies]
+embed-resource = "3"

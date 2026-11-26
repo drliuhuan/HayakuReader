@@ -9,19 +9,25 @@ use tao::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
     platform::run_return::EventLoopExtRunReturn,
-    window::WindowBuilder,
+    platform::windows::{IconExtWindows, WindowBuilderExtWindows},
+    window::{Icon, WindowBuilder},
 };
 use wry::{DragDropEvent, WebContext, WebViewBuilder};
 
 enum DesktopEvent {
     Dropped(PathBuf),
     Saved,
+    Restart,
+    Poll,
 }
 
 pub fn run(url: &str, app: Shared) -> Result<(), Box<dyn Error>> {
     let mut events = EventLoopBuilder::<DesktopEvent>::with_user_event().build();
+    let icon = Icon::from_resource(1, None).ok();
     let window = WindowBuilder::new()
         .with_title("HayakuReader")
+        .with_window_icon(icon.clone())
+        .with_taskbar_icon(icon)
         .with_inner_size(LogicalSize::new(1150.0, 820.0))
         .with_min_inner_size(LogicalSize::new(560.0, 430.0))
         .build(&events)?;
@@ -47,20 +53,35 @@ pub fn run(url: &str, app: Shared) -> Result<(), Box<dyn Error>> {
         .with_ipc_handler(move |request| {
             if request.body() == "saved" {
                 let _ = saved.send_event(DesktopEvent::Saved);
+            } else if request.body() == "restart" {
+                let _ = saved.send_event(DesktopEvent::Restart);
             }
         })
         .with_drag_drop_handler(move |event| {
-            if let DragDropEvent::Drop { paths, .. } = event
-                && let Some(path) = paths.into_iter().next()
-            {
-                let _ = dropped.send_event(DesktopEvent::Dropped(path));
+            if let DragDropEvent::Drop { paths, .. } = event {
+                for path in paths {
+                    let _ = dropped.send_event(DesktopEvent::Dropped(path));
+                }
             }
             true
         })
         .build(&window)?;
     let mut closing = None;
+    // A proxy tick wakes the native message loop even while WebView2 is idle.
+    let poll = events.create_proxy();
+    let (stop_poll, stopped) = std::sync::mpsc::channel::<()>();
+    let poller = std::thread::spawn(move || {
+        while matches!(
+            stopped.recv_timeout(Duration::from_millis(350)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            if poll.send_event(DesktopEvent::Poll).is_err() {
+                break;
+            }
+        }
+    });
     events.run_return(|event, _, flow| {
-        *flow = closing.map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
+        *flow = ControlFlow::Wait;
         match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -72,17 +93,54 @@ pub fn run(url: &str, app: Shared) -> Result<(), Box<dyn Error>> {
                 *flow = ControlFlow::WaitUntil(deadline);
             }
             Event::UserEvent(DesktopEvent::Saved) if closing.is_some() => *flow = ControlFlow::Exit,
+            Event::UserEvent(DesktopEvent::Restart)
+                if app.restart.lock().is_ok_and(|pending| pending.is_some()) =>
+            {
+                *flow = ControlFlow::Exit
+            }
             Event::UserEvent(DesktopEvent::Dropped(path)) if closing.is_none() => {
                 if let Ok(mut pending) = app.dropped.lock() {
-                    *pending = Some(path);
+                    pending.push_back(path);
                 }
                 let _ = webview.evaluate_script("window.hayakuOpenDrop?.()");
             }
-            Event::NewEvents(_) if closing.is_some_and(|deadline| Instant::now() >= deadline) => {
+            Event::UserEvent(DesktopEvent::Poll)
+                if closing.is_some_and(|deadline| Instant::now() >= deadline) =>
+            {
                 *flow = ControlFlow::Exit;
+            }
+            Event::UserEvent(DesktopEvent::Poll) if closing.is_none() => {
+                if app.data.join("request-restart").is_file() {
+                    let _ = std::fs::remove_file(app.data.join("request-restart"));
+                    let _ = webview.evaluate_script("window.hayakuFlush?.()");
+                    closing = Some(Instant::now() + Duration::from_secs(2));
+                    *flow = ControlFlow::WaitUntil(closing.unwrap());
+                }
+                if let Ok(entries) = std::fs::read_dir(app.data.join("inbox")) {
+                    for file in entries.flatten().filter(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "json")
+                    }) {
+                        let path = file.path();
+                        if let Ok(paths) = crate::read_json::<Vec<PathBuf>>(&path) {
+                            let _ = std::fs::remove_file(path);
+                            if let Ok(mut pending) = app.dropped.lock() {
+                                pending.extend(paths);
+                            }
+                            window.set_focus();
+                        }
+                    }
+                }
+                if app.dropped.lock().is_ok_and(|paths| !paths.is_empty()) {
+                    let _ = webview.evaluate_script("window.hayakuOpenDrop?.()");
+                }
             }
             _ => {}
         }
     });
+    drop(stop_poll);
+    let _ = poller.join();
     Ok(())
 }

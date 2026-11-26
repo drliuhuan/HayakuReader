@@ -3,6 +3,8 @@
 #[cfg(windows)]
 mod desktop;
 mod formats;
+#[cfg(windows)]
+mod platform;
 mod word;
 
 use axum::{
@@ -55,7 +57,9 @@ struct App {
     recent: Mutex<Vec<Recent>>,
     books: Mutex<std::collections::HashMap<String, Arc<OpenBook>>>,
     initial: Mutex<Option<PathBuf>>,
-    dropped: Mutex<Option<PathBuf>>,
+    dropped: Mutex<std::collections::VecDeque<PathBuf>>,
+    #[cfg(windows)]
+    restart: Mutex<Option<platform::Restart>>,
 }
 
 type Shared = Arc<App>;
@@ -221,6 +225,23 @@ async fn settings(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<
     ))
 }
 
+async fn workspace(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<Value>> {
+    authorize(&headers, &app)?;
+    Ok(Json(
+        read_json(&app.data.join("workspace.json")).map_err(internal)?,
+    ))
+}
+
+async fn save_workspace(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Json(value): Json<Value>,
+) -> Result<StatusCode> {
+    authorize(&headers, &app)?;
+    write_json(&app.data.join("workspace.json"), &value).map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn save_settings(
     State(app): State<Shared>,
     headers: HeaderMap,
@@ -294,7 +315,7 @@ async fn open_book(
         let path = if request.initial.unwrap_or(false) {
             app.initial.lock().map_err(internal)?.take()
         } else if request.dropped.unwrap_or(false) {
-            app.dropped.lock().map_err(internal)?.take()
+            app.dropped.lock().map_err(internal)?.pop_front()
         } else if let Some(id) = request.id {
             Some(
                 app.recent
@@ -307,9 +328,19 @@ async fn open_book(
                     .clone(),
             )
         } else {
-            rfd::FileDialog::new()
-                .add_filter("HayakuReader 文档", formats::EXTENSIONS)
-                .pick_file()
+            if request.relocate.is_some() {
+                rfd::FileDialog::new()
+                    .add_filter("HayakuReader 文档", formats::EXTENSIONS)
+                    .pick_file()
+            } else {
+                let chosen = rfd::FileDialog::new()
+                    .add_filter("HayakuReader 文档", formats::EXTENSIONS)
+                    .pick_files();
+                let mut paths = chosen.into_iter().flatten();
+                let first = paths.next();
+                app.dropped.lock().map_err(internal)?.extend(paths);
+                first
+            }
         };
         path.map(|path| open(&app, path, request.relocate))
             .transpose()
@@ -538,6 +569,10 @@ async fn frontend(RoutePath(file): RoutePath<String>) -> Result<Response> {
             "text/css; charset=utf-8",
             include_bytes!("../ui/reader.css").to_vec(),
         )),
+        "logo.svg" => Ok(bytes(
+            "image/svg+xml",
+            include_bytes!("../assets/logo.svg").to_vec(),
+        )),
         _ => Err((StatusCode::NOT_FOUND, "资源不存在".into())),
     }
 }
@@ -635,16 +670,58 @@ fn main() {
 
 fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut manual = false;
-    let mut initial = None;
-    for argument in std::env::args_os().skip(1) {
-        if argument == "--no-browser" {
-            manual = true;
-        } else {
-            initial = Some(PathBuf::from(argument));
-        }
-    }
+    let mut launch_paths = std::collections::VecDeque::new();
     let data = app_data()?;
     fs::create_dir_all(&data)?;
+    let mut args = std::env::args_os().skip(1);
+    while let Some(argument) = args.next() {
+        if argument == "--no-browser" {
+            manual = true;
+        } else if argument == "--apply-update" {
+            #[cfg(windows)]
+            platform::apply_update(
+                &data,
+                &args.next().ok_or("Missing version")?.to_string_lossy(),
+                args,
+            )?;
+            return Ok(());
+        } else {
+            let path = PathBuf::from(argument);
+            launch_paths.push_back(std::path::absolute(&path)?);
+        }
+    }
+    #[cfg(windows)]
+    if !manual && platform::check_manual_update(&data)? {
+        return Ok(());
+    }
+    let instance = if manual {
+        None
+    } else {
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(data.join("instance.lock"))?;
+        match lock.try_lock() {
+            Ok(()) => Some(lock),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let inbox = data.join("inbox");
+                fs::create_dir_all(&inbox)?;
+                write_json(
+                    &inbox.join(format!("{}.json", Uuid::new_v4())),
+                    &launch_paths,
+                )?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    #[cfg(windows)]
+    if !manual {
+        platform::record_version(&data)?;
+    }
+    let initial = launch_paths.pop_front();
     let has_initial = initial.is_some();
     let app = Arc::new(App {
         secret: Uuid::new_v4().to_string(),
@@ -652,18 +729,26 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         data,
         books: Mutex::new(std::collections::HashMap::new()),
         initial: Mutex::new(initial),
-        dropped: Mutex::new(None),
+        dropped: Mutex::new(launch_paths),
+        #[cfg(windows)]
+        restart: Mutex::new(None),
     });
     let runtime = tokio::runtime::Runtime::new()?;
     let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
-    let query = if has_initial { "?open" } else { "" };
-    let url = format!("http://{}/{query}#{}", listener.local_addr()?, app.secret);
+    let query = if manual { "dev" } else { "desktop" };
+    let open = if has_initial { "&open" } else { "" };
+    let url = format!(
+        "http://{}/?{query}{open}#{}",
+        listener.local_addr()?,
+        app.secret
+    );
     let router = Router::new()
         .route("/", get(index))
         .route("/ui/{file}", get(frontend))
         .route("/vendor/{*file}", get(vendor))
         .route("/api/recent", get(recent))
         .route("/api/settings", get(settings).post(save_settings))
+        .route("/api/workspace", get(workspace).post(save_workspace))
         .route("/api/open", post(open_book))
         .route(
             "/api/import",
@@ -672,8 +757,24 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .route("/api/content/{session}", get(content))
         .route("/api/save/{session}", post(save))
         .route("/api/close/{session}", post(close))
-        .route("/resource/{key}/{session}", get(resource))
-        .with_state(app.clone());
+        .route("/resource/{key}/{session}", get(resource));
+    #[cfg(windows)]
+    let router = router
+        .route(
+            "/api/installation",
+            get(platform::status).post(platform::install),
+        )
+        .route(
+            "/api/installation/defaults",
+            post(platform::windows_defaults),
+        )
+        .route("/api/project", get(platform::project))
+        .route("/api/project/local", get(platform::local_project))
+        .route(
+            "/api/release",
+            get(platform::releases).post(platform::update),
+        );
+    let router = router.with_state(app.clone());
     if manual {
         println!("HayakuReader · {url}");
         runtime.block_on(async { axum::serve(listener, router).await })?;
@@ -686,7 +787,16 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 eprintln!("HayakuReader：{error}");
             }
         });
-        desktop::run(&url, app)?;
+        desktop::run(&url, app.clone())?;
+        let pending = app
+            .restart
+            .lock()
+            .map_err(|_| "Restart state unavailable")?
+            .take();
+        drop(instance);
+        if let Some(request) = pending {
+            platform::restart(request)?;
+        }
     }
     #[cfg(not(windows))]
     return Err("当前桌面窗口适用于 Windows，可用 --no-browser 启动开发服务".into());

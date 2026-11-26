@@ -4,14 +4,20 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>HayakuReader</title>
-  <link rel="icon" href="data:,">
+  <link rel="icon" href="/ui/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/vendor/pdf.css">
   <link rel="stylesheet" href="/ui/reader.css">
   <script type="module" src="/ui/reader.js"></script>
 </head>
 <body>
-  <aside id="sidebar">
-    <header class="identity"><span class="brand-mark" aria-hidden="true">H</span><span>HayakuReader</span></header>
+  <section id="splash" aria-label="HayakuReader">
+    <img class="brand-logo splash-logo" src="/ui/logo.svg" alt="">
+    <h1>HayakuReader</h1>
+    <p>drliuhuan</p>
+    <p>github.com/drliuhuan/HayakuReader</p>
+  </section>
+  <aside id="sidebar" hidden>
+    <header class="identity"><img class="brand-logo" src="/ui/logo.svg" alt=""><span>HayakuReader</span></header>
     <nav aria-label="阅读导航">
       <button type="button" data-tab="recent" aria-pressed="true">最近阅读</button>
       <button type="button" data-tab="contents" aria-pressed="false">目录</button>
@@ -21,7 +27,7 @@
   </aside>
   <main>
     <header class="toolbar">
-      <button id="toggle-sidebar" aria-label="切换侧栏" title="切换侧栏" aria-expanded="true">☰</button>
+      <button id="toggle-sidebar" aria-label="切换侧栏" title="切换侧栏" aria-expanded="false">☰</button>
       <button id="open-file" class="primary">打开文件</button>
       <strong id="file-name"></strong>
       <div class="tools">
@@ -31,12 +37,17 @@
         <button id="settings-toggle" aria-expanded="false">阅读设置</button>
       </div>
     </header>
+    <div id="document-tabs" role="tablist" aria-label="已打开的文档" hidden></div>
     <section id="settings" class="panel" hidden aria-label="阅读设置">
       <label>主题 <select id="theme"><option value="light">浅色</option><option value="dark">深色</option></select></label>
       <label>字号 <input id="font-size" type="range" min="14" max="32" value="19"></label>
       <label>行距 <input id="line-height" type="range" min="1.3" max="2.4" step="0.1" value="1.8"></label>
       <label>阅读宽度 <input id="text-width" type="range" min="480" max="1150" step="10" value="760"></label>
       <label id="encoding-label" hidden>TXT 编码 <select id="encoding"><option value="">自动</option><option value="utf-8">UTF-8</option><option value="utf-16le">UTF-16 LE</option><option value="utf-16be">UTF-16 BE</option><option value="gb18030">GB18030</option></select></label>
+      <label><input id="restore-session" type="checkbox" checked>启动时恢复标签页</label>
+      <label id="auto-update-label" hidden><input id="auto-update" type="checkbox">自动安装更新</label>
+      <button id="association-settings" hidden>安装</button>
+      <button id="check-updates" hidden>检查更新</button>
     </section>
     <form id="search-form" class="panel" hidden role="search">
       <input id="query" type="search" placeholder="在正文中搜索" aria-label="搜索正文" required>
@@ -45,11 +56,9 @@
     <div id="status" role="status" aria-live="polite"></div>
     <div id="scroll" tabindex="0">
       <section id="welcome">
-        <span class="brand-mark large" aria-hidden="true">H</span>
-        <h1>打开一本书</h1>
-        <p>选择本地文件，或者拖到这里。</p>
+        <img class="brand-logo large-logo" src="/ui/logo.svg" alt="">
+        <div id="project-intro"></div>
         <button id="welcome-open" class="primary">打开文件</button>
-        <p class="formats">PDF · EPUB · TXT · Kindle · Word · HTML · Markdown</p>
       </section>
       <article id="reader" hidden></article>
     </div>
@@ -77,6 +86,32 @@
       <div class="dialog-actions">
         <button value="delete" id="delete-note" class="danger">删除</button>
         <button value="cancel">取消</button><button value="save" class="primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="installation">
+    <form method="dialog">
+      <h2 id="installation-title">安装 HayakuReader</h2>
+      <p id="installation-path"></p>
+      <fieldset>
+        <legend id="association-legend">关联的文件格式</legend>
+        <div id="association-list"></div>
+      </fieldset>
+      <p id="association-hint">Windows 已设置过默认应用的格式，仍由系统默认应用设置决定。</p>
+      <button type="button" id="windows-defaults" hidden>Windows 默认应用</button>
+      <div class="dialog-actions">
+        <button value="cancel" id="installation-cancel">取消</button>
+        <button value="apply" class="primary" id="installation-apply">确定</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="update-dialog">
+    <form method="dialog">
+      <h2 id="update-title"></h2>
+      <p id="update-description"></p>
+      <div class="dialog-actions">
+        <button value="cancel" id="update-cancel">稍后</button>
+        <button value="update" class="primary" id="update-apply">立即更新</button>
       </div>
     </form>
   </dialog>

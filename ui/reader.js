@@ -9,7 +9,7 @@ const colors = ["yellow", "green", "blue", "pink"];
 let book = null;
 let pdf = null;
 let contents = [];
-let currentTab = "recent";
+let currentTab = "contents";
 let openBusy = false;
 let sideRevision = 0;
 let searchRevision = 0;
@@ -20,6 +20,15 @@ let editing = null;
 let restoring = false;
 let progressFrame;
 let results = [];
+const documentTabs = new Map();
+const isDesktop = new URLSearchParams(location.search).has("desktop");
+const english = !navigator.language.toLowerCase().startsWith("zh");
+const translate = (zh, en) => english ? en : zh;
+let installation;
+let updateInProgress = false;
+let workspaceQueue = Promise.resolve();
+let started = false;
+let installDismissed = false;
 
 async function request(url, options = {}) {
   const response = await fetch(url, { ...options, headers: { ...headers, ...options.headers } });
@@ -230,10 +239,14 @@ async function loadFlow() {
 async function present(next) {
   const previous = book;
   if (previous) await save().catch(() => {});
+  if (previous?.id === next.id && previous.session !== next.session) {
+    post(sessionUrl("close", next), {}).catch(() => {});
+    return;
+  }
+  if (previous && documentTabs.has(previous.id)) documentTabs.get(previous.id).lastUsed = Date.now();
   if (previous?.id === next.id) next.saved = previous.saved;
   pdf?.close();
   pdf = null;
-  if (previous) post(sessionUrl("close", previous), {}).catch(() => {});
   book = next;
   book.saved = { annotations: [], ...book.saved };
   contents = [];
@@ -276,6 +289,13 @@ async function present(next) {
     for (const id of ["search-toggle", "bookmark", "page-note"]) $(id).disabled = false;
     refreshHighlights();
     updateProgress();
+    const side = contents.length ? "contents" : getState().annotations.length ? "notes" : null;
+    setSidebar(Boolean(side));
+    currentTab = side || "contents";
+    documentTabs.set(book.id, { id: book.id, title: book.title, document: book, lastUsed: Date.now() });
+    sleepTabs();
+    renderDocumentTabs();
+    persistWorkspace();
     await renderSidebar();
   } catch (error) {
     reader.hidden = true;
@@ -285,9 +305,11 @@ async function present(next) {
     pdf?.close();
     pdf = null;
     post(sessionUrl("close"), {}).catch(() => {});
+    if (documentTabs.has(book.id)) documentTabs.get(book.id).document = null;
     book = null;
     $("file-name").textContent = "";
     document.title = "HayakuReader";
+    renderDocumentTabs();
     throw error;
   } finally {
     restoring = false;
@@ -295,17 +317,20 @@ async function present(next) {
 }
 
 async function openDocument(payload = {}, file = null) {
-  if (openBusy) return;
+  if (openBusy) return false;
   openBusy = true;
   for (const id of ["open-file", "welcome-open"]) $(id).disabled = true;
   message("正在打开文件…");
   try {
+    const cached = payload.id && documentTabs.get(payload.id)?.document;
+    if (cached && cached.id === book?.id) return true;
     const response = file
       ? await request("/api/import?" + new URLSearchParams({ name: file.name }), { method: "POST", body: file })
-      : await post("/api/open", payload);
-    const next = await response.json();
+      : cached ? null : await post("/api/open", payload);
+    const next = cached ?? await response.json();
     if (next) await present(next);
     message();
+    return Boolean(next);
   } catch (error) {
     report(error);
   } finally {
@@ -313,6 +338,86 @@ async function openDocument(payload = {}, file = null) {
     openBusy = false;
   }
 }
+
+function setSidebar(visible) {
+  $("sidebar").hidden = !visible;
+  $("toggle-sidebar").setAttribute("aria-expanded", String(visible));
+}
+
+function sleepTabs() {
+  const ordered = [...documentTabs.values()].sort((left, right) => right.lastUsed - left.lastUsed);
+  const expire = Date.now() - 5 * 60 * 1000;
+  let changed = false;
+  for (const [index, entry] of ordered.entries()) {
+    if (entry.id === book?.id || !entry.document || (index < 5 && entry.lastUsed > expire)) continue;
+    post(sessionUrl("close", entry.document), {}).catch(() => {});
+    entry.document = null;
+    changed = true;
+  }
+  return changed;
+}
+
+function renderDocumentTabs() {
+  const host = $("document-tabs");
+  host.replaceChildren();
+  host.hidden = !documentTabs.size;
+  for (const entry of documentTabs.values()) {
+    const item = document.createElement("div");
+    item.className = "document-tab";
+    const active = entry.id === book?.id;
+    item.dataset.sleeping = String(!entry.document);
+    item.dataset.active = String(active);
+    const select = document.createElement("button");
+    select.setAttribute("role", "tab");
+    select.setAttribute("aria-selected", String(active));
+    select.textContent = select.title = entry.title;
+    select.onclick = () => openDocument({ id: entry.id });
+    const close = document.createElement("button");
+    close.textContent = "×";
+    close.setAttribute("aria-label", translate("关闭 ", "Close ") + entry.title);
+    close.onclick = () => closeDocumentTab(entry).catch(report);
+    item.append(select, close);
+    host.append(item);
+  }
+}
+
+async function closeDocumentTab(entry) {
+  if (openBusy) return;
+  if (entry.id === book?.id) {
+    await save().catch(() => {});
+    pdf?.close();
+    pdf = null;
+    book = null;
+    contents = [];
+    reader.replaceChildren();
+    reader.hidden = true;
+    $("welcome").hidden = false;
+    $("progress").hidden = true;
+    $("file-name").textContent = "";
+    $("selection-tools").hidden = true;
+    $("search-form").hidden = true;
+    document.title = "HayakuReader";
+    setSidebar(false);
+    for (const id of ["search-toggle", "bookmark", "page-note"]) $(id).disabled = true;
+  }
+  documentTabs.delete(entry.id);
+  if (entry.document) await post(sessionUrl("close", entry.document), {}).catch(() => {});
+  if (!book && documentTabs.size) {
+    const next = [...documentTabs.values()].sort((left, right) => right.lastUsed - left.lastUsed)[0];
+    await openDocument({ id: next.id });
+  }
+  renderDocumentTabs();
+  await persistWorkspace();
+}
+
+function persistWorkspace(keepalive = false) {
+  const tabs = [...documentTabs.values()].map(({ id, title, lastUsed }) => ({ id, title, lastUsed }));
+  const value = { tabs, active: book?.id ?? null };
+  workspaceQueue = workspaceQueue.catch(() => {}).then(() => post("/api/workspace", value, keepalive));
+  return workspaceQueue.catch(report);
+}
+
+setInterval(() => { if (sleepTabs()) renderDocumentTabs(); }, 15000);
 
 function activePosition() {
   const top = scroll.getBoundingClientRect().top + 12;
@@ -505,6 +610,8 @@ function addAnnotation(annotation) {
   getState().annotations.push({ id: crypto.randomUUID(), ...annotation });
   document.getSelection()?.removeAllRanges();
   refreshHighlights();
+  currentTab = "notes";
+  setSidebar(true);
   save();
   renderSidebar().catch(report);
 }
@@ -645,10 +752,18 @@ async function find(query) {
 }
 
 function settingsValues() {
-  return Object.fromEntries(["theme", "font-size", "line-height", "text-width"].map(id => [id, $(id).value]));
+  return {
+    ...Object.fromEntries(["theme", "font-size", "line-height", "text-width"].map(id => [id, $(id).value])),
+    "restore-session": $("restore-session").checked,
+    "auto-update": $("auto-update").checked,
+    "install-dismissed": installDismissed
+  };
 }
 
 function applySettings(values) {
+  for (const id of ["restore-session", "auto-update"]) {
+    if (values?.[id] != null) $(id).checked = Boolean(values[id]);
+  }
   for (const id of ["theme", "font-size", "line-height", "text-width"]) {
     if (values?.[id] != null) $(id).value = values[id];
   }
@@ -665,8 +780,8 @@ for (const tab of document.querySelectorAll("[data-tab]")) tab.addEventListener(
   renderSidebar().catch(report);
 });
 $("toggle-sidebar").addEventListener("click", () => {
-  $("sidebar").hidden = !$("sidebar").hidden;
-  $("toggle-sidebar").setAttribute("aria-expanded", String(!$("sidebar").hidden));
+  setSidebar($("sidebar").hidden);
+  if (!$("sidebar").hidden) renderSidebar().catch(report);
 });
 $("settings-toggle").addEventListener("click", () => {
   $("settings").hidden = !$("settings").hidden;
@@ -724,6 +839,9 @@ for (const id of ["theme", "font-size", "line-height", "text-width"]) {
   $(id).addEventListener("input", () => applySettings());
   $(id).addEventListener("change", () => post("/api/settings", settingsValues()).catch(report));
 }
+for (const id of ["restore-session", "auto-update"]) {
+  $(id).addEventListener("change", () => post("/api/settings", settingsValues()).catch(report));
+}
 $("encoding").addEventListener("change", async () => {
   if (book?.kind !== "text") return;
   getState().encoding = $("encoding").value;
@@ -779,14 +897,148 @@ window.addEventListener("drop", event => {
 
 async function start() {
   if (!key) { message("请从 HayakuReader 启动阅读窗口。"); return; }
-  applySettings(await (await request("/api/settings")).json());
+  document.documentElement.lang = english ? "en" : "zh-CN";
+  const language = english ? "en" : "zh";
+  const project = isDesktop
+    ? request("/api/project?lang=" + language).then(response => response.json()).then(value => value.html).catch(() => "")
+    : Promise.resolve("");
+  const local = request("/api/project/local?lang=" + language).then(response => response.text()).catch(() => "");
+  const release = isDesktop ? request("/api/release").then(response => response.json()).catch(() => null) : Promise.resolve(null);
+  const splash = new Promise(resolve => setTimeout(resolve, isDesktop ? 3000 : 0));
+  const preferences = request("/api/settings").then(response => response.json());
+  const workspace = request("/api/workspace").then(response => response.json());
+  const installState = isDesktop ? request("/api/installation").then(response => response.json()) : Promise.resolve(null);
+  const remoteIntro = await Promise.race([project, splash.then(() => "")]);
+  const intro = remoteIntro || await local;
+  $("project-intro").replaceChildren(purify.sanitize(intro, {
+    RETURN_DOM_FRAGMENT: true, ALLOWED_TAGS: ["h1", "h2", "p", "ul", "ol", "li", "strong", "em", "code"], ALLOWED_ATTR: []
+  }));
+  await splash;
+  $("splash").hidden = true;
+  const settings = await preferences;
+  applySettings(settings);
+  installDismissed = Boolean(settings?.["install-dismissed"]);
+  installation = await installState;
+  if (installation) {
+    $("association-settings").hidden = installation.installationExists && !installation.installed;
+    $("association-settings").textContent = installation.installed
+      ? translate("文件关联", "File associations") : translate("安装", "Install");
+    $("auto-update-label").hidden = !installation.installed;
+    $("check-updates").hidden = false;
+  }
+  const saved = await workspace;
+  if ($("restore-session").checked && saved?.tabs) {
+    for (const entry of saved.tabs) documentTabs.set(entry.id, { ...entry, document: null });
+    renderDocumentTabs();
+  }
   await renderSidebar();
-  if (new URLSearchParams(location.search).has("open")) await openDocument({ initial: true });
+  if (new URLSearchParams(location.search).has("open")) {
+    await openDocument({ initial: true });
+  } else if ($("restore-session").checked && saved?.active && documentTabs.has(saved.active)) {
+    await openDocument({ id: saved.active });
+  }
+  started = true;
+  if (installation && !installation.installationExists && !installDismissed) showInstallation();
+  else release.then(info => showRelease(info)).catch(report);
 }
 
-window.hayakuOpenDrop = () => openDocument({ dropped: true });
+function showInstallation() {
+  if (!installation || $("installation").open) return;
+  $("installation-title").textContent = installation.installed
+    ? translate("文件关联", "File associations") : translate("安装 HayakuReader", "Install HayakuReader");
+  $("installation-path").textContent = installation.path;
+  $("association-legend").textContent = translate("关联的文件格式", "File types to associate");
+  $("association-hint").textContent = translate(
+    "Windows 已设置过默认应用的格式，仍由系统默认应用设置决定。",
+    "For file types with an existing Windows default, choose HayakuReader in Windows Default apps."
+  );
+  $("installation-cancel").textContent = translate("取消", "Cancel");
+  $("installation-apply").textContent = translate("确定", "Apply");
+  $("windows-defaults").hidden = !installation.installed;
+  $("windows-defaults").textContent = translate("打开 Windows 默认应用", "Open Windows Default apps");
+  const list = $("association-list");
+  list.replaceChildren();
+  for (const extension of installation.extensions) {
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = extension;
+    box.checked = installation.associations.includes(extension);
+    label.append(box, "." + extension);
+    list.append(label);
+  }
+  $("installation").returnValue = "cancel";
+  $("installation").showModal();
+}
+
+async function restart() {
+  await Promise.all([save(true).catch(() => {}), persistWorkspace(true)]);
+  window.ipc?.postMessage("restart");
+}
+
+$("association-settings").onclick = showInstallation;
+$("windows-defaults").onclick = () => post("/api/installation/defaults", {}).catch(report);
+$("installation").addEventListener("close", async () => {
+  if ($("installation").returnValue !== "apply") {
+    if (!installation.installed) {
+      installDismissed = true;
+      post("/api/settings", settingsValues()).catch(report);
+    }
+    return;
+  }
+  const extensions = [...$("association-list").querySelectorAll("input:checked")].map(box => box.value);
+  try {
+    const result = await (await post("/api/installation", { extensions, install: !installation.installed })).json();
+    installation.associations = extensions;
+    if (result.restart) await restart();
+    else message(translate("已保存文件关联。", "File associations saved."));
+  } catch (error) { report(error); }
+});
+
+async function installUpdate() {
+  if (updateInProgress) return;
+  updateInProgress = true;
+  message(translate("正在下载并验证更新…", "Downloading and verifying update…"));
+  try {
+    const result = await (await post("/api/release", {})).json();
+    if (result.restart) await restart();
+  } catch (error) { report(error); }
+  finally { updateInProgress = false; }
+}
+
+function showRelease(info, manual = false) {
+  if (!info?.version) {
+    if (manual) message(translate("已是最新版本。", "HayakuReader is up to date."));
+    return;
+  }
+  if (info.installed && $("auto-update").checked && !manual) {
+    installUpdate();
+    return;
+  }
+  if (!info.installed) {
+    message(translate("发现更新 " + info.version + "。安装后可在应用内更新。", "Update " + info.version + " is available. Install the app to update in place."));
+    return;
+  }
+  if ($("update-dialog").open) return;
+  $("update-title").textContent = translate("发现新版本 ", "Update available ") + info.version;
+  $("update-description").textContent = translate("更新后会重新启动 HayakuReader。", "HayakuReader will restart after the update.");
+  $("update-apply").textContent = translate("立即更新", "Update now");
+  $("update-cancel").textContent = translate("稍后", "Later");
+  $("update-dialog").returnValue = "cancel";
+  $("update-dialog").showModal();
+}
+
+$("check-updates").onclick = () => request("/api/release").then(response => response.json())
+  .then(info => showRelease(info, true)).catch(report);
+$("update-dialog").addEventListener("close", () => {
+  if ($("update-dialog").returnValue === "update") installUpdate();
+});
+
+window.hayakuOpenDrop = () => {
+  if (started && !openBusy && !$("installation").open) openDocument({ dropped: true });
+};
 window.hayakuFlush = async () => {
-  try { await save(true); }
+  try { await Promise.all([save(true), persistWorkspace(true)]); }
   finally { window.ipc?.postMessage("saved"); }
 };
 
