@@ -930,14 +930,13 @@ function settingsValues() {
   return {
     ...Object.fromEntries(["theme", "font-size", "line-height", "text-width"].map(id => [id, $(id).value])),
     "restore-session": $("restore-session").checked,
-    "pdf-dark": $("pdf-dark").checked,
     "auto-update": $("auto-update").checked,
     "install-dismissed": installDismissed
   };
 }
 
 function applySettings(values) {
-  for (const id of ["restore-session", "pdf-dark", "auto-update"]) {
+  for (const id of ["restore-session", "auto-update"]) {
     if (values?.[id] != null) $(id).checked = Boolean(values[id]);
   }
   for (const id of ["theme", "font-size", "line-height", "text-width"]) {
@@ -945,7 +944,6 @@ function applySettings(values) {
   }
   const root = document.documentElement;
   root.dataset.theme = $("theme").value;
-  root.dataset.pdfDark = String($("pdf-dark").checked);
   root.style.setProperty("--size", $("font-size").value + "px");
   root.style.setProperty("--leading", $("line-height").value);
   root.style.setProperty("--measure", $("text-width").value + "px");
@@ -1047,11 +1045,11 @@ for (const id of ["theme", "font-size", "line-height", "text-width"]) {
   $(id).addEventListener("input", () => applySettings());
   $(id).addEventListener("change", () => post("/api/settings", settingsValues()).catch(report));
 }
-for (const id of ["restore-session", "pdf-dark", "auto-update"]) {
+for (const id of ["restore-session", "auto-update"]) {
   $(id).addEventListener("change", () => post("/api/settings", settingsValues()).catch(report));
 }
 $("reset-settings").addEventListener("click", () => {
-  applySettings({ "font-size": 19, "line-height": 1.8, "text-width": 760, "pdf-dark": false });
+  applySettings({ "font-size": 19, "line-height": 1.8, "text-width": 760 });
   post("/api/settings", settingsValues()).catch(report);
   message(translate("已恢复默认阅读设置。", "Reading settings reset."));
 });
@@ -1307,7 +1305,6 @@ function localizeStaticUi() {
   labelText("encoding", "TXT encoding ");
   text('#encoding option[value=""]', "Auto");
   labelText("restore-session", "Restore tabs on startup");
-  labelText("pdf-dark", "Invert pages in dark mode");
   labelText("auto-update", "Install updates automatically");
   labelText("note-text", "Note ");
   labelText("color", "Color ");

@@ -103,9 +103,9 @@ footer { justify-content: space-between; border-top: 1px solid var(--line); colo
 #selection-tools .swatch[data-highlight="green"] { background: #72c681; }
 #selection-tools .swatch[data-highlight="blue"] { background: #72b7ea; }
 #selection-tools .swatch[data-highlight="pink"] { background: #e98dc2; }
-:root[data-theme="dark"][data-pdf-dark="true"] .pdf-page canvas,
-:root[data-theme="dark"][data-pdf-dark="true"] .word-page > img { filter: invert(.88) hue-rotate(180deg); }
-:root[data-theme="dark"][data-pdf-dark="true"] .pdf-page { background: #1e211f; }
+:root[data-theme="dark"] .pdf-page canvas,
+:root[data-theme="dark"] .word-page > img { filter: invert(.88) hue-rotate(180deg); }
+:root[data-theme="dark"] .pdf-page { background: #1e211f; }
 body.focus-mode .toolbar,
 body.focus-mode #document-tabs,
 body.focus-mode footer,
