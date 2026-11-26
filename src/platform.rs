@@ -1,6 +1,7 @@
 use crate::{App, Result, Shared, authorize, bad, internal, read_json, write_json};
 use axum::{
     Json,
+    body::Bytes,
     extract::{Query, State},
     http::HeaderMap,
 };
@@ -320,6 +321,101 @@ pub async fn open_repo(
 ) -> Result<axum::http::StatusCode> {
     authorize(&headers, &app)?;
     shell_open(REPO)
+}
+
+pub fn validate_external_url(raw: &str) -> std::result::Result<url::Url, &'static str> {
+    let parsed = url::Url::parse(raw.trim()).map_err(|_| "链接格式无效")?;
+    match parsed.scheme() {
+        "http" | "https" if parsed.has_host() => Ok(parsed),
+        "mailto" if !parsed.path().is_empty() => Ok(parsed),
+        _ => Err("仅支持打开 http、https 或 mailto 外部链接"),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ExternalLinkRequest {
+    url: String,
+}
+
+pub async fn open_external_link(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Json(payload): Json<ExternalLinkRequest>,
+) -> Result<axum::http::StatusCode> {
+    authorize(&headers, &app)?;
+    let parsed = validate_external_url(&payload.url).map_err(bad)?;
+    shell_open(parsed.as_str())
+}
+
+pub async fn copy_image(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    data: Bytes,
+) -> Result<axum::http::StatusCode> {
+    authorize(&headers, &app)?;
+    const PNG_SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if data.is_empty() || !data.starts_with(PNG_SIG) {
+        return Err(bad("图像数据无效"));
+    }
+    tokio::task::spawn_blocking(move || set_clipboard_png(&data).map_err(internal))
+        .await
+        .map_err(internal)??;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+fn set_clipboard_png(png: &[u8]) -> std::result::Result<(), &'static str> {
+    const GMEM_MOVEABLE: u32 = 0x0002;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn OpenClipboard(hwnd: *const core::ffi::c_void) -> i32;
+        fn EmptyClipboard() -> i32;
+        fn SetClipboardData(
+            format: u32,
+            mem: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        fn CloseClipboard() -> i32;
+        fn RegisterClipboardFormatW(name: *const u16) -> u32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalAlloc(flags: u32, bytes: usize) -> *mut core::ffi::c_void;
+        fn GlobalLock(mem: *mut core::ffi::c_void) -> *mut u8;
+        fn GlobalUnlock(mem: *mut core::ffi::c_void) -> i32;
+        fn GlobalFree(mem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+    let png_name: Vec<u16> = "PNG\0".encode_utf16().collect();
+    unsafe {
+        let png_fmt = RegisterClipboardFormatW(png_name.as_ptr());
+        if png_fmt == 0 {
+            return Err("无法注册剪贴板 PNG 格式");
+        }
+        if OpenClipboard(std::ptr::null()) == 0 {
+            return Err("无法打开系统剪贴板");
+        }
+        let result = (|| {
+            if EmptyClipboard() == 0 {
+                return Err("无法清空系统剪贴板");
+            }
+            let hmem = GlobalAlloc(GMEM_MOVEABLE, png.len());
+            if hmem.is_null() {
+                return Err("无法分配剪贴板内存");
+            }
+            let ptr = GlobalLock(hmem);
+            if ptr.is_null() {
+                GlobalFree(hmem);
+                return Err("无法锁定剪贴板内存");
+            }
+            std::ptr::copy_nonoverlapping(png.as_ptr(), ptr, png.len());
+            GlobalUnlock(hmem);
+            if SetClipboardData(png_fmt, hmem).is_null() {
+                GlobalFree(hmem);
+                return Err("写入剪贴板图像失败");
+            }
+            Ok(())
+        })();
+        CloseClipboard();
+        result
+    }
 }
 
 pub fn report_replace_failure(error: &dyn std::error::Error) {
@@ -787,5 +883,16 @@ mod tests {
         assert!(fs::metadata(&desktop_lnk)?.len() > 0);
         assert!(fs::metadata(&start_lnk)?.len() > 0);
         Ok(())
+    }
+
+    #[test]
+    fn validates_external_link_schemes() {
+        assert!(validate_external_url("https://example.com/path?a=1").is_ok());
+        assert!(validate_external_url(" http://example.com ").is_ok());
+        assert!(validate_external_url("mailto:reader@example.com").is_ok());
+        assert!(validate_external_url("javascript:alert(1)").is_err());
+        assert!(validate_external_url("file:///C:/Windows/win.ini").is_err());
+        assert!(validate_external_url(r"C:\Windows\notepad.exe").is_err());
+        assert!(validate_external_url("http://").is_err());
     }
 }

@@ -163,6 +163,19 @@
       <button type="button" id="select-all-cancel">取消</button>
     </div>
   </dialog>
+  <dialog id="link-warning-dialog">
+    <form method="dialog">
+      <h2 id="link-warning-title">外部链接风险提示</h2>
+      <p id="link-warning-body">即将离开阅读器并在外部浏览器中打开以下链接。外部页面不受 HayakuReader 控制，可能存在钓鱼、恶意软件或隐私风险，请确认来源可信后再继续：</p>
+      <div class="link-warning-url-box"><code id="link-warning-url"></code></div>
+      <div class="dialog-actions">
+        <button type="button" id="link-warning-copy">复制链接</button>
+        <button value="cancel" id="link-warning-cancel">取消</button>
+        <button value="open" class="primary" id="link-warning-open">继续打开</button>
+      </div>
+    </form>
+  </dialog>
+  <div id="context-menu" class="context-menu" role="menu" hidden></div>
   <div class="win-resize win-resize-n" data-resize="n" aria-hidden="true"></div>
   <div class="win-resize win-resize-nw" data-resize="nw" aria-hidden="true"></div>
   <div class="win-resize win-resize-ne" data-resize="ne" aria-hidden="true"></div>

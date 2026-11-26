@@ -433,6 +433,7 @@ struct ContentQuery {
     encoding: Option<String>,
     raster: Option<bool>,
     raw: Option<bool>,
+    scale: Option<f32>,
 }
 
 fn parse_range(header: &str, len: u64) -> Option<std::result::Result<(u64, u64), ()>> {
@@ -550,7 +551,7 @@ async fn content(
             Source::Word(word) => {
                 let index = query.chapter.unwrap_or(0);
                 if query.raster.unwrap_or(false) {
-                    bytes("image/png", word.image(index).map_err(bad)?)
+                    bytes("image/png", word.image(index, query.scale).map_err(bad)?)
                 } else {
                     Json(word.text(index).map_err(bad)?).into_response()
                 }
@@ -600,6 +601,56 @@ async fn content(
             }
         };
         Ok(response)
+    })
+    .await
+    .map_err(internal)?
+}
+
+#[derive(Deserialize)]
+struct SaveImageQuery {
+    name: Option<String>,
+}
+
+fn sanitize_image_filename(raw: Option<&str>) -> String {
+    let base = raw
+        .unwrap_or("image")
+        .trim()
+        .replace(
+            |c: char| c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'),
+            "_",
+        );
+    let clean = base.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if clean.is_empty() {
+        "image.png".to_owned()
+    } else if clean.to_ascii_lowercase().ends_with(".png") {
+        clean.to_owned()
+    } else {
+        format!("{clean}.png")
+    }
+}
+
+async fn save_image(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Query(query): Query<SaveImageQuery>,
+    data: Bytes,
+) -> Result<Json<Value>> {
+    authorize(&headers, &app)?;
+    const PNG_SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if data.is_empty() || !data.starts_with(PNG_SIG) {
+        return Err(bad("图像数据无效"));
+    }
+    let filename = sanitize_image_filename(query.name.as_deref());
+    tokio::task::spawn_blocking(move || {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PNG 图像", &["png"])
+            .set_file_name(&filename)
+            .save_file()
+        else {
+            return Ok(Json(serde_json::json!({ "saved": false })));
+        };
+        fs::write(&path, &data).map_err(internal)?;
+        Ok(Json(serde_json::json!({ "saved": true })))
     })
     .await
     .map_err(internal)?
@@ -950,6 +1001,10 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .route("/api/content/{session}", get(content))
         .route("/api/save/{session}", post(save))
         .route("/api/close/{session}", post(close))
+        .route(
+            "/api/image/save",
+            post(save_image).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .route("/api/project/local", get(local_project))
         .route("/resource/{key}/{session}", get(resource));
     #[cfg(windows)]
@@ -964,6 +1019,11 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/project", get(platform::project))
         .route("/api/project/open", post(platform::open_repo))
+        .route("/api/link/open", post(platform::open_external_link))
+        .route(
+            "/api/image/copy",
+            post(platform::copy_image).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .route("/api/release/progress", get(platform::progress))
         .route("/api/release/open", post(platform::open_releases))
         .route(

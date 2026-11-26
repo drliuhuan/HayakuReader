@@ -248,6 +248,121 @@ function applyFlowColors() {
   }
 }
 
+const BARE_URL_RE = /https?:\/\/[^\s<>"'`()[\]{}，。、；：！？（）【】《》]+/g;
+
+function normalizeExternalUrl(raw, baseHref = "") {
+  if (!raw || typeof raw !== "string") return null;
+  let candidate = raw.trim();
+  if (!candidate) return null;
+  if (candidate.startsWith("//")) candidate = "https:" + candidate;
+  try {
+    let parsed;
+    if (baseHref && /^https?:\/\//i.test(baseHref)) {
+      parsed = new URL(candidate, baseHref);
+    } else {
+      parsed = new URL(candidate);
+    }
+    if ((parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.host) {
+      return parsed.href;
+    }
+    if (parsed.protocol === "mailto:" && parsed.pathname) {
+      return parsed.href;
+    }
+  } catch { /* Reject malformed or relative URLs without an HTTP(S) base. */ }
+  return null;
+}
+
+function extractHtmlBaseHref(markup) {
+  const doc = new DOMParser().parseFromString(markup, "text/html");
+  const rawBase = doc.querySelector("base[href]")?.getAttribute("href")?.trim();
+  if (!rawBase) return "";
+  try {
+    const parsed = new URL(rawBase);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") ? parsed.href : "";
+  } catch {
+    return "";
+  }
+}
+
+function confirmExternalLink(displayTarget, openUrl = null) {
+  const dialog = $("link-warning-dialog");
+  if (!dialog) return;
+  const targetLabel = openUrl || displayTarget;
+  $("link-warning-url").textContent = targetLabel;
+  $("link-warning-title").textContent = translate("外部链接风险提示", "External link risk warning");
+  $("link-warning-body").textContent = openUrl
+    ? translate(
+        "即将离开阅读器并在外部浏览器中打开以下链接。外部页面不受 HayakuReader 控制，可能存在钓鱼、恶意软件或隐私风险，请确认来源可信后再继续：",
+        "You are about to leave HayakuReader and open this link in your external browser. External websites are outside HayakuReader's control and may pose phishing, malware, or privacy risks. Continue only if you trust the destination:"
+      )
+    : translate(
+        "该链接指向当前文档页面之外的目标，不在本地页面范围内。为避免潜在安全风险，无法在应用内直接打开：",
+        "This link points outside the current document page and cannot be opened directly inside the reader for safety:"
+      );
+  const openBtn = $("link-warning-open");
+  openBtn.hidden = !openUrl;
+  $("link-warning-copy").onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(targetLabel);
+      message(translate("已复制链接。", "Link copied."));
+    } catch (error) { report(error); }
+  };
+  dialog.returnValue = "cancel";
+  if (dialog.open) dialog.close();
+  dialog.showModal();
+  dialog.addEventListener("close", () => {
+    if (dialog.returnValue !== "open" || !openUrl) return;
+    if (isDesktop) post("/api/link/open", { url: openUrl }).catch(report);
+    else window.open(openUrl, "_blank", "noopener,noreferrer");
+  }, { once: true });
+}
+
+function linkifyTextNodes(root, skipPre = true) {
+  const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue || !node.nodeValue.includes("://")) return NodeFilter.FILTER_REJECT;
+      const parent = node.parentElement;
+      if (!parent || parent.closest(skipPre ? "a, script, style, code, pre" : "a, script, style, code")) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+  const targets = [];
+  while (walk.nextNode()) targets.push(walk.currentNode);
+  for (const node of targets) {
+    const text = node.nodeValue;
+    BARE_URL_RE.lastIndex = 0;
+    let match;
+    let last = 0;
+    let fragment = null;
+    while ((match = BARE_URL_RE.exec(text)) !== null) {
+      const cleaned = match[0].replace(/[.,;:!?]+$/, "");
+      const valid = normalizeExternalUrl(cleaned);
+      if (!valid) continue;
+      if (!fragment) fragment = document.createDocumentFragment();
+      if (match.index > last) fragment.append(document.createTextNode(text.slice(last, match.index)));
+      const anchor = document.createElement("a");
+      anchor.className = "external-link";
+      anchor.href = valid;
+      anchor.textContent = cleaned;
+      anchor.title = valid;
+      anchor.addEventListener("click", event => {
+        if (getSelection()?.toString()) return;
+        event.preventDefault();
+        confirmExternalLink(valid, valid);
+      });
+      fragment.append(anchor);
+      last = match.index + cleaned.length;
+      BARE_URL_RE.lastIndex = last;
+    }
+    if (fragment) {
+      if (last < text.length) fragment.append(document.createTextNode(text.slice(last)));
+      node.replaceWith(fragment);
+    }
+  }
+}
+
 function addMarkup(target, markup, base, kind, index) {
   const parsed = purify.sanitize(markup, {
     RETURN_DOM_FRAGMENT: true, USE_PROFILES: { html: true },
@@ -276,19 +391,55 @@ function addMarkup(target, markup, base, kind, index) {
       image.removeAttribute("src");
     }
   }
+  const htmlBase = kind === "html" ? extractHtmlBaseHref(markup) : "";
   for (const link of parsed.querySelectorAll("a[href]")) {
-    const original = link.getAttribute("href");
-    const resolved = stripRemote(original, base);
+    const original = (link.getAttribute("href") || "").trim();
     link.removeAttribute("href");
-    if (!resolved) continue;
-    const isEbook = kind === "epub" || kind === "kindle";
-    const chapter = isEbook ? book.chapters.findIndex(item => item.path === resolved.path) : index;
-    if (chapter === -1 || (!isEbook && !original.startsWith("#"))) continue;
-    link.href = "#";
-    link.addEventListener("click", event => {
-      event.preventDefault();
-      jump(chapter, null, resolved.fragment);
-    });
+    if (!original) continue;
+    if (original.startsWith("#")) {
+      let fragment = original.slice(1);
+      try { fragment = decodeURIComponent(fragment); } catch { /* Keep raw fragment. */ }
+      link.href = "#";
+      link.addEventListener("click", event => {
+        event.preventDefault();
+        jump(index, null, fragment);
+      });
+      continue;
+    }
+    if (kind === "epub" || kind === "kindle") {
+      const resolved = stripRemote(original, base);
+      if (resolved) {
+        const chapter = book.chapters.findIndex(item => item.path === resolved.path);
+        if (chapter !== -1) {
+          link.href = "#";
+          link.addEventListener("click", event => {
+            event.preventDefault();
+            jump(chapter, null, resolved.fragment);
+          });
+          continue;
+        }
+      }
+    }
+    const external = normalizeExternalUrl(original, htmlBase);
+    if (external) {
+      link.href = external;
+      link.classList.add("external-link");
+      link.title = external;
+      link.addEventListener("click", event => {
+        if (getSelection()?.toString()) return;
+        event.preventDefault();
+        confirmExternalLink(external, external);
+      });
+    } else if (kind === "html" && !/^(?:javascript|vbscript|data):/i.test(original)) {
+      link.href = "#";
+      link.classList.add("external-link");
+      link.title = original;
+      link.addEventListener("click", event => {
+        if (getSelection()?.toString()) return;
+        event.preventDefault();
+        confirmExternalLink(original, null);
+      });
+    }
   }
   target.append(parsed);
 }
@@ -329,6 +480,7 @@ async function loadFlow() {
     pre.className = "plain-text";
     pre.dataset.unit = 0;
     pre.textContent = await (await request(contentRoute(0, getState().encoding))).text();
+    linkifyTextNodes(pre, false);
     reader.replaceChildren(pre);
     bookStyles.replaceSync("");
     return;
@@ -359,6 +511,7 @@ async function loadFlow() {
     const markup = markups[index];
     rules.push(...await readStyles(markup, chapter.path, index));
     addMarkup(part, markup, chapter.path, book.kind, index);
+    linkifyTextNodes(part, true);
     if (!book.outline?.length && book.chapters.length) contents.push(chapterHeading(chapter.title, index, ""));
     if (book.kind !== "epub" && !book.outline?.length) addHeadings(part, index);
     fragment.append(part);
@@ -401,17 +554,40 @@ async function present(next) {
   updateViewModeButton();
   for (const id of ["search-toggle", "bookmark", "page-note"]) $(id).disabled = true;
   restoring = true;
+  const handleExternal = rawUrl => {
+    const normalized = normalizeExternalUrl(rawUrl);
+    if (normalized) confirmExternalLink(normalized, normalized);
+    else if (rawUrl) confirmExternalLink(rawUrl, null);
+  };
   try {
     if (book.kind === "pdf") {
       reader.className = "fixed";
       const { openPdf } = await import("/ui/pdf.js");
-      pdf = await openPdf(contentRoute(0), headers, reader, scroll, scheduleRefreshHighlights, isSmartInvertActive);
+      pdf = await openPdf(
+        contentRoute(0),
+        headers,
+        reader,
+        scroll,
+        scheduleRefreshHighlights,
+        isSmartInvertActive,
+        handleExternal,
+        pageIndex => jump(pageIndex).catch(report)
+      );
       contents = await pdf.outline().catch(() => []);
       $("page-number").max = pdf.count;
     } else if (book.kind === "word") {
       reader.className = "fixed";
       const { openWord } = await import("/ui/word.js");
-      pdf = openWord(book.word, contentRoute, request, reader, scroll, scheduleRefreshHighlights, isSmartInvertActive);
+      pdf = openWord(
+        book.word,
+        contentRoute,
+        request,
+        reader,
+        scroll,
+        scheduleRefreshHighlights,
+        isSmartInvertActive,
+        handleExternal
+      );
       contents = book.word.outline;
       $("page-number").max = pdf.count;
     } else {
@@ -1388,7 +1564,9 @@ document.addEventListener("keydown", event => {
     return;
   }
   if (event.key === "Escape") {
-    if (document.body.classList.contains("focus-mode")) {
+    if (!$("context-menu").hidden) {
+      closeContextMenu();
+    } else if (document.body.classList.contains("focus-mode")) {
       document.body.classList.remove("focus-mode");
     } else if (!$("settings").hidden) {
       $("settings").hidden = true;
@@ -1442,6 +1620,7 @@ new ResizeObserver(() => {
 }).observe(scroll);
 
 scroll.addEventListener("scroll", () => {
+  closeContextMenu();
   if (progressFrame) return;
   progressFrame = requestAnimationFrame(() => { progressFrame = null; updateProgress(); });
 }, { passive: true });
@@ -1453,6 +1632,143 @@ document.addEventListener("copy", event => {
   event.preventDefault();
   event.clipboardData.setData("text/plain", parts.map(part => part.quote).join("\n"));
 });
+
+function closeContextMenu() {
+  const menu = $("context-menu");
+  if (!menu || menu.hidden) return;
+  menu.hidden = true;
+  menu.replaceChildren();
+}
+
+function imgElementToPngBlob(img) {
+  return new Promise((resolve, reject) => {
+    const width = img.naturalWidth || img.width;
+    const height = img.naturalHeight || img.height;
+    if (!width || !height) {
+      reject(new Error(translate("图像尚未加载", "Image is not ready")));
+      return;
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    try {
+      canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+      canvas.toBlob(blob => {
+        if (blob) resolve(blob);
+        else reject(new Error(translate("无法导出图像", "Could not export image")));
+      }, "image/png");
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+async function copyImageBlob(blob) {
+  try {
+    if (navigator.clipboard?.write && typeof ClipboardItem !== "undefined") {
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+      message(translate("已复制图像。", "Image copied."));
+      return;
+    }
+  } catch { /* Fall back to native Windows clipboard on desktop WebView2. */ }
+  if (!isDesktop) throw new Error(translate("浏览器不支持直接复制图像。", "Clipboard image copy is unavailable."));
+  await request("/api/image/copy", {
+    method: "POST",
+    headers: { "Content-Type": "image/png" },
+    body: blob
+  });
+  message(translate("已复制图像。", "Image copied."));
+}
+
+async function saveImageBlob(blob, filename) {
+  if (isDesktop) {
+    const result = await (await request("/api/image/save?" + new URLSearchParams({ name: filename }), {
+      method: "POST",
+      headers: { "Content-Type": "image/png" },
+      body: blob
+    })).json();
+    if (result?.saved) message(translate("图像已保存。", "Image saved."));
+    return;
+  }
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+  message(translate("图像已保存。", "Image saved."));
+}
+
+function showContextMenu(x, y, items) {
+  const menu = $("context-menu");
+  if (!menu || !items.length) return;
+  menu.replaceChildren(...items.map(({ label, action }) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("role", "menuitem");
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      closeContextMenu();
+      Promise.resolve().then(action).catch(report);
+    });
+    return button;
+  }));
+  menu.hidden = false;
+  const maxX = Math.max(8, window.innerWidth - menu.offsetWidth - 8);
+  const maxY = Math.max(8, window.innerHeight - menu.offsetHeight - 8);
+  menu.style.left = Math.min(Math.max(8, x), maxX) + "px";
+  menu.style.top = Math.min(Math.max(8, y), maxY) + "px";
+}
+
+reader.addEventListener("contextmenu", event => {
+  closeContextMenu();
+  if (!book || reader.hidden) return;
+  let imageTarget = null;
+  const imgEl = event.target.closest("img");
+  if (imgEl && reader.contains(imgEl)) {
+    const rawName = (imgEl.getAttribute("alt") || imgEl.src.split("/").pop()?.split("?")[0] || "image").replace(/\.[a-z0-9]+$/i, "");
+    imageTarget = {
+      kind: "image",
+      filename: (rawName || "image") + ".png",
+      extractPng: () => imgElementToPngBlob(imgEl)
+    };
+  } else if (pdf?.imageAt) {
+    const pageEl = event.target.closest(".pdf-page, .word-page");
+    if (pageEl && reader.contains(pageEl)) {
+      imageTarget = pdf.imageAt(Number(pageEl.dataset.unit), event.clientX, event.clientY);
+    }
+  }
+  if (!imageTarget) return;
+  event.preventDefault();
+  const items = [];
+  const selection = getSelection();
+  const selectedText = selection?.toString();
+  if (selectedText && reader.contains(selection.anchorNode)) {
+    items.push({
+      label: translate("复制文字", "Copy text"),
+      action: () => navigator.clipboard.writeText(picked?.text || selectedText).then(() => message(translate("已复制文字。", "Copied text.")))
+    });
+  }
+  const isImage = imageTarget.kind === "image";
+  items.push({
+    label: isImage ? translate("复制图像", "Copy image") : translate("复制此页图像", "Copy page image"),
+    action: async () => copyImageBlob(await imageTarget.extractPng())
+  });
+  items.push({
+    label: isImage ? translate("图像另存为…", "Save image as…") : translate("此页另存为图片…", "Save page as PNG…"),
+    action: async () => saveImageBlob(await imageTarget.extractPng(), imageTarget.filename)
+  });
+  showContextMenu(event.clientX, event.clientY, items);
+});
+
+document.addEventListener("mousedown", event => {
+  const menu = $("context-menu");
+  if (menu && !menu.hidden && !menu.contains(event.target)) closeContextMenu();
+});
+window.addEventListener("blur", closeContextMenu);
+window.addEventListener("resize", closeContextMenu);
 document.addEventListener("visibilitychange", () => { if (document.hidden && saveTimer) save(true); });
 window.addEventListener("pagehide", () => { if (saveTimer) save(true); });
 window.addEventListener("dragover", event => {
@@ -1537,6 +1853,10 @@ function localizeStaticUi() {
   $("smart-invert-ack").textContent = "Got it";
   $("select-all-label").textContent = "Loading remaining pages…";
   $("select-all-cancel").textContent = "Cancel";
+  $("link-warning-title").textContent = "External link risk warning";
+  $("link-warning-copy").textContent = "Copy link";
+  $("link-warning-cancel").textContent = "Cancel";
+  $("link-warning-open").textContent = "Open link";
   $("win-minimize").setAttribute("aria-label", "Minimize");
   $("win-minimize").title = "Minimize";
   $("win-close").setAttribute("aria-label", "Close");
