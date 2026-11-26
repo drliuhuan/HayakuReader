@@ -6,4 +6,6 @@ HayakuReader is a local Windows reader built in Rust by **drliuhuan**. Open PDF,
 - Reading positions and annotations stay on your computer. You can restore your tabs on startup.
 - The single EXE supports per-user installation, file associations, and updates from GitHub.
 
+Starting with v0.2.1, HTM and HTML are unchecked by default. You can still select both formats during installation or in settings after installing.
+
 Complex Word layouts may differ from the originals. Kindle files protected by DRM or compressed with HUFF/CDIC are currently unsupported. OCR, Markdown editing, and annotation export are planned for later releases.

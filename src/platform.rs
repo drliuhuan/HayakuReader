@@ -127,7 +127,7 @@ pub fn check_manual_update(data: &Path) -> io::Result<bool> {
 fn association_defaults() -> Vec<String> {
     crate::formats::EXTENSIONS
         .iter()
-        .filter(|extension| !matches!(**extension, "txt" | "doc" | "docx"))
+        .filter(|extension| !matches!(**extension, "txt" | "doc" | "docx" | "htm" | "html"))
         .map(|extension| (*extension).to_owned())
         .collect()
 }
@@ -548,7 +548,7 @@ mod tests {
             register_associations(&test_root, data.path(), &exe, &defaults)?;
             let selected = test_root.open_subkey(format!(r"{CAPABILITIES}\FileAssociations"))?;
             assert_eq!(selected.get_value::<String, _>(".pdf")?, PROG_ID);
-            for ext in [".txt", ".doc", ".docx"] {
+            for ext in [".txt", ".doc", ".docx", ".htm", ".html"] {
                 assert!(selected.get_value::<String, _>(ext).is_err());
             }
             let command =
