@@ -45,7 +45,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            theme: "light".to_owned(),
+            theme: "system".to_owned(),
             font_size: 19.0,
             line_height: 1.8,
             text_width: 760.0,
@@ -116,6 +116,8 @@ pub struct Annotation {
     pub digest: String,
     #[serde(default)]
     pub missing: bool,
+    #[serde(rename = "createdAt", default)]
+    pub created_at: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

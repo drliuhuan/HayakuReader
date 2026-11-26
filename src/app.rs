@@ -43,6 +43,13 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 enum SplashState {
     Timed {
         started_at: Instant,
@@ -76,6 +83,7 @@ struct OpenBook {
 #[derive(Clone, Debug)]
 struct PendingJump {
     chapter: usize,
+    item_idx: Option<usize>,
     fragment: String,
     fraction: f32,
 }
@@ -128,8 +136,13 @@ struct AnnotationEditorModal {
     position: Option<Position>,
 }
 
+#[derive(Clone, Debug)]
 struct SearchMatch {
     unit: usize,
+    item_idx: Option<usize>,
+    char_start: usize,
+    char_end: usize,
+    fraction: f32,
     snippet: String,
 }
 
@@ -174,6 +187,8 @@ enum FlowVisual {
     SingleJob {
         job: LayoutJob,
         pad_top: f32,
+        indent_px: f32,
+        bullet: Option<String>,
         link_spans: Vec<(usize, usize, LinkTarget)>,
         code_box: bool,
         quote_bar: bool,
@@ -186,12 +201,22 @@ enum FlowVisual {
     RichSpec {
         scale_mul: f32,
         pad_top: f32,
+        indent_px: f32,
+        bullet: Option<String>,
+        quote_bar: bool,
     },
 }
 
 enum FlowSourceRef {
     Separator,
-    Block { chapter_idx: usize, block_idx: usize },
+    Block {
+        chapter_idx: usize,
+        block_idx: usize,
+        flat_block: Option<Block>,
+        indent_px: f32,
+        bullet: Option<String>,
+        quote_bar: bool,
+    },
     CodeLine {
         line_no: usize,
         text: String,
@@ -246,8 +271,10 @@ pub struct HayakuApp {
     show_settings: bool,
     show_search: bool,
     search_query: String,
+    last_searched_query: String,
     search_matches: Vec<SearchMatch>,
     search_cursor: usize,
+    hovered_note: Option<(Pos2, String, u64)>,
 
     fixed_zoom: Option<f32>,
     page_cache: HashMap<(String, usize), CachedPageTexture>,
@@ -373,16 +400,18 @@ impl HayakuApp {
             scroll_active_tab_into_view: false,
             smart_invert_btn_rect: None,
             splash,
-            sidebar_open: false,
+            sidebar_open: true,
             sidebar_pinned: false,
-            sidebar_tab: SidebarTab::Contents,
+            sidebar_tab: SidebarTab::Recent,
             active_outline_idx: None,
             focus_mode: false,
             show_settings: false,
             show_search: false,
             search_query: String::new(),
+            last_searched_query: String::new(),
             search_matches: Vec::new(),
             search_cursor: 0,
+            hovered_note: None,
             fixed_zoom: None,
             page_cache: HashMap::new(),
             use_tick: 0,
@@ -456,13 +485,10 @@ impl HayakuApp {
         }
     }
 
-    fn active_book_has_outline_or_notes(&self) -> bool {
+    fn active_book_has_outline(&self) -> bool {
         let Some(book) = &self.active_book else {
             return false;
         };
-        if !book.state.annotations.is_empty() {
-            return true;
-        }
         match &book.source {
             LoadedSource::Pdf(p) => !p.outline().is_empty(),
             LoadedSource::Word(w) => !w.metadata.outline.is_empty(),
@@ -470,13 +496,28 @@ impl HayakuApp {
         }
     }
 
+    fn active_book_has_notes(&self) -> bool {
+        self.active_book
+            .as_ref()
+            .is_some_and(|b| !b.state.annotations.is_empty())
+    }
+
     fn sync_auto_sidebar(&mut self, select_contents_if_opened: bool) {
-        if self.sidebar_pinned {
+        if self.active_book.is_none() {
             self.sidebar_open = true;
-        } else if self.active_book_has_outline_or_notes() {
+            self.sidebar_tab = SidebarTab::Recent;
+            return;
+        }
+        let has_outline = self.active_book_has_outline();
+        let has_notes = self.active_book_has_notes();
+        if self.sidebar_pinned || has_outline || has_notes {
             self.sidebar_open = true;
             if select_contents_if_opened {
-                self.sidebar_tab = SidebarTab::Contents;
+                if has_outline {
+                    self.sidebar_tab = SidebarTab::Contents;
+                } else if has_notes {
+                    self.sidebar_tab = SidebarTab::Notes;
+                }
             }
         } else {
             self.sidebar_open = false;
@@ -484,7 +525,22 @@ impl HayakuApp {
     }
 
     fn theme_mode(&self) -> ThemeMode {
-        ThemeMode::from_str_loose(&self.settings.theme)
+        if self.settings.theme.eq_ignore_ascii_case("system") {
+            #[cfg(windows)]
+            {
+                if platform::windows_system_prefers_dark() {
+                    ThemeMode::Dark
+                } else {
+                    ThemeMode::Light
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                ThemeMode::Light
+            }
+        } else {
+            ThemeMode::from_str_loose(&self.settings.theme)
+        }
     }
 
     fn palette(&self) -> Palette {
@@ -616,6 +672,7 @@ impl HayakuApp {
         self.scroll_fraction = pos.fraction;
         self.pending_jump = Some(PendingJump {
             chapter: pos.index,
+            item_idx: None,
             fragment: String::new(),
             fraction: pos.fraction,
         });
@@ -644,6 +701,7 @@ impl HayakuApp {
         self.fixed_sel_dragging = false;
         self.fixed_all_selected = false;
         self.search_matches.clear();
+        self.last_searched_query.clear();
         self.search_cursor = 0;
         self.scroll_active_tab_into_view = true;
         if !self.active_book_uses_smart_invert() {
@@ -925,6 +983,7 @@ impl HayakuApp {
             LinkTarget::Internal { chapter, fragment } => {
                 self.pending_jump = Some(PendingJump {
                     chapter: *chapter,
+                    item_idx: None,
                     fragment: fragment.clone(),
                     fraction: 0.0,
                 });
@@ -1042,54 +1101,170 @@ impl HayakuApp {
         parts.join("")
     }
 
+    fn jump_to_search_match(&mut self, index: usize) {
+        if let Some(m) = self.search_matches.get(index).cloned() {
+            self.search_cursor = index;
+            self.pending_jump = Some(PendingJump {
+                chapter: m.unit,
+                item_idx: m.item_idx,
+                fragment: String::new(),
+                fraction: m.fraction,
+            });
+            self.current_unit = m.unit;
+        }
+    }
+
     fn run_search(&mut self) {
         self.search_matches.clear();
         self.search_cursor = 0;
         let query = self.search_query.trim().to_lowercase();
+        self.last_searched_query = query.clone();
         if query.is_empty() {
             return;
         }
         let Some(book) = &self.active_book else {
             return;
         };
+        const MAX_MATCHES: usize = 2000;
         match &book.source {
             LoadedSource::Pdf(pdf) => {
+                let sizes = pdf.page_sizes();
                 for i in 0..pdf.page_count() {
-                    let txt = pdf.page_text(i);
-                    if let Some(pos) = txt.to_lowercase().find(&query) {
-                        let snippet = extract_snippet(&txt, pos);
-                        self.search_matches.push(SearchMatch { unit: i, snippet });
+                    if self.search_matches.len() >= MAX_MATCHES {
+                        break;
+                    }
+                    let page_h = sizes.get(i).map_or(800.0, |s| s[1]).max(1.0);
+                    let runs = pdf.page_text_runs(i);
+                    if !runs.is_empty() {
+                        let mut plain = String::new();
+                        let mut run_spans: Vec<(usize, usize, f32)> = Vec::with_capacity(runs.len());
+                        let mut off = 0usize;
+                        for r in &runs {
+                            let len = r.text.chars().count();
+                            plain.push_str(&r.text);
+                            run_spans.push((off, off + len, r.rect_pt[1]));
+                            off += len;
+                        }
+                        let rem = MAX_MATCHES - self.search_matches.len();
+                        for (cs, ce, snippet) in find_all_matches_in_text(&plain, &query, rem) {
+                            let y_pt = run_spans
+                                .iter()
+                                .find(|&&(r0, r1, _)| cs >= r0 && cs < r1)
+                                .map_or(0.0, |&(_, _, y)| y);
+                            self.search_matches.push(SearchMatch {
+                                unit: i,
+                                item_idx: None,
+                                char_start: cs,
+                                char_end: ce,
+                                fraction: (y_pt / page_h).clamp(0.0, 0.95),
+                                snippet,
+                            });
+                        }
+                    } else {
+                        let txt = pdf.page_text(i);
+                        let rem = MAX_MATCHES - self.search_matches.len();
+                        for (cs, ce, snippet) in find_all_matches_in_text(&txt, &query, rem) {
+                            self.search_matches.push(SearchMatch {
+                                unit: i,
+                                item_idx: None,
+                                char_start: cs,
+                                char_end: ce,
+                                fraction: 0.0,
+                                snippet,
+                            });
+                        }
                     }
                 }
             }
             LoadedSource::Word(word) => {
                 for i in 0..word.metadata.pages.len() {
+                    if self.search_matches.len() >= MAX_MATCHES {
+                        break;
+                    }
+                    let page_h = word.metadata.pages.get(i).map_or(800.0, |s| s[1]).max(1.0);
                     if let Ok(runs) = word.text_runs(i) {
-                        let txt = word_runs_plain(&runs);
-                        if let Some(pos) = txt.to_lowercase().find(&query) {
-                            let snippet = extract_snippet(&txt, pos);
-                            self.search_matches.push(SearchMatch { unit: i, snippet });
+                        let mut plain = String::new();
+                        let mut run_spans: Vec<(usize, usize, f32)> = Vec::with_capacity(runs.len());
+                        let mut off = 0usize;
+                        for r in &runs {
+                            let len = r.text.chars().count();
+                            plain.push_str(&r.text);
+                            run_spans.push((off, off + len, r.top));
+                            off += len;
+                        }
+                        let rem = MAX_MATCHES - self.search_matches.len();
+                        for (cs, ce, snippet) in find_all_matches_in_text(&plain, &query, rem) {
+                            let y_pt = run_spans
+                                .iter()
+                                .find(|&&(r0, r1, _)| cs >= r0 && cs < r1)
+                                .map_or(0.0, |&(_, _, y)| y);
+                            self.search_matches.push(SearchMatch {
+                                unit: i,
+                                item_idx: None,
+                                char_start: cs,
+                                char_end: ce,
+                                fraction: (y_pt / page_h).clamp(0.0, 0.95),
+                                snippet,
+                            });
                         }
                     }
                 }
             }
             LoadedSource::Flow(flow) => {
-                for (i, ch) in flow.chapters.iter().enumerate() {
-                    let txt = ch.plain_text();
-                    if let Some(pos) = txt.to_lowercase().find(&query) {
-                        let snippet = extract_snippet(&txt, pos);
-                        self.search_matches.push(SearchMatch { unit: i, snippet });
+                if let Some(cache) = &self.flow_cache {
+                    for (idx, item) in cache.items.iter().enumerate() {
+                        if self.search_matches.len() >= MAX_MATCHES {
+                            break;
+                        }
+                        if item.plain.is_empty() {
+                            continue;
+                        }
+                        let rem = MAX_MATCHES - self.search_matches.len();
+                        for (cs, ce, snippet) in find_all_matches_in_text(&item.plain, &query, rem) {
+                            self.search_matches.push(SearchMatch {
+                                unit: item.chapter_idx,
+                                item_idx: Some(idx),
+                                char_start: cs,
+                                char_end: ce,
+                                fraction: 0.0,
+                                snippet,
+                            });
+                        }
+                    }
+                } else {
+                    let is_code_mode = book.state.view_mode.as_deref() == Some("code");
+                    let (items, _, _) = build_flow_items_list(
+                        flow,
+                        book.kind,
+                        is_code_mode,
+                        self.settings.text_width.max(360.0),
+                        self.settings.font_size,
+                        self.settings.line_height,
+                    );
+                    for (idx, item) in items.iter().enumerate() {
+                        if self.search_matches.len() >= MAX_MATCHES {
+                            break;
+                        }
+                        if item.plain.is_empty() {
+                            continue;
+                        }
+                        let rem = MAX_MATCHES - self.search_matches.len();
+                        for (cs, ce, snippet) in find_all_matches_in_text(&item.plain, &query, rem) {
+                            self.search_matches.push(SearchMatch {
+                                unit: item.chapter_idx,
+                                item_idx: Some(idx),
+                                char_start: cs,
+                                char_end: ce,
+                                fraction: 0.0,
+                                snippet,
+                            });
+                        }
                     }
                 }
             }
         }
-        if let Some(first) = self.search_matches.first() {
-            self.pending_jump = Some(PendingJump {
-                chapter: first.unit,
-                fragment: String::new(),
-                fraction: 0.0,
-            });
-            self.current_unit = first.unit;
+        if !self.search_matches.is_empty() {
+            self.jump_to_search_match(0);
         }
     }
 
@@ -1148,6 +1323,21 @@ impl HayakuApp {
     fn apply_egui_visuals(&self, ctx: &Context) {
         for theme in [egui::Theme::Light, egui::Theme::Dark] {
             ctx.style_mut_of(theme, |s| s.interaction.selectable_labels = false);
+        }
+        #[cfg(windows)]
+        {
+            let text_scale = platform::windows_text_scale_factor();
+            let sys_dpi = platform::windows_system_dpi_scale();
+            let native_ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
+            let dpi_comp = if sys_dpi > 1.05 && (native_ppp - 1.0).abs() < 0.05 {
+                sys_dpi
+            } else {
+                1.0
+            };
+            let target_zoom = (text_scale * dpi_comp).clamp(1.0, 2.5);
+            if (ctx.zoom_factor() - target_zoom).abs() > 0.01 {
+                ctx.set_zoom_factor(target_zoom);
+            }
         }
         let p = self.palette();
         let mut visuals = if self.theme_mode() == ThemeMode::Dark {
@@ -1659,6 +1849,7 @@ impl HayakuApp {
                 }),
                 digest: book.digest.clone(),
                 missing: false,
+                created_at: now_epoch_secs(),
             });
             self.sidebar_open = true;
             self.sidebar_tab = SidebarTab::Notes;
@@ -1862,6 +2053,7 @@ impl HayakuApp {
                 }),
                 digest,
                 missing: false,
+                created_at: now_epoch_secs(),
             });
             self.save_active_book();
             self.clear_selection();
@@ -1963,7 +2155,7 @@ impl HayakuApp {
     }
 
     fn draw_tabs_bar(&mut self, ui: &mut Ui) {
-        self.tab_screen_rects.clear();
+        let prev_rects = std::mem::take(&mut self.tab_screen_rects);
         if self.tabs.is_empty() || self.focus_mode {
             return;
         }
@@ -1978,10 +2170,27 @@ impl HayakuApp {
                     .inner_margin(Margin::symmetric(6, 4)),
             )
             .show(ui, |ui| {
-                let avail_w = ui.available_width();
+                let bar_rect = ui.available_rect_before_wrap();
+                ui.allocate_rect(bar_rect, Sense::hover());
                 let arrow_w = 24.0;
-                let arrow_gap = 4.0;
-                let viewport_w = (avail_w - (arrow_w + arrow_gap) * 2.0).max(40.0);
+                let arrow_gap = 6.0;
+                let bar_h = bar_rect.height().min(28.0);
+                let top_y = bar_rect.center().y - bar_h * 0.5;
+                let left_rect = Rect::from_min_size(
+                    Pos2::new(bar_rect.left(), top_y),
+                    Vec2::new(arrow_w, bar_h),
+                );
+                let right_rect = Rect::from_min_size(
+                    Pos2::new((bar_rect.right() - arrow_w).max(left_rect.right() + 40.0), top_y),
+                    Vec2::new(arrow_w, bar_h),
+                );
+                let mid_left = left_rect.right() + arrow_gap;
+                let mid_right = (right_rect.left() - arrow_gap).max(mid_left + 40.0);
+                let mid_rect = Rect::from_min_max(
+                    Pos2::new(mid_left, top_y),
+                    Pos2::new(mid_right, top_y + bar_h),
+                );
+                let viewport_w = mid_rect.width();
                 let step = (viewport_w * 0.55).max(160.0);
                 let can_left = self.tabs_scroll_offset > 0.5;
                 let can_right = self.tabs_scroll_offset + 0.5 < self.tabs_scroll_max;
@@ -1990,185 +2199,201 @@ impl HayakuApp {
                 let mut close_id: Option<String> = None;
                 let mut active_rel_span: Option<(f32, f32)> = None;
                 let mut new_tab_rects: Vec<(String, Rect)> = Vec::new();
-                let mut content_w = 0.0f32;
-                let mut tabs_viewport_rect = Rect::NOTHING;
+                let pointer_pos = (!self.is_modal_open())
+                    .then(|| ui.ctx().pointer_latest_pos())
+                    .flatten();
 
-                ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing.x = arrow_gap;
+                // Left scroll arrow pinned at left end
+                let left_resp = ui
+                    .interact(left_rect, ui.scope_id().with("tabs_arrow_left"), Sense::click())
+                    .on_hover_text("向左滚动标签栏");
+                if can_left && left_resp.hovered() {
+                    ui.painter().rect_filled(left_rect, 5.0, p.surface);
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                ui.painter().rect_stroke(
+                    left_rect,
+                    5.0,
+                    Stroke::new(1.0, if can_left { p.line } else { Color32::TRANSPARENT }),
+                    StrokeKind::Inside,
+                );
+                draw_chevron(
+                    ui.painter(),
+                    left_rect.center(),
+                    true,
+                    if can_left {
+                        p.ink
+                    } else {
+                        Color32::from_rgba_unmultiplied(p.muted.r(), p.muted.g(), p.muted.b(), 110)
+                    },
+                );
+                if can_left && left_resp.clicked() {
+                    self.tabs_scroll_offset = (self.tabs_scroll_offset - step).max(0.0);
+                }
 
-                    // Left scroll arrow button
-                    let (left_rect, left_resp) =
-                        ui.allocate_exact_size(Vec2::new(arrow_w, 26.0), Sense::click());
-                    let left_resp = left_resp.on_hover_text("向左滚动标签栏");
-                    if can_left && left_resp.hovered() {
-                        ui.painter().rect_filled(left_rect, 5.0, p.surface);
-                    }
-                    ui.painter().rect_stroke(
-                        left_rect,
-                        5.0,
-                        Stroke::new(1.0, if can_left { p.line } else { Color32::TRANSPARENT }),
-                        StrokeKind::Inside,
-                    );
-                    draw_chevron(
-                        ui.painter(),
-                        left_rect.center(),
-                        true,
-                        if can_left {
-                            p.ink
-                        } else {
-                            Color32::from_rgba_unmultiplied(p.muted.r(), p.muted.g(), p.muted.b(), 110)
-                        },
-                    );
-                    if can_left && left_resp.clicked() {
-                        self.tabs_scroll_offset = (self.tabs_scroll_offset - step).max(0.0);
-                    }
-
-                    // Scrollable tab strip with scrollbar completely hidden
-                    let scroll_out = ui
-                        .allocate_ui_with_layout(
-                            Vec2::new(viewport_w, 28.0),
-                            egui::Layout::left_to_right(Align::Center),
-                            |ui| {
-                                ScrollArea::horizontal()
-                                    .id_salt("document_tabs_scroll")
-                                    .scroll_bar_visibility(
-                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                                    )
-                                    .horizontal_scroll_offset(self.tabs_scroll_offset)
-                                    .show(ui, |ui| {
-                                        let inner = ui.horizontal(|ui| {
-                                            let content_origin_x = ui.cursor().left();
-                                            let active_id =
-                                                self.active_book.as_ref().map(|b| b.id.clone());
-                                            for tab in &self.tabs {
-                                                let is_active =
-                                                    active_id.as_deref() == Some(tab.id.as_str());
-                                                let sleeping = self.is_tab_sleeping(&tab.id);
-                                                let frame = Frame::new()
-                                                    .fill(if is_active { p.surface } else { p.side })
-                                                    .stroke(Stroke::new(
-                                                        1.0,
-                                                        if is_active { p.accent } else { p.line },
-                                                    ))
-                                                    .corner_radius(CornerRadius::same(6))
-                                                    .inner_margin(Margin::symmetric(8, 3));
-                                                let tab_resp = frame
-                                                    .show(ui, |ui| {
-                                                        ui.horizontal(|ui| {
-                                                            ui.spacing_mut().item_spacing.x = 5.0;
-                                                            if sleeping {
-                                                                let (leaf_rect, _) =
-                                                                    ui.allocate_exact_size(
-                                                                        Vec2::new(13.0, 13.0),
-                                                                        Sense::hover(),
-                                                                    );
-                                                                draw_eco_leaf_icon(
-                                                                    ui.painter(),
-                                                                    leaf_rect,
-                                                                    dark,
-                                                                );
-                                                            }
-                                                            let text_color = if sleeping {
-                                                                Color32::from_rgba_unmultiplied(
-                                                                    p.muted.r(),
-                                                                    p.muted.g(),
-                                                                    p.muted.b(),
-                                                                    195,
-                                                                )
-                                                            } else {
-                                                                p.ink
-                                                            };
-                                                            let label_text = RichText::new(
-                                                                truncate_str(&tab.title, 22),
-                                                            )
-                                                            .color(text_color);
-                                                            let tooltip = if sleeping {
-                                                                format!(
-                                                                    "{}（已休眠以节省内存，点击恢复）",
-                                                                    tab.title
-                                                                )
-                                                            } else {
-                                                                tab.title.clone()
-                                                            };
-                                                            let btn = ui
-                                                                .add(
-                                                                    egui::Button::new(label_text)
-                                                                        .frame(false),
-                                                                )
-                                                                .on_hover_text(tooltip);
-                                                            if btn.clicked() && !is_active {
-                                                                switch_to = Some(tab.id.clone());
-                                                            }
-                                                            if btn.middle_clicked() {
-                                                                close_id = Some(tab.id.clone());
-                                                            }
-                                                            let close_text =
-                                                                RichText::new("×").color(
-                                                                    if sleeping {
-                                                                        text_color
-                                                                    } else {
-                                                                        p.muted
-                                                                    },
-                                                                );
-                                                            if ui
-                                                                .add(
-                                                                    egui::Button::new(close_text)
-                                                                        .frame(false),
-                                                                )
-                                                                .on_hover_text("关闭标签页")
-                                                                .clicked()
-                                                            {
-                                                                close_id = Some(tab.id.clone());
-                                                            }
-                                                        });
-                                                    })
-                                                    .response;
-                                                let tab_rect = tab_resp.rect;
-                                                new_tab_rects.push((tab.id.clone(), tab_rect));
-                                                if is_active {
-                                                    active_rel_span = Some((
-                                                        tab_rect.left() - content_origin_x,
-                                                        tab_rect.right() - content_origin_x,
-                                                    ));
-                                                }
-                                            }
+                // Middle scrollable tab strip strictly spanning between left and right arrows
+                let scroll_out = ui
+                    .scope_builder(UiBuilder::new().max_rect(mid_rect), |ui| {
+                        ScrollArea::horizontal()
+                            .id_salt("document_tabs_scroll")
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
+                            .horizontal_scroll_offset(self.tabs_scroll_offset)
+                            .show(ui, |ui| {
+                                let inner = ui.horizontal(|ui| {
+                                    let content_origin_x = ui.cursor().left();
+                                    let active_id =
+                                        self.active_book.as_ref().map(|b| b.id.clone());
+                                    for tab in &self.tabs {
+                                        let is_active =
+                                            active_id.as_deref() == Some(tab.id.as_str());
+                                        let sleeping = self.is_tab_sleeping(&tab.id);
+                                        let is_hovered = pointer_pos.is_some_and(|pos| {
+                                            mid_rect.contains(pos)
+                                                && prev_rects
+                                                    .get(&tab.id)
+                                                    .is_some_and(|r| r.contains(pos))
                                         });
-                                        inner.response.rect.width()
-                                    })
-                            },
-                        )
-                        .inner;
-                    content_w = scroll_out.content_size.x.max(scroll_out.inner);
-                    tabs_viewport_rect = scroll_out.inner_rect;
+                                        if is_hovered {
+                                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                        }
+                                        let fill = if is_active {
+                                            p.surface
+                                        } else if is_hovered {
+                                            Color32::from_rgba_unmultiplied(
+                                                p.accent.r(),
+                                                p.accent.g(),
+                                                p.accent.b(),
+                                                if dark { 38 } else { 26 },
+                                            )
+                                        } else {
+                                            p.side
+                                        };
+                                        let stroke = if is_active {
+                                            Stroke::new(1.2, p.accent)
+                                        } else if is_hovered {
+                                            Stroke::new(1.1, p.accent)
+                                        } else {
+                                            Stroke::new(1.0, p.line)
+                                        };
+                                        let frame = Frame::new()
+                                            .fill(fill)
+                                            .stroke(stroke)
+                                            .corner_radius(CornerRadius::same(6))
+                                            .inner_margin(Margin::symmetric(8, 3));
+                                        let tab_resp = frame
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 5.0;
+                                                    if sleeping {
+                                                        let (leaf_rect, _) = ui.allocate_exact_size(
+                                                            Vec2::new(13.0, 13.0),
+                                                            Sense::hover(),
+                                                        );
+                                                        draw_eco_leaf_icon(
+                                                            ui.painter(),
+                                                            leaf_rect,
+                                                            dark,
+                                                        );
+                                                    }
+                                                    let text_color = if is_hovered && !sleeping {
+                                                        p.ink
+                                                    } else if is_hovered && sleeping {
+                                                        p.ink
+                                                    } else if sleeping {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            p.muted.r(),
+                                                            p.muted.g(),
+                                                            p.muted.b(),
+                                                            195,
+                                                        )
+                                                    } else {
+                                                        p.ink
+                                                    };
+                                                    let label_text =
+                                                        RichText::new(truncate_str(&tab.title, 22))
+                                                            .color(text_color);
+                                                    let tooltip = if sleeping {
+                                                        format!(
+                                                            "{}（已休眠以节省内存，点击恢复）",
+                                                            tab.title
+                                                        )
+                                                    } else {
+                                                        tab.title.clone()
+                                                    };
+                                                    let btn = ui
+                                                        .add(
+                                                            egui::Button::new(label_text)
+                                                                .frame(false),
+                                                        )
+                                                        .on_hover_text(tooltip);
+                                                    if btn.clicked() && !is_active {
+                                                        switch_to = Some(tab.id.clone());
+                                                    }
+                                                    if btn.middle_clicked() {
+                                                        close_id = Some(tab.id.clone());
+                                                    }
+                                                    let close_text = RichText::new("×").color(
+                                                        if sleeping { text_color } else { p.muted },
+                                                    );
+                                                    if ui
+                                                        .add(
+                                                            egui::Button::new(close_text)
+                                                                .frame(false),
+                                                        )
+                                                        .on_hover_text("关闭标签页")
+                                                        .clicked()
+                                                    {
+                                                        close_id = Some(tab.id.clone());
+                                                    }
+                                                });
+                                            })
+                                            .response;
+                                        let tab_rect = tab_resp.rect;
+                                        new_tab_rects.push((tab.id.clone(), tab_rect));
+                                        if is_active {
+                                            active_rel_span = Some((
+                                                tab_rect.left() - content_origin_x,
+                                                tab_rect.right() - content_origin_x,
+                                            ));
+                                        }
+                                    }
+                                });
+                                inner.response.rect.width()
+                            })
+                    })
+                    .inner;
+                let content_w = scroll_out.content_size.x.max(scroll_out.inner);
 
-                    // Right scroll arrow button
-                    let (right_rect, right_resp) =
-                        ui.allocate_exact_size(Vec2::new(arrow_w, 26.0), Sense::click());
-                    let right_resp = right_resp.on_hover_text("向右滚动标签栏");
-                    if can_right && right_resp.hovered() {
-                        ui.painter().rect_filled(right_rect, 5.0, p.surface);
-                    }
-                    ui.painter().rect_stroke(
-                        right_rect,
-                        5.0,
-                        Stroke::new(1.0, if can_right { p.line } else { Color32::TRANSPARENT }),
-                        StrokeKind::Inside,
-                    );
-                    draw_chevron(
-                        ui.painter(),
-                        right_rect.center(),
-                        false,
-                        if can_right {
-                            p.ink
-                        } else {
-                            Color32::from_rgba_unmultiplied(p.muted.r(), p.muted.g(), p.muted.b(), 110)
-                        },
-                    );
-                    if can_right && right_resp.clicked() {
-                        self.tabs_scroll_offset =
-                            (self.tabs_scroll_offset + step).min(self.tabs_scroll_max);
-                    }
-                });
+                // Right scroll arrow pinned at right end of the window
+                let right_resp = ui
+                    .interact(right_rect, ui.scope_id().with("tabs_arrow_right"), Sense::click())
+                    .on_hover_text("向右滚动标签栏");
+                if can_right && right_resp.hovered() {
+                    ui.painter().rect_filled(right_rect, 5.0, p.surface);
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                ui.painter().rect_stroke(
+                    right_rect,
+                    5.0,
+                    Stroke::new(1.0, if can_right { p.line } else { Color32::TRANSPARENT }),
+                    StrokeKind::Inside,
+                );
+                draw_chevron(
+                    ui.painter(),
+                    right_rect.center(),
+                    false,
+                    if can_right {
+                        p.ink
+                    } else {
+                        Color32::from_rgba_unmultiplied(p.muted.r(), p.muted.g(), p.muted.b(), 110)
+                    },
+                );
+                if can_right && right_resp.clicked() {
+                    self.tabs_scroll_offset =
+                        (self.tabs_scroll_offset + step).min(self.tabs_scroll_max);
+                }
 
                 for (id, rect) in new_tab_rects {
                     self.tab_screen_rects.insert(id, rect);
@@ -2181,10 +2406,7 @@ impl HayakuApp {
                 // Support mouse wheel scrolling when hovering the tab bar
                 if !self.is_modal_open()
                     && self.tabs_scroll_max > 0.5
-                    && ui
-                        .ctx()
-                        .pointer_latest_pos()
-                        .is_some_and(|pos| tabs_viewport_rect.contains(pos))
+                    && pointer_pos.is_some_and(|pos| mid_rect.contains(pos))
                 {
                     let (dx, dy) = ui
                         .ctx()
@@ -2230,11 +2452,15 @@ impl HayakuApp {
         if !self.sidebar_open || self.focus_mode {
             return;
         }
+        let has_book = self.active_book.is_some();
+        if !has_book && self.sidebar_tab != SidebarTab::Recent {
+            self.sidebar_tab = SidebarTab::Recent;
+        }
         let p = self.palette();
         Panel::left("sidebar_panel")
             .resizable(true)
-            .default_size(250.0)
-            .size_range(180.0..=360.0)
+            .default_size(270.0)
+            .size_range(220.0..=380.0)
             .show_separator_line(true)
             .frame(
                 Frame::new()
@@ -2243,21 +2469,28 @@ impl HayakuApp {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Recent, "最近阅读");
-                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Contents, "目录");
-                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Notes, "批注");
+                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Recent, "最近打开的文件");
+                    ui.add_enabled_ui(has_book, |ui| {
+                        ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Contents, "目录");
+                        ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Notes, "批注");
+                    });
                 });
                 ui.separator();
                 ScrollArea::vertical().show(ui, |ui| match self.sidebar_tab {
                     SidebarTab::Recent => {
                         let mut delete_id = None;
                         let mut open_path = None;
+                        let mut clear_all = false;
                         if self.recent.is_empty() {
-                            ui.label(RichText::new("暂无最近阅读记录").color(p.muted));
+                            ui.label(RichText::new("暂无最近打开的文件").color(p.muted));
                         } else {
-                            if ui.button("清空记录").clicked() {
-                                let _ = storage::clear_recent_entries(&self.data, &mut self.recent);
-                            }
+                            ui.horizontal(|ui| {
+                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                    if ui.button("清空记录").clicked() {
+                                        clear_all = true;
+                                    }
+                                });
+                            });
                             ui.add_space(4.0);
                             for item in self.recent.iter().take(30) {
                                 let name = item
@@ -2265,19 +2498,92 @@ impl HayakuApp {
                                     .file_name()
                                     .map(|s| s.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| item.path.display().to_string());
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .button(truncate_str(&name, 22))
-                                        .on_hover_text(item.path.display().to_string())
-                                        .clicked()
-                                    {
-                                        open_path = Some(item.path.clone());
-                                    }
-                                    if ui.button("×").clicked() {
-                                        delete_id = Some(item.id.clone());
-                                    }
-                                });
+                                let folder = item
+                                    .path
+                                    .parent()
+                                    .map(|dir| dir.display().to_string())
+                                    .unwrap_or_default();
+                                let ext = item
+                                    .path
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .unwrap_or("");
+                                let card_w = ui.available_width();
+                                let row_h = 44.0;
+                                let (row_rect, row_resp) = ui.allocate_exact_size(
+                                    Vec2::new(card_w, row_h),
+                                    Sense::click(),
+                                );
+                                let row_resp =
+                                    row_resp.on_hover_text(item.path.display().to_string());
+                                let del_rect = Rect::from_center_size(
+                                    Pos2::new(row_rect.right() - 14.0, row_rect.center().y),
+                                    Vec2::new(20.0, 20.0),
+                                );
+                                let del_resp = ui.interact(
+                                    del_rect,
+                                    ui.scope_id().with(("recent-del", &item.id)),
+                                    Sense::click(),
+                                );
+                                let hovered = row_resp.hovered() || del_resp.hovered();
+                                if hovered {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                                ui.painter().rect_filled(
+                                    row_rect,
+                                    6.0,
+                                    if hovered { p.surface } else { Color32::TRANSPARENT },
+                                );
+                                if hovered {
+                                    ui.painter().rect_stroke(
+                                        row_rect,
+                                        6.0,
+                                        Stroke::new(1.0, p.line),
+                                        StrokeKind::Inside,
+                                    );
+                                }
+                                let icon_rect = Rect::from_min_size(
+                                    Pos2::new(row_rect.left() + 6.0, row_rect.center().y - 10.0),
+                                    Vec2::new(16.0, 20.0),
+                                );
+                                draw_file_icon(ui.painter(), icon_rect, ext, p);
+
+                                let text_left = icon_rect.right() + 8.0;
+                                let max_chars_name = ((card_w - 58.0) / 8.5).floor().max(10.0) as usize;
+                                let max_chars_dir = ((card_w - 58.0) / 6.5).floor().max(12.0) as usize;
+                                ui.painter().text(
+                                    Pos2::new(text_left, row_rect.top() + 7.0),
+                                    egui::Align2::LEFT_TOP,
+                                    truncate_str(&name, max_chars_name),
+                                    FontId::proportional(13.5),
+                                    p.ink,
+                                );
+                                if !folder.is_empty() {
+                                    ui.painter().text(
+                                        Pos2::new(text_left, row_rect.top() + 24.5),
+                                        egui::Align2::LEFT_TOP,
+                                        truncate_str(&folder, max_chars_dir),
+                                        FontId::proportional(11.0),
+                                        p.muted,
+                                    );
+                                }
+                                ui.painter().text(
+                                    del_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "×",
+                                    FontId::proportional(14.0),
+                                    if del_resp.hovered() { p.ink } else { p.muted },
+                                );
+                                if del_resp.clicked() {
+                                    delete_id = Some(item.id.clone());
+                                } else if row_resp.clicked() {
+                                    open_path = Some(item.path.clone());
+                                }
+                                ui.add_space(2.0);
                             }
+                        }
+                        if clear_all {
+                            let _ = storage::clear_recent_entries(&self.data, &mut self.recent);
                         }
                         if let Some(id) = delete_id {
                             let _ = storage::delete_recent_entry(&self.data, &mut self.recent, &id);
@@ -2322,6 +2628,7 @@ impl HayakuApp {
                                 if ui.selectable_label(active, text).clicked() {
                                     self.pending_jump = Some(PendingJump {
                                         chapter: entry.index,
+                                        item_idx: None,
                                         fragment: entry.fragment.clone(),
                                         fraction: 0.0,
                                     });
@@ -2480,6 +2787,15 @@ impl HayakuApp {
                                         {
                                             jump_to = Some((pos.index, pos.fraction));
                                         }
+                                        #[cfg(windows)]
+                                        if ann.created_at > 0 {
+                                            let ts = platform::format_local_timestamp(ann.created_at);
+                                            if !ts.is_empty() {
+                                                ui.label(
+                                                    RichText::new(ts).size(11.0).color(p.muted),
+                                                );
+                                            }
+                                        }
                                     });
                                     ui.add_space(4.0);
                                 }
@@ -2504,6 +2820,7 @@ impl HayakuApp {
                         if let Some((unit, fraction)) = jump_to {
                             self.pending_jump = Some(PendingJump {
                                 chapter: unit,
+                                item_idx: None,
                                 fragment: String::new(),
                                 fraction,
                             });
@@ -2630,6 +2947,7 @@ impl HayakuApp {
                                 self.current_unit = next;
                                 self.pending_jump = Some(PendingJump {
                                     chapter: next,
+                                    item_idx: None,
                                     fragment: String::new(),
                                     fraction: 0.0,
                                 });
@@ -2639,6 +2957,7 @@ impl HayakuApp {
                                 self.current_unit = prev;
                                 self.pending_jump = Some(PendingJump {
                                     chapter: prev,
+                                    item_idx: None,
                                     fragment: String::new(),
                                     fraction: 0.0,
                                 });
@@ -2676,15 +2995,11 @@ impl HayakuApp {
     fn draw_welcome(&mut self, ui: &mut Ui) {
         let p = self.palette();
         let mut open_repo = false;
-        let mut open_files = false;
-        let mut open_target = None;
-        let mut del_target = None;
-        let mut clear_recent = false;
         ScrollArea::vertical().show(ui, |ui| {
             let avail_w = ui.available_width();
-            let col_w = (avail_w - 48.0).clamp(320.0, 680.0);
-            let side_pad = ((avail_w - col_w) * 0.5).max(16.0);
-            ui.add_space(28.0);
+            let col_w = (avail_w - 64.0).clamp(360.0, 760.0);
+            let side_pad = ((avail_w - col_w) * 0.5).max(20.0);
+            ui.add_space(32.0);
             ui.horizontal(|ui| {
                 ui.add_space(side_pad);
                 ui.allocate_ui_with_layout(
@@ -2694,116 +3009,37 @@ impl HayakuApp {
                         ui.set_width(col_w);
                         ui.vertical_centered(|ui| {
                             if let Some(logo) = &self.logo_texture {
-                                ui.add(egui::Image::new((logo.id(), Vec2::splat(56.0))));
-                                ui.add_space(10.0);
+                                ui.add(egui::Image::new((logo.id(), Vec2::splat(68.0))));
+                                ui.add_space(12.0);
                             }
                             ui.label(
                                 RichText::new("HayakuReader")
-                                    .size(32.0)
+                                    .size(40.0)
                                     .strong()
                                     .color(p.ink),
                             );
-                            ui.add_space(4.0);
+                            ui.add_space(6.0);
                             ui.label(
                                 RichText::new(format!(
                                     "v{} · 纯 Rust 原生本地阅读器",
                                     platform::VERSION
                                 ))
-                                .size(13.5)
+                                .size(16.0)
                                 .color(p.muted),
                             );
                         });
-                        ui.add_space(16.0);
+                        ui.add_space(20.0);
 
                         if draw_welcome_intro_markdown(ui, INTRO_ZH_MD, p) {
                             open_repo = true;
                         }
-
-                        ui.add_space(18.0);
-                        ui.vertical_centered(|ui| {
-                            if ui
-                                .add_sized(
-                                    [156.0, 38.0],
-                                    egui::Button::new(
-                                        RichText::new("打开文件")
-                                            .size(15.0)
-                                            .strong()
-                                            .color(p.accent_ink),
-                                    )
-                                    .fill(p.accent),
-                                )
-                                .clicked()
-                            {
-                                open_files = true;
-                            }
-                        });
-
-                        if !self.recent.is_empty() {
-                            ui.add_space(22.0);
-                            Frame::new()
-                                .fill(p.surface)
-                                .stroke(Stroke::new(1.0, p.line))
-                                .corner_radius(CornerRadius::same(10))
-                                .inner_margin(Margin::same(14))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new("最近阅读").size(15.0).strong());
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(Align::Center),
-                                            |ui| {
-                                                if ui.button("清空记录").clicked() {
-                                                    clear_recent = true;
-                                                }
-                                            },
-                                        );
-                                    });
-                                    ui.separator();
-                                    for rec in self.recent.iter().take(12) {
-                                        let name = rec
-                                            .path
-                                            .file_name()
-                                            .map(|s| s.to_string_lossy().into_owned())
-                                            .unwrap_or_else(|| rec.path.display().to_string());
-                                        ui.horizontal(|ui| {
-                                            if ui
-                                                .button(truncate_str(&name, 52))
-                                                .on_hover_text(rec.path.display().to_string())
-                                                .clicked()
-                                            {
-                                                open_target = Some(rec.path.clone());
-                                            }
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(Align::Center),
-                                                |ui| {
-                                                    if ui.button("×").clicked() {
-                                                        del_target = Some(rec.id.clone());
-                                                    }
-                                                },
-                                            );
-                                        });
-                                    }
-                                });
-                        }
-                        ui.add_space(36.0);
+                        ui.add_space(40.0);
                     },
                 );
             });
         });
         if open_repo && let Err(e) = platform::shell_open(platform::REPO) {
             self.set_status(e, Some(4));
-        }
-        if open_files {
-            self.pick_and_open_files();
-        }
-        if clear_recent {
-            let _ = storage::clear_recent_entries(&self.data, &mut self.recent);
-        }
-        if let Some(id) = del_target {
-            let _ = storage::delete_recent_entry(&self.data, &mut self.recent, &id);
-        }
-        if let Some(path) = open_target {
-            self.open_path(&path);
         }
     }
 
@@ -2848,6 +3084,7 @@ impl HayakuApp {
         let mut requested_menu: Option<ImageContextMenu> = None;
         let mut clicked_annotation_id: Option<String> = None;
         let mut sel_bounds: Option<Rect> = None;
+        let mut hovered_note: Option<(Pos2, String, u64)> = None;
 
         let dark = self.theme_mode() == ThemeMode::Dark;
         let page_annotations: Vec<Annotation> = self
@@ -2855,6 +3092,16 @@ impl HayakuApp {
             .as_ref()
             .map(|b| b.state.annotations.clone())
             .unwrap_or_default();
+        let search_active = self.show_search && !self.search_matches.is_empty();
+        let search_matches: Vec<(usize, usize, usize, bool)> = if search_active {
+            self.search_matches
+                .iter()
+                .enumerate()
+                .map(|(mi, m)| (m.unit, m.char_start, m.char_end, mi == self.search_cursor))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let modal_open = self.is_modal_open();
         let has_ctx_menu = self.context_menu.is_some();
@@ -3037,19 +3284,34 @@ impl HayakuApp {
                         &page_annotations,
                         dark,
                     );
-                    if primary_released
-                        && (!was_dragging || self.fixed_sel_anchor == self.fixed_sel_head)
-                        && let Some(pos) = view_pointer_pos
-                        && let Some((ann_id, _)) =
-                            page_hl_rects.iter().find(|(_, r)| r.contains(pos))
-                    {
-                        clicked_annotation_id = Some(ann_id.clone());
+                    // Paint search keyword highlights on this page
+                    if !search_matches.is_empty() {
+                        paint_fixed_page_search_matches(
+                            ui,
+                            idx,
+                            page_rect,
+                            factor,
+                            &cached.pdf_runs,
+                            &cached.word_runs,
+                            &search_matches,
+                            dark,
+                        );
                     }
-                    if view_pointer_pos.is_some_and(|pos| {
-                        page_hl_rects.iter().any(|(_, r)| r.contains(pos))
-                    }) && !self.fixed_sel_dragging
+                    if let Some(pos) = view_pointer_pos
+                        && let Some((ann_id, _, note_text, created_at)) =
+                            page_hl_rects.iter().find(|(_, r, _, _)| r.contains(pos))
                     {
-                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                        if !note_text.is_empty() {
+                            hovered_note = Some((pos, note_text.clone(), *created_at));
+                        }
+                        if !self.fixed_sel_dragging {
+                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                        }
+                        if primary_released
+                            && (!was_dragging || self.fixed_sel_anchor == self.fixed_sel_head)
+                        {
+                            clicked_annotation_id = Some(ann_id.clone());
+                        }
                     }
 
                     // Paint selected text runs
@@ -3348,6 +3610,8 @@ impl HayakuApp {
         self.last_viewport_h = scroll_out.inner_rect.height();
         self.last_content_h = scroll_out.content_size.y;
         self.last_selection_rect = sel_bounds;
+        self.hovered_note = hovered_note;
+        self.hovered_note = hovered_note;
 
         if let Some(ann_id) = clicked_annotation_id
             && let Some(ann) = self
@@ -3364,6 +3628,7 @@ impl HayakuApp {
         if let Some(p) = clicked_page {
             self.pending_jump = Some(PendingJump {
                 chapter: p,
+                item_idx: None,
                 fragment: String::new(),
                 fraction: 0.0,
             });
@@ -3402,83 +3667,14 @@ impl HayakuApp {
             return;
         }
 
-        let mut items = Vec::new();
-        let mut chapter_first_item = Vec::with_capacity(flow.chapters.len());
-        let mut anchor_to_item = HashMap::new();
-
-        if is_code_mode {
-            let lang = match book.kind {
-                "xml" | "html" => CodeLang::XmlHtml,
-                "markdown" => CodeLang::Markdown,
-                _ => CodeLang::Code,
-            };
-            let row_h = ((font_size * 0.88).max(12.0) * 1.48).ceil();
-            for (ci, ch) in flow.chapters.iter().enumerate() {
-                chapter_first_item.push(items.len());
-                if ci > 0 {
-                    items.push(FlowItemEntry {
-                        chapter_idx: ci,
-                        source: FlowSourceRef::Separator,
-                        height: 28.0,
-                        visual: None,
-                        plain: String::new(),
-                    });
-                }
-                for (ln, line) in ch.raw_source.split('\n').enumerate() {
-                    let clean_line = line.strip_suffix('\r').unwrap_or(line).to_owned();
-                    items.push(FlowItemEntry {
-                        chapter_idx: ci,
-                        source: FlowSourceRef::CodeLine {
-                            line_no: ln + 1,
-                            text: clean_line.clone(),
-                            lang,
-                        },
-                        height: row_h,
-                        visual: None,
-                        plain: clean_line,
-                    });
-                }
-            }
-        } else {
-            let chars_per_line = (measure / (font_size * 0.92)).max(12.0);
-            let line_px = font_size * line_height;
-            for (ci, ch) in flow.chapters.iter().enumerate() {
-                chapter_first_item.push(items.len());
-                let block_base = items.len();
-                if ci > 0 {
-                    items.push(FlowItemEntry {
-                        chapter_idx: ci,
-                        source: FlowSourceRef::Separator,
-                        height: 36.0,
-                        visual: None,
-                        plain: String::new(),
-                    });
-                }
-                let content_start = items.len();
-                for (bi, block) in ch.blocks.iter().enumerate() {
-                    let plain = block_plain_text(block);
-                    let est = estimate_block_height(block, &plain, chars_per_line, line_px, font_size);
-                    items.push(FlowItemEntry {
-                        chapter_idx: ci,
-                        source: FlowSourceRef::Block {
-                            chapter_idx: ci,
-                            block_idx: bi,
-                        },
-                        height: est,
-                        visual: None,
-                        plain,
-                    });
-                }
-                if content_start < items.len() {
-                    for (frag, &b_idx) in &ch.anchors {
-                        let mapped = (content_start + b_idx).min(items.len() - 1);
-                        anchor_to_item.insert((ci, frag.clone()), mapped);
-                    }
-                } else {
-                    anchor_to_item.insert((ci, String::new()), block_base);
-                }
-            }
-        }
+        let (items, chapter_first_item, anchor_to_item) = build_flow_items_list(
+            flow,
+            book.kind,
+            is_code_mode,
+            measure,
+            font_size,
+            line_height,
+        );
 
         let _ = ui;
         self.flow_cache = Some(FlowLayoutCache {
@@ -3529,7 +3725,9 @@ impl HayakuApp {
             && let Some(jump) = self.pending_jump.take()
             && let Some(cache) = self.flow_cache.as_mut()
         {
-            let target_item = if !jump.fragment.is_empty() {
+            let target_item = if let Some(idx) = jump.item_idx {
+                Some(idx.min(cache.items.len().saturating_sub(1)))
+            } else if !jump.fragment.is_empty() {
                 cache
                     .anchor_to_item
                     .get(&(jump.chapter, jump.fragment.clone()))
@@ -3544,7 +3742,7 @@ impl HayakuApp {
                         .iter()
                         .map(|it| it.height)
                         .sum::<f32>();
-                if jump.fraction > 0.0 && jump.fragment.is_empty() {
+                if jump.item_idx.is_none() && jump.fraction > 0.0 && jump.fragment.is_empty() {
                     let ch_start = cache
                         .chapter_first_item
                         .get(jump.chapter)
@@ -3558,7 +3756,8 @@ impl HayakuApp {
                     let ch_h: f32 = cache.items[ch_start..ch_end].iter().map(|it| it.height).sum();
                     offset_y += ch_h * jump.fraction.clamp(0.0, 1.0);
                 }
-                initial_scroll_offset = Some((offset_y - 16.0).max(0.0));
+                let margin_top = if jump.item_idx.is_some() { 80.0 } else { 16.0 };
+                initial_scroll_offset = Some((offset_y - margin_top).max(0.0));
             }
         }
 
@@ -3571,6 +3770,7 @@ impl HayakuApp {
         let mut requested_menu: Option<ImageContextMenu> = None;
         let mut clicked_annotation_id: Option<String> = None;
         let mut sel_bounds: Option<Rect> = None;
+        let mut hovered_note: Option<(Pos2, String, u64)> = None;
 
         let dark = mode == ThemeMode::Dark;
         let flow_annotations: Vec<Annotation> = self
@@ -3578,6 +3778,20 @@ impl HayakuApp {
             .as_ref()
             .map(|b| b.state.annotations.clone())
             .unwrap_or_default();
+        let search_matches: Vec<(usize, usize, usize, bool)> = if self.show_search
+            && !self.search_matches.is_empty()
+        {
+            self.search_matches
+                .iter()
+                .enumerate()
+                .filter_map(|(mi, m)| {
+                    m.item_idx
+                        .map(|ii| (ii, m.char_start, m.char_end, mi == self.search_cursor))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let modal_open = self.is_modal_open();
         let has_ctx_menu = self.context_menu.is_some();
@@ -3731,6 +3945,8 @@ impl HayakuApp {
                         FlowVisual::SingleJob {
                             job,
                             pad_top,
+                            indent_px,
+                            bullet,
                             link_spans,
                             code_box,
                             quote_bar,
@@ -3747,20 +3963,37 @@ impl HayakuApp {
 
                             let content_pos = Pos2::new(
                                 item_rect.left()
-                                    + if *code_box {
-                                        10.0
-                                    } else if *quote_bar {
-                                        14.0
-                                    } else {
-                                        0.0
-                                    },
+                                    + *indent_px
+                                    + if *code_box { 10.0 } else { 0.0 },
                                 item_rect.top() + *pad_top,
                             );
+                            if *quote_bar {
+                                let bar_x = item_rect.left() + (*indent_px - 10.0).max(4.0);
+                                ui.painter().line_segment(
+                                    [
+                                        Pos2::new(bar_x, item_rect.top() + 3.0),
+                                        Pos2::new(
+                                            bar_x,
+                                            item_rect.top() + galley.rect.height() + *pad_top + 4.0,
+                                        ),
+                                    ],
+                                    Stroke::new(3.0, p.accent),
+                                );
+                            }
+                            if let Some(b_txt) = bullet {
+                                ui.painter().text(
+                                    Pos2::new(content_pos.x - 4.0, content_pos.y),
+                                    egui::Align2::RIGHT_TOP,
+                                    b_txt,
+                                    FontId::proportional(font_size),
+                                    p.accent,
+                                );
+                            }
                             if *code_box {
                                 let box_r = Rect::from_min_size(
-                                    Pos2::new(item_rect.left(), item_rect.top() + 2.0),
+                                    Pos2::new(item_rect.left() + *indent_px, item_rect.top() + 2.0),
                                     Vec2::new(
-                                        (galley.rect.width() + 20.0).min(measure),
+                                        (galley.rect.width() + 20.0).min((measure - *indent_px).max(80.0)),
                                         galley.rect.height() + 18.0,
                                     ),
                                 );
@@ -3770,17 +4003,6 @@ impl HayakuApp {
                                     8.0,
                                     Stroke::new(1.0, p.line),
                                     StrokeKind::Inside,
-                                );
-                            } else if *quote_bar {
-                                ui.painter().line_segment(
-                                    [
-                                        Pos2::new(item_rect.left() + 4.0, item_rect.top() + 4.0),
-                                        Pos2::new(
-                                            item_rect.left() + 4.0,
-                                            item_rect.top() + galley.rect.height() + 6.0,
-                                        ),
-                                    ],
-                                    Stroke::new(3.0, p.accent),
                                 );
                             }
                             // Paint saved annotations on this flow item
@@ -3793,24 +4015,66 @@ impl HayakuApp {
                                             && let Some((hc0, hc1)) =
                                                 locate_anchor_in_text(item_plain, part)
                                         {
-                                            let hl_col = highlight_fill_color(&ann.color, dark);
+                                            let is_note = ann.kind == "note";
+                                            let fill_col = if is_note {
+                                                Color32::TRANSPARENT
+                                            } else {
+                                                highlight_fill_color(&ann.color, dark)
+                                            };
                                             let rects = paint_galley_selection_rects(
                                                 ui,
                                                 &galley,
                                                 content_pos,
                                                 hc0,
                                                 hc1,
-                                                hl_col,
-                                                ann.kind == "note",
+                                                fill_col,
+                                                is_note,
                                                 highlight_swatch_color(&ann.color),
                                             );
-                                            if primary_released
-                                                && (!was_dragging
-                                                    || self.flow_sel_anchor == self.flow_sel_head)
-                                                && let Some(pos) = view_pointer_pos
-                                                && rects.iter().any(|r| r.contains(pos))
+                                            if let Some(pos) = view_pointer_pos
+                                                && rects.iter().any(|r| r.expand2(Vec2::new(0.0, 3.0)).contains(pos))
                                             {
-                                                clicked_annotation_id = Some(ann.id.clone());
+                                                if is_note && !ann.text.trim().is_empty() {
+                                                    hovered_note = Some((
+                                                        pos,
+                                                        ann.text.clone(),
+                                                        ann.created_at,
+                                                    ));
+                                                }
+                                                if primary_released
+                                                    && (!was_dragging
+                                                        || self.flow_sel_anchor == self.flow_sel_head)
+                                                {
+                                                    clicked_annotation_id = Some(ann.id.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Paint search keyword highlights on this flow item
+                            if !search_matches.is_empty() {
+                                for &(mi, cs, ce, is_cur) in &search_matches {
+                                    if mi == idx {
+                                        let (fill, stroke) = search_highlight_style(is_cur, dark);
+                                        let rects = paint_galley_selection_rects(
+                                            ui,
+                                            &galley,
+                                            content_pos,
+                                            cs,
+                                            ce,
+                                            fill,
+                                            false,
+                                            Color32::TRANSPARENT,
+                                        );
+                                        if is_cur {
+                                            for r in rects {
+                                                ui.painter().rect_stroke(
+                                                    r,
+                                                    2.0,
+                                                    stroke,
+                                                    StrokeKind::Outside,
+                                                );
                                             }
                                         }
                                     }
@@ -3897,6 +4161,33 @@ impl HayakuApp {
                             );
                             let code_pos =
                                 Pos2::new(item_rect.left() + num_w, item_rect.top() + 2.0);
+                            if !search_matches.is_empty() {
+                                for &(mi, cs, ce, is_cur) in &search_matches {
+                                    if mi == idx {
+                                        let (fill, stroke) = search_highlight_style(is_cur, dark);
+                                        let rects = paint_galley_selection_rects(
+                                            ui,
+                                            &code_galley,
+                                            code_pos,
+                                            cs,
+                                            ce,
+                                            fill,
+                                            false,
+                                            Color32::TRANSPARENT,
+                                        );
+                                        if is_cur {
+                                            for r in rects {
+                                                ui.painter().rect_stroke(
+                                                    r,
+                                                    2.0,
+                                                    stroke,
+                                                    StrokeKind::Outside,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if let Some((c0, c1)) = item_sel {
                                 let rects = paint_galley_selection_rects(
                                     ui,
@@ -3932,13 +4223,24 @@ impl HayakuApp {
                                 });
                             }
                         }
-                        FlowVisual::RichSpec { scale_mul, pad_top } => {
+                        FlowVisual::RichSpec {
+                            scale_mul,
+                            pad_top,
+                            indent_px,
+                            bullet,
+                            quote_bar,
+                        } => {
                             if let FlowSourceRef::Block {
                                 chapter_idx,
                                 block_idx,
+                                flat_block,
+                                ..
                             } = &cache.items[idx].source
                             {
-                                let inlines = match &flow.chapters[*chapter_idx].blocks[*block_idx] {
+                                let block_ref = flat_block
+                                    .as_ref()
+                                    .unwrap_or(&flow.chapters[*chapter_idx].blocks[*block_idx]);
+                                let inlines = match block_ref {
                                     Block::Heading { inlines, .. }
                                     | Block::Paragraph(inlines) => Some(inlines.as_slice()),
                                     _ => None,
@@ -3950,7 +4252,7 @@ impl HayakuApp {
                                         mode,
                                         font_size,
                                         line_height,
-                                        max_width: measure,
+                                        max_width: (measure - *indent_px).max(100.0),
                                         resources: &flow.resources,
                                         math_cache: &mut self.math_cache,
                                         math_textures: &mut self.math_textures,
@@ -3961,10 +4263,36 @@ impl HayakuApp {
                                     let (lines, _, char_boxes, extra_gap, base_ascent, total_h) =
                                         measure_rich_lines(ui, inlines, *scale_mul, &mut ctx);
                                     updated_h = Some(total_h + *pad_top + gap);
+                                    if *quote_bar {
+                                        let bar_x =
+                                            item_rect.left() + (*indent_px - 10.0).max(4.0);
+                                        ui.painter().line_segment(
+                                            [
+                                                Pos2::new(bar_x, item_rect.top() + 3.0),
+                                                Pos2::new(
+                                                    bar_x,
+                                                    item_rect.top() + total_h + *pad_top + 4.0,
+                                                ),
+                                            ],
+                                            Stroke::new(3.0, p.accent),
+                                        );
+                                    }
+                                    if let Some(b_txt) = bullet {
+                                        ui.painter().text(
+                                            Pos2::new(
+                                                item_rect.left() + *indent_px - 4.0,
+                                                item_rect.top() + *pad_top,
+                                            ),
+                                            egui::Align2::RIGHT_TOP,
+                                            b_txt,
+                                            FontId::proportional(font_size),
+                                            p.accent,
+                                        );
+                                    }
                                     let item_plain = &cache.items[idx].plain;
                                     let item_ch = cache.items[idx].chapter_idx;
-                                    let rich_origin =
-                                        item_rect.min.to_vec2() + Vec2::new(0.0, *pad_top);
+                                    let rich_origin = item_rect.min.to_vec2()
+                                        + Vec2::new(*indent_px, *pad_top);
                                     if !item_plain.is_empty() && !flow_annotations.is_empty() {
                                         for ann in &flow_annotations {
                                             for part in &ann.parts {
@@ -3972,33 +4300,69 @@ impl HayakuApp {
                                                     && let Some((hc0, hc1)) =
                                                         locate_anchor_in_text(item_plain, part)
                                                 {
-                                                    let hl_col =
-                                                        highlight_fill_color(&ann.color, dark);
+                                                    let is_note = ann.kind == "note";
+                                                    let hl_col = if is_note {
+                                                        Color32::TRANSPARENT
+                                                    } else {
+                                                        highlight_fill_color(&ann.color, dark)
+                                                    };
                                                     let ul_col = highlight_swatch_color(&ann.color);
                                                     for r in &char_boxes
                                                         [hc0..hc1.min(char_boxes.len())]
                                                     {
                                                         let sr = r.translate(rich_origin);
-                                                        ui.painter().rect_filled(sr, 1.0, hl_col);
-                                                        if ann.kind == "note" {
+                                                        if !is_note {
+                                                            ui.painter().rect_filled(sr, 1.0, hl_col);
+                                                        } else {
                                                             ui.painter().line_segment(
                                                                 [
                                                                     Pos2::new(sr.left(), sr.bottom()),
                                                                     Pos2::new(sr.right(), sr.bottom()),
                                                                 ],
-                                                                Stroke::new(2.0, ul_col),
+                                                                Stroke::new(2.2, ul_col),
                                                             );
                                                         }
-                                                        if primary_released
-                                                            && (!was_dragging
-                                                                || self.flow_sel_anchor
-                                                                    == self.flow_sel_head)
-                                                            && let Some(pos) = view_pointer_pos
-                                                            && sr.contains(pos)
+                                                        if let Some(pos) = view_pointer_pos
+                                                            && sr.expand2(Vec2::new(0.0, 3.0)).contains(pos)
                                                         {
-                                                            clicked_annotation_id =
-                                                                Some(ann.id.clone());
+                                                            if is_note && !ann.text.trim().is_empty() {
+                                                                hovered_note = Some((
+                                                                    pos,
+                                                                    ann.text.clone(),
+                                                                    ann.created_at,
+                                                                ));
+                                                            }
+                                                            if primary_released
+                                                                && (!was_dragging
+                                                                    || self.flow_sel_anchor
+                                                                        == self.flow_sel_head)
+                                                            {
+                                                                clicked_annotation_id =
+                                                                    Some(ann.id.clone());
+                                                            }
                                                         }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !search_matches.is_empty() {
+                                        for &(mi, cs, ce, is_cur) in &search_matches {
+                                            if mi == idx {
+                                                let (fill, stroke) =
+                                                    search_highlight_style(is_cur, dark);
+                                                for r in &char_boxes
+                                                    [cs..ce.min(char_boxes.len())]
+                                                {
+                                                    let sr = r.translate(rich_origin);
+                                                    ui.painter().rect_filled(sr, 1.5, fill);
+                                                    if is_cur {
+                                                        ui.painter().rect_stroke(
+                                                            sr,
+                                                            1.5,
+                                                            stroke,
+                                                            StrokeKind::Outside,
+                                                        );
                                                     }
                                                 }
                                             }
@@ -4021,7 +4385,10 @@ impl HayakuApp {
                                     paint_measured_lines(
                                         ui,
                                         &lines,
-                                        Pos2::new(item_rect.left(), item_rect.top() + *pad_top),
+                                        Pos2::new(
+                                            item_rect.left() + *indent_px,
+                                            item_rect.top() + *pad_top,
+                                        ),
                                         base_ascent,
                                         extra_gap,
                                         p,
@@ -4057,7 +4424,8 @@ impl HayakuApp {
                                         if view_pointer_pos.is_some() {
                                             hover_text_cursor = true;
                                         }
-                                        let origin = item_rect.min + Vec2::new(0.0, *pad_top);
+                                        let origin =
+                                            item_rect.min + Vec2::new(*indent_px, *pad_top);
                                         let rel = pos - origin;
                                         let ci = hit_test_char_boxes(rel, &char_boxes);
                                         new_hit_pos = Some(FlowTextPos {
@@ -4072,16 +4440,21 @@ impl HayakuApp {
                             if let FlowSourceRef::Block {
                                 chapter_idx,
                                 block_idx,
+                                flat_block,
+                                indent_px,
+                                ..
                             } = &cache.items[idx].source
                             {
-                                let block = &flow.chapters[*chapter_idx].blocks[*block_idx];
+                                let block = flat_block
+                                    .as_ref()
+                                    .unwrap_or(&flow.chapters[*chapter_idx].blocks[*block_idx]);
                                 let mut ctx = FlowDrawCtx {
                                     book_id: &book_id,
                                     palette: p,
                                     mode,
                                     font_size,
                                     line_height,
-                                    max_width: measure,
+                                    max_width: (measure - *indent_px).max(100.0),
                                     resources: &flow.resources,
                                     math_cache: &mut self.math_cache,
                                     math_textures: &mut self.math_textures,
@@ -4090,8 +4463,8 @@ impl HayakuApp {
                                     requested_menu: &mut requested_menu,
                                 };
                                 let unclipped = Rect::from_min_size(
-                                    item_rect.min,
-                                    Vec2::new(measure, 10_000.0),
+                                    item_rect.min + Vec2::new(*indent_px, 0.0),
+                                    Vec2::new((measure - *indent_px).max(100.0), 10_000.0),
                                 );
                                 let scoped =
                                     ui.scope_builder(UiBuilder::new().max_rect(unclipped), |ui| {
@@ -4249,6 +4622,7 @@ impl HayakuApp {
         self.last_viewport_h = scroll_out.inner_rect.height();
         self.last_content_h = scroll_out.content_size.y;
         self.last_selection_rect = sel_bounds;
+        self.hovered_note = hovered_note;
 
         if let Some(ann_id) = clicked_annotation_id
             && let Some(ann) = self
@@ -4708,6 +5082,7 @@ impl HayakuApp {
                             position: editor.position.clone(),
                             digest,
                             missing: false,
+                            created_at: now_epoch_secs(),
                         });
                     }
                     self.sidebar_open = true;
@@ -4783,6 +5158,46 @@ impl HayakuApp {
             }
         }
 
+        if let Some((pos, note_text, created_at)) = self.hovered_note.clone()
+            && !self.is_modal_open()
+            && self.context_menu.is_none()
+        {
+            let screen = ctx.content_rect();
+            let tip_pos = Pos2::new(
+                (pos.x + 14.0).clamp(screen.left() + 8.0, (screen.right() - 290.0).max(8.0)),
+                (pos.y + 18.0).clamp(screen.top() + 8.0, (screen.bottom() - 100.0).max(8.0)),
+            );
+            egui::Area::new(Id::unique("hovered_note_tooltip"))
+                .fixed_pos(tip_pos)
+                .order(egui::Order::Tooltip)
+                .interactable(false)
+                .show(ctx, |ui| {
+                    Frame::new()
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.2, p.accent))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::same(10))
+                        .shadow(egui::Shadow {
+                            offset: [0, 4],
+                            blur: 14,
+                            spread: 0,
+                            color: Color32::from_black_alpha(64),
+                        })
+                        .show(ui, |ui| {
+                            ui.set_max_width(270.0);
+                            ui.label(RichText::new(&note_text).size(13.5).color(p.ink));
+                            #[cfg(windows)]
+                            if created_at > 0 {
+                                let ts = platform::format_local_timestamp(created_at);
+                                if !ts.is_empty() {
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new(ts).size(11.5).color(p.muted));
+                                }
+                            }
+                        });
+                });
+        }
+
         if self.show_settings {
             let mut close = false;
             let mut changed = false;
@@ -4793,48 +5208,86 @@ impl HayakuApp {
                 .resizable(false)
                 .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-16.0, 52.0))
                 .show(ctx, |ui| {
+                    ui.set_width(356.0);
                     ui.horizontal(|ui| {
-                        ui.label("主题");
-                        if ui
-                            .selectable_label(self.settings.theme != "dark", "浅色")
-                            .clicked()
-                        {
-                            self.settings.theme = "light".to_owned();
-                            changed = true;
-                        }
-                        if ui
-                            .selectable_label(self.settings.theme == "dark", "深色")
-                            .clicked()
-                        {
-                            self.settings.theme = "dark".to_owned();
-                            changed = true;
-                        }
+                        let slot_w = (ui.available_width() - 68.0).max(198.0);
+                        Frame::new()
+                            .fill(p.code_bg)
+                            .stroke(Stroke::new(1.0, p.line))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::same(3))
+                            .show(ui, |ui| {
+                                ui.set_width(slot_w);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 3.0;
+                                    let btn_w = ((slot_w - 6.0) / 3.0).max(58.0);
+                                    for (val, label) in [
+                                        ("system", "跟随系统"),
+                                        ("light", "浅色"),
+                                        ("dark", "深色"),
+                                    ] {
+                                        let active = self.settings.theme.eq_ignore_ascii_case(val)
+                                            || (val == "system"
+                                                && !self.settings.theme.eq_ignore_ascii_case("light")
+                                                && !self.settings.theme.eq_ignore_ascii_case("dark"));
+                                        let btn = egui::Button::new(
+                                            RichText::new(label)
+                                                .color(if active { p.accent_ink } else { p.muted })
+                                                .strong(),
+                                        )
+                                        .fill(if active { p.accent } else { Color32::TRANSPARENT })
+                                        .stroke(Stroke::NONE)
+                                        .corner_radius(CornerRadius::same(6));
+                                        if ui.add_sized([btn_w, 26.0], btn).clicked() {
+                                            self.settings.theme = val.to_owned();
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                            });
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new("主题").color(p.ink));
+                        });
                     });
+                    ui.add_space(6.0);
                     ui.scope(|ui| {
                         let vis = ui.visuals_mut();
                         vis.slider_trailing_fill = true;
                         vis.selection.bg_fill = p.accent;
-                        changed |= ui
-                            .add(
-                                egui::Slider::new(&mut self.settings.font_size, 13.0..=34.0)
-                                    .text("字号"),
-                            )
-                            .changed();
-                        changed |= ui
-                            .add(
-                                egui::Slider::new(&mut self.settings.line_height, 1.3..=2.4)
-                                    .step_by(0.1)
-                                    .text("行距"),
-                            )
-                            .changed();
-                        changed |= ui
-                            .add(
-                                egui::Slider::new(&mut self.settings.text_width, 360.0..=1800.0)
-                                    .step_by(10.0)
-                                    .text("阅读宽度"),
-                            )
-                            .changed();
+                        ui.spacing_mut().slider_width = 215.0;
+
+                        ui.horizontal(|ui| {
+                            changed |= ui
+                                .add(egui::Slider::new(&mut self.settings.font_size, 13.0..=34.0))
+                                .changed();
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new("字号").color(p.ink));
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut self.settings.line_height, 1.3..=2.4)
+                                        .step_by(0.1),
+                                )
+                                .changed();
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new("行距").color(p.ink));
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut self.settings.text_width, 360.0..=1800.0)
+                                        .step_by(10.0),
+                                )
+                                .changed();
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new("阅读宽度").color(p.ink));
+                            });
+                        });
                     });
+                    ui.add_space(4.0);
                     changed |= ui
                         .checkbox(&mut self.settings.restore_session, "启动时恢复标签页")
                         .changed();
@@ -4890,15 +5343,32 @@ impl HayakuApp {
             let mut close = false;
             let mut trigger_search = false;
             let mut step: isize = 0;
+            let mut jump_to_idx: Option<usize> = None;
+            let is_fixed_doc = self.active_book.as_ref().is_some_and(|b| {
+                matches!(b.source, LoadedSource::Pdf(_) | LoadedSource::Word(_))
+            });
             egui::Window::new("搜索正文")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-16.0, 52.0))
                 .show(ctx, |ui| {
+                    ui.set_min_width(360.0);
                     ui.horizontal(|ui| {
-                        let edit = ui.text_edit_singleline(&mut self.search_query);
-                        if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                            trigger_search = true;
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(&mut self.search_query)
+                                .hint_text("输入关键词…")
+                                .desired_width(185.0),
+                        );
+                        let enter_pressed = (edit.has_focus() || edit.lost_focus())
+                            && ui.input(|i| i.key_pressed(Key::Enter));
+                        if enter_pressed {
+                            let shift = ui.input(|i| i.modifiers.shift);
+                            let cur_q = self.search_query.trim().to_lowercase();
+                            if cur_q == self.last_searched_query && !self.search_matches.is_empty() {
+                                step = if shift { -1 } else { 1 };
+                            } else {
+                                trigger_search = true;
+                            }
                         }
                         if ui.button("查找").clicked() {
                             trigger_search = true;
@@ -4909,10 +5379,10 @@ impl HayakuApp {
                                 self.search_cursor + 1,
                                 self.search_matches.len()
                             ));
-                            if ui.button("↑").clicked() {
+                            if ui.button("↑").on_hover_text("上一条").clicked() {
                                 step = -1;
                             }
-                            if ui.button("↓").clicked() {
+                            if ui.button("↓").on_hover_text("下一条").clicked() {
                                 step = 1;
                             }
                         }
@@ -4920,23 +5390,92 @@ impl HayakuApp {
                             close = true;
                         }
                     });
-                    if let Some(m) = self.search_matches.get(self.search_cursor) {
-                        ui.label(RichText::new(&m.snippet).color(p.muted));
+                    if self.search_matches.is_empty() {
+                        let cur_q = self.search_query.trim().to_lowercase();
+                        if !cur_q.is_empty() && cur_q == self.last_searched_query {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("未找到匹配内容").color(p.muted));
+                        }
+                    } else {
+                        ui.separator();
+                        ScrollArea::vertical()
+                            .id_salt("search_results_list")
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for (mi, m) in self.search_matches.iter().enumerate() {
+                                    let is_cur = mi == self.search_cursor;
+                                    let unit_label = if is_fixed_doc {
+                                        format!("第 {} 页", m.unit + 1)
+                                    } else {
+                                        format!("第 {} 章", m.unit + 1)
+                                    };
+                                    let row_frame = Frame::new()
+                                        .fill(if is_cur {
+                                            Color32::from_rgba_unmultiplied(
+                                                0xff, 0x57, 0x22, if dark { 42 } else { 28 },
+                                            )
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        })
+                                        .stroke(Stroke::new(
+                                            1.0,
+                                            if is_cur {
+                                                Color32::from_rgb(0xff, 0x57, 0x22)
+                                            } else {
+                                                Color32::TRANSPARENT
+                                            },
+                                        ))
+                                        .corner_radius(CornerRadius::same(5))
+                                        .inner_margin(Margin::symmetric(6, 4));
+                                    let resp = row_frame
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new(unit_label)
+                                                        .size(11.5)
+                                                        .strong()
+                                                        .color(if is_cur {
+                                                            Color32::from_rgb(0xff, 0x57, 0x22)
+                                                        } else {
+                                                            p.accent
+                                                        }),
+                                                );
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&m.snippet)
+                                                            .size(12.5)
+                                                            .color(p.ink),
+                                                    )
+                                                    .wrap()
+                                                    .sense(Sense::click()),
+                                                );
+                                            });
+                                        })
+                                        .response;
+                                    let click_resp = ui.interact(
+                                        resp.rect,
+                                        ui.scope_id().with(("search-row", mi)),
+                                        Sense::click(),
+                                    );
+                                    if click_resp.hovered() {
+                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    }
+                                    if click_resp.clicked() {
+                                        jump_to_idx = Some(mi);
+                                    }
+                                }
+                            });
                     }
                 });
             if trigger_search {
                 self.run_search();
-            }
-            if step != 0 && !self.search_matches.is_empty() {
+            } else if let Some(idx) = jump_to_idx {
+                self.jump_to_search_match(idx);
+            } else if step != 0 && !self.search_matches.is_empty() {
                 let len = self.search_matches.len() as isize;
-                self.search_cursor = (self.search_cursor as isize + step).rem_euclid(len) as usize;
-                let unit = self.search_matches[self.search_cursor].unit;
-                self.pending_jump = Some(PendingJump {
-                    chapter: unit,
-                    fragment: String::new(),
-                    fraction: 0.0,
-                });
-                self.current_unit = unit;
+                let next_idx = (self.search_cursor as isize + step).rem_euclid(len) as usize;
+                self.jump_to_search_match(next_idx);
             }
             if close {
                 self.show_search = false;
@@ -5287,6 +5826,7 @@ impl eframe::App for HayakuApp {
         CentralPanel::default()
             .frame(Frame::new().fill(p.paper))
             .show(ui, |ui| {
+                self.hovered_note = None;
                 match self.active_book.as_ref().map(|b| &b.source) {
                     None => {
                         self.last_selection_rect = None;
@@ -5717,8 +6257,15 @@ fn build_flow_item_visual(
         FlowSourceRef::Block {
             chapter_idx,
             block_idx,
+            flat_block,
+            indent_px,
+            bullet,
+            quote_bar,
         } => {
-            let block = &flow.chapters[*chapter_idx].blocks[*block_idx];
+            let block = flat_block
+                .as_ref()
+                .unwrap_or(&flow.chapters[*chapter_idx].blocks[*block_idx]);
+            let eff_max_w = (ctx.max_width - *indent_px).max(100.0);
             match block {
                 Block::Heading { level, inlines, .. } => {
                     let mul = match level {
@@ -5728,12 +6275,29 @@ fn build_flow_item_visual(
                         _ => 1.08,
                     };
                     if contains_ruby_or_math(inlines) {
+                        let mut sub_ctx = FlowDrawCtx {
+                            book_id: ctx.book_id,
+                            palette: ctx.palette,
+                            mode: ctx.mode,
+                            font_size: ctx.font_size,
+                            line_height: ctx.line_height,
+                            max_width: eff_max_w,
+                            resources: ctx.resources,
+                            math_cache: ctx.math_cache,
+                            math_textures: ctx.math_textures,
+                            image_textures: ctx.image_textures,
+                            clicked_link: ctx.clicked_link,
+                            requested_menu: ctx.requested_menu,
+                        };
                         let (_, _, _, _, _, total_h) =
-                            measure_rich_lines(ui, inlines, mul, ctx);
+                            measure_rich_lines(ui, inlines, mul, &mut sub_ctx);
                         (
                             FlowVisual::RichSpec {
                                 scale_mul: mul,
                                 pad_top: 6.0,
+                                indent_px: *indent_px,
+                                bullet: bullet.clone(),
+                                quote_bar: *quote_bar,
                             },
                             total_h + 6.0 + gap,
                         )
@@ -5742,7 +6306,7 @@ fn build_flow_item_visual(
                             inlines,
                             ctx.font_size * mul,
                             ctx.palette,
-                            ctx.max_width,
+                            eff_max_w,
                         );
                         let galley = ui.fonts_mut(|f| f.layout_job(job.clone()));
                         let h = galley.rect.height() + 8.0 + gap;
@@ -5750,9 +6314,11 @@ fn build_flow_item_visual(
                             FlowVisual::SingleJob {
                                 job,
                                 pad_top: 6.0,
+                                indent_px: *indent_px,
+                                bullet: bullet.clone(),
                                 link_spans,
                                 code_box: false,
-                                quote_bar: false,
+                                quote_bar: *quote_bar,
                             },
                             h,
                         )
@@ -5760,12 +6326,29 @@ fn build_flow_item_visual(
                 }
                 Block::Paragraph(inlines) => {
                     if contains_ruby_or_math(inlines) {
+                        let mut sub_ctx = FlowDrawCtx {
+                            book_id: ctx.book_id,
+                            palette: ctx.palette,
+                            mode: ctx.mode,
+                            font_size: ctx.font_size,
+                            line_height: ctx.line_height,
+                            max_width: eff_max_w,
+                            resources: ctx.resources,
+                            math_cache: ctx.math_cache,
+                            math_textures: ctx.math_textures,
+                            image_textures: ctx.image_textures,
+                            clicked_link: ctx.clicked_link,
+                            requested_menu: ctx.requested_menu,
+                        };
                         let (_, _, _, _, _, total_h) =
-                            measure_rich_lines(ui, inlines, 1.0, ctx);
+                            measure_rich_lines(ui, inlines, 1.0, &mut sub_ctx);
                         (
                             FlowVisual::RichSpec {
                                 scale_mul: 1.0,
                                 pad_top: 0.0,
+                                indent_px: *indent_px,
+                                bullet: bullet.clone(),
+                                quote_bar: *quote_bar,
                             },
                             total_h + gap,
                         )
@@ -5774,7 +6357,7 @@ fn build_flow_item_visual(
                             inlines,
                             ctx.font_size,
                             ctx.palette,
-                            ctx.max_width,
+                            eff_max_w,
                         );
                         let galley = ui.fonts_mut(|f| f.layout_job(job.clone()));
                         let h = galley.rect.height() + gap;
@@ -5782,9 +6365,11 @@ fn build_flow_item_visual(
                             FlowVisual::SingleJob {
                                 job,
                                 pad_top: 0.0,
+                                indent_px: *indent_px,
+                                bullet: bullet.clone(),
                                 link_spans,
                                 code_box: false,
-                                quote_bar: false,
+                                quote_bar: *quote_bar,
                             },
                             h,
                         )
@@ -5794,16 +6379,18 @@ fn build_flow_item_visual(
                     let fsize = (ctx.font_size * 0.85).max(12.0);
                     let detected = highlight::detect_lang(lang);
                     let mut job = highlight::highlight_block(code, detected, ctx.mode, fsize);
-                    job.wrap.max_width = (ctx.max_width - 24.0).max(120.0);
+                    job.wrap.max_width = (eff_max_w - 24.0).max(120.0);
                     let galley = ui.fonts_mut(|f| f.layout_job(job.clone()));
                     let h = galley.rect.height() + 22.0 + gap;
                     (
                         FlowVisual::SingleJob {
                             job,
                             pad_top: 10.0,
+                            indent_px: *indent_px,
+                            bullet: bullet.clone(),
                             link_spans: Vec::new(),
                             code_box: true,
-                            quote_bar: false,
+                            quote_bar: *quote_bar,
                         },
                         h,
                     )
@@ -6670,6 +7257,195 @@ fn locate_anchor_in_text(haystack: &str, anchor: &Anchor) -> Option<(usize, usiz
 }
 
 #[allow(clippy::too_many_arguments)]
+fn push_flattened_flow_block(
+    block: &Block,
+    chapter_idx: usize,
+    block_idx: usize,
+    indent_px: f32,
+    bullet: Option<String>,
+    quote_bar: bool,
+    is_top_level: bool,
+    chars_per_line: f32,
+    line_px: f32,
+    font_size: f32,
+    items: &mut Vec<FlowItemEntry>,
+) {
+    match block {
+        Block::Quote(inner) => {
+            for child in inner {
+                push_flattened_flow_block(
+                    child,
+                    chapter_idx,
+                    block_idx,
+                    indent_px + 14.0,
+                    bullet.clone(),
+                    true,
+                    false,
+                    chars_per_line,
+                    line_px,
+                    font_size,
+                    items,
+                );
+            }
+        }
+        Block::List {
+            ordered,
+            items: list_items,
+        } => {
+            for (li_idx, item_blocks) in list_items.iter().enumerate() {
+                let prefix = if *ordered {
+                    format!("{}.", li_idx + 1)
+                } else {
+                    "•".to_owned()
+                };
+                for (sub_idx, child) in item_blocks.iter().enumerate() {
+                    let child_bullet = if sub_idx == 0 {
+                        Some(prefix.clone())
+                    } else {
+                        None
+                    };
+                    push_flattened_flow_block(
+                        child,
+                        chapter_idx,
+                        block_idx,
+                        indent_px + 22.0,
+                        child_bullet,
+                        quote_bar,
+                        false,
+                        chars_per_line,
+                        line_px,
+                        font_size,
+                        items,
+                    );
+                }
+            }
+        }
+        _ => {
+            let plain = block_plain_text(block);
+            let est = estimate_block_height(block, &plain, chars_per_line, line_px, font_size);
+            let flat_block =
+                if is_top_level && bullet.is_none() && !quote_bar && indent_px == 0.0 {
+                    None
+                } else {
+                    Some(block.clone())
+                };
+            items.push(FlowItemEntry {
+                chapter_idx,
+                source: FlowSourceRef::Block {
+                    chapter_idx,
+                    block_idx,
+                    flat_block,
+                    indent_px,
+                    bullet,
+                    quote_bar,
+                },
+                height: est,
+                visual: None,
+                plain,
+            });
+        }
+    }
+}
+
+fn build_flow_items_list(
+    flow: &FlowDocument,
+    book_kind: &str,
+    is_code_mode: bool,
+    measure: f32,
+    font_size: f32,
+    line_height: f32,
+) -> (
+    Vec<FlowItemEntry>,
+    Vec<usize>,
+    HashMap<(usize, String), usize>,
+) {
+    let mut items = Vec::new();
+    let mut chapter_first_item = Vec::with_capacity(flow.chapters.len());
+    let mut anchor_to_item = HashMap::new();
+
+    if is_code_mode {
+        let lang = match book_kind {
+            "xml" | "html" => CodeLang::XmlHtml,
+            "markdown" => CodeLang::Markdown,
+            _ => CodeLang::Code,
+        };
+        let row_h = ((font_size * 0.88).max(12.0) * 1.48).ceil();
+        for (ci, ch) in flow.chapters.iter().enumerate() {
+            chapter_first_item.push(items.len());
+            if ci > 0 {
+                items.push(FlowItemEntry {
+                    chapter_idx: ci,
+                    source: FlowSourceRef::Separator,
+                    height: 28.0,
+                    visual: None,
+                    plain: String::new(),
+                });
+            }
+            for (ln, line) in ch.raw_source.split('\n').enumerate() {
+                let clean_line = line.strip_suffix('\r').unwrap_or(line).to_owned();
+                items.push(FlowItemEntry {
+                    chapter_idx: ci,
+                    source: FlowSourceRef::CodeLine {
+                        line_no: ln + 1,
+                        text: clean_line.clone(),
+                        lang,
+                    },
+                    height: row_h,
+                    visual: None,
+                    plain: clean_line,
+                });
+            }
+        }
+    } else {
+        let chars_per_line = (measure / (font_size * 0.92)).max(12.0);
+        let line_px = font_size * line_height;
+        for (ci, ch) in flow.chapters.iter().enumerate() {
+            chapter_first_item.push(items.len());
+            let block_base = items.len();
+            if ci > 0 {
+                items.push(FlowItemEntry {
+                    chapter_idx: ci,
+                    source: FlowSourceRef::Separator,
+                    height: 36.0,
+                    visual: None,
+                    plain: String::new(),
+                });
+            }
+            let mut block_start_item = Vec::with_capacity(ch.blocks.len());
+            for (bi, block) in ch.blocks.iter().enumerate() {
+                block_start_item.push(items.len());
+                push_flattened_flow_block(
+                    block,
+                    ci,
+                    bi,
+                    0.0,
+                    None,
+                    false,
+                    true,
+                    chars_per_line,
+                    line_px,
+                    font_size,
+                    &mut items,
+                );
+            }
+            if !block_start_item.is_empty() {
+                for (frag, &b_idx) in &ch.anchors {
+                    let mapped = block_start_item
+                        .get(b_idx)
+                        .copied()
+                        .unwrap_or_else(|| items.len().saturating_sub(1));
+                    anchor_to_item.insert((ci, frag.clone()), mapped);
+                }
+            } else {
+                anchor_to_item.insert((ci, String::new()), block_base);
+            }
+        }
+    }
+
+    (items, chapter_first_item, anchor_to_item)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn paint_fixed_page_annotations(
     ui: &Ui,
     page_idx: usize,
@@ -6679,7 +7455,7 @@ fn paint_fixed_page_annotations(
     word_runs: &[WordTextRun],
     annotations: &[Annotation],
     dark: bool,
-) -> Vec<(String, Rect)> {
+) -> Vec<(String, Rect, String, u64)> {
     let mut hit_rects = Vec::new();
     let has_page_ann = annotations
         .iter()
@@ -6728,6 +7504,11 @@ fn paint_fixed_page_annotations(
         let fill = highlight_fill_color(&ann.color, dark);
         let underline = highlight_swatch_color(&ann.color);
         let is_note = ann.kind == "note";
+        let note_text = if is_note {
+            ann.text.clone()
+        } else {
+            String::new()
+        };
         for part in &ann.parts {
             if part.index != page_idx || part.quote.is_empty() {
                 continue;
@@ -6749,19 +7530,152 @@ fn paint_fixed_page_annotations(
                         Pos2::new(rr.left() + rr.width() * f0, rr.top()),
                         Pos2::new(rr.left() + rr.width() * f1, rr.bottom()),
                     );
-                    ui.painter().rect_filled(sub, 1.5, fill);
-                    if is_note {
+                    if !is_note {
+                        ui.painter().rect_filled(sub, 1.5, fill);
+                    } else {
                         ui.painter().line_segment(
                             [Pos2::new(sub.left(), sub.bottom()), Pos2::new(sub.right(), sub.bottom())],
-                            Stroke::new(2.0, underline),
+                            Stroke::new(2.2, underline),
                         );
                     }
-                    hit_rects.push((ann.id.clone(), sub));
+                    hit_rects.push((
+                        ann.id.clone(),
+                        sub.expand2(Vec2::new(0.0, 3.0)),
+                        note_text.clone(),
+                        ann.created_at,
+                    ));
                 }
             }
         }
     }
     hit_rects
+}
+
+fn search_highlight_style(is_current: bool, dark: bool) -> (Color32, Stroke) {
+    if is_current {
+        (
+            Color32::from_rgba_unmultiplied(0xff, 0x57, 0x22, if dark { 155 } else { 135 }),
+            Stroke::new(1.5, Color32::from_rgb(0xff, 0x57, 0x22)),
+        )
+    } else {
+        (
+            Color32::from_rgba_unmultiplied(0x8e, 0x44, 0xad, if dark { 125 } else { 95 }),
+            Stroke::NONE,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_fixed_page_search_matches(
+    ui: &Ui,
+    page_idx: usize,
+    page_rect: Rect,
+    factor: f32,
+    pdf_runs: &[PdfTextRun],
+    word_runs: &[WordTextRun],
+    matches: &[(usize, usize, usize, bool)],
+    dark: bool,
+) {
+    if !matches.iter().any(|&(u, _, _, _)| u == page_idx) {
+        return;
+    }
+    let mut run_spans: Vec<(usize, usize, Rect)> = Vec::new();
+    let mut offset = 0usize;
+    if !pdf_runs.is_empty() {
+        for run in pdf_runs {
+            let len = run.text.chars().count();
+            let rr = Rect::from_min_size(
+                Pos2::new(
+                    page_rect.left() + run.rect_pt[0] * factor,
+                    page_rect.top() + run.rect_pt[1] * factor,
+                ),
+                Vec2::new(run.rect_pt[2] * factor, run.rect_pt[3] * factor),
+            );
+            run_spans.push((offset, offset + len, rr));
+            offset += len;
+        }
+    } else {
+        for run in word_runs {
+            let len = run.text.chars().count();
+            let rr = Rect::from_min_size(
+                Pos2::new(
+                    page_rect.left() + run.left * factor,
+                    page_rect.top() + run.top * factor,
+                ),
+                Vec2::new(run.width * factor, (run.size * 1.2) * factor),
+            );
+            run_spans.push((offset, offset + len, rr));
+            offset += len;
+        }
+    }
+    for &(unit, m0, m1, is_cur) in matches {
+        if unit != page_idx {
+            continue;
+        }
+        let (fill, stroke) = search_highlight_style(is_cur, dark);
+        for &(r0, r1, rr) in &run_spans {
+            let len = r1.saturating_sub(r0);
+            if len == 0 || m1 <= r0 || m0 >= r1 {
+                continue;
+            }
+            let c0 = m0.saturating_sub(r0).min(len);
+            let c1 = m1.saturating_sub(r0).min(len);
+            if c1 > c0 {
+                let f0 = c0 as f32 / len as f32;
+                let f1 = c1 as f32 / len as f32;
+                let sub = Rect::from_min_max(
+                    Pos2::new(rr.left() + rr.width() * f0, rr.top()),
+                    Pos2::new(rr.left() + rr.width() * f1, rr.bottom()),
+                );
+                ui.painter().rect_filled(sub, 1.5, fill);
+                if is_cur {
+                    ui.painter().rect_stroke(sub, 1.5, stroke, StrokeKind::Outside);
+                }
+            }
+        }
+    }
+}
+
+fn draw_file_icon(painter: &egui::Painter, rect: Rect, ext: &str, p: Palette) {
+    let badge_color = match ext.to_ascii_lowercase().as_str() {
+        "pdf" => Color32::from_rgb(0xc9, 0x45, 0x3b),
+        "doc" | "docx" => Color32::from_rgb(0x2b, 0x6c, 0xb0),
+        "epub" | "azw" | "azw3" | "mobi" => p.accent,
+        "md" | "markdown" => Color32::from_rgb(0x6b, 0x4c, 0x9a),
+        _ => p.muted,
+    };
+    let fold = 4.5;
+    let body = vec![
+        rect.left_top(),
+        Pos2::new(rect.right() - fold, rect.top()),
+        Pos2::new(rect.right(), rect.top() + fold),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        body,
+        p.surface,
+        Stroke::new(1.1, badge_color),
+    ));
+    painter.line_segment(
+        [
+            Pos2::new(rect.right() - fold, rect.top()),
+            Pos2::new(rect.right() - fold, rect.top() + fold),
+        ],
+        Stroke::new(1.0, badge_color),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(rect.right() - fold, rect.top() + fold),
+            Pos2::new(rect.right(), rect.top() + fold),
+        ],
+        Stroke::new(1.0, badge_color),
+    );
+    let band = Rect::from_min_max(
+        Pos2::new(rect.left() + 2.5, rect.bottom() - 7.5),
+        Pos2::new(rect.right() - 2.5, rect.bottom() - 2.5),
+    );
+    painter.rect_filled(band, 1.5, badge_color);
 }
 
 fn draw_chevron(painter: &egui::Painter, center: Pos2, left: bool, color: Color32) {
@@ -6985,36 +7899,37 @@ fn draw_welcome_intro_markdown(ui: &mut Ui, md: &str, p: Palette) -> bool {
     for raw_line in md.lines() {
         let line = raw_line.trim();
         if line.is_empty() {
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             continue;
         }
         if line.starts_with("# ") {
             continue;
         }
         if let Some(h) = line.strip_prefix("### ") {
-            ui.add_space(6.0);
-            ui.label(RichText::new(h).size(15.5).strong().color(p.ink));
-            ui.add_space(2.0);
+            ui.add_space(10.0);
+            ui.label(RichText::new(h).size(20.0).strong().color(p.ink));
+            ui.add_space(4.0);
             continue;
         }
         if let Some(item) = line.strip_prefix("- ") {
             ui.horizontal_top(|ui| {
-                ui.add_space(6.0);
-                ui.label(RichText::new("•").size(14.5).strong().color(p.accent));
+                ui.add_space(8.0);
+                ui.label(RichText::new("•").size(17.5).strong().color(p.accent));
                 let mut job = LayoutJob::default();
-                append_welcome_inline_md(&mut job, item, 14.0, p);
+                append_welcome_inline_md(&mut job, item, 16.5, p);
                 ui.add(egui::Label::new(job).wrap());
             });
-            ui.add_space(3.0);
+            ui.add_space(5.0);
             continue;
         }
         if line.contains("github.com/drliuhuan/HayakuReader") {
+            ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("GitHub 仓库：").size(14.0).color(p.muted));
+                ui.label(RichText::new("GitHub 仓库：").size(16.5).color(p.muted));
                 let link = ui.add(
                     egui::Button::new(
                         RichText::new("github.com/drliuhuan/HayakuReader")
-                            .size(14.0)
+                            .size(16.5)
                             .underline()
                             .color(p.accent),
                     )
@@ -7030,13 +7945,14 @@ fn draw_welcome_intro_markdown(ui: &mut Ui, md: &str, p: Palette) -> bool {
             continue;
         }
         if line.starts_with('©') {
-            ui.label(RichText::new(line).size(12.5).color(p.muted));
+            ui.add_space(4.0);
+            ui.label(RichText::new(line).size(14.5).color(p.muted));
             continue;
         }
         let mut job = LayoutJob::default();
-        append_welcome_inline_md(&mut job, line, 14.5, p);
+        append_welcome_inline_md(&mut job, line, 17.5, p);
         ui.add(egui::Label::new(job).wrap());
-        ui.add_space(4.0);
+        ui.add_space(6.0);
     }
     open_repo
 }
@@ -7199,16 +8115,55 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     out
 }
 
-fn extract_snippet(text: &str, match_byte: usize) -> String {
-    let mut start = match_byte.saturating_sub(40);
-    while start > 0 && !text.is_char_boundary(start) {
-        start -= 1;
+fn find_all_matches_in_text(
+    haystack: &str,
+    query_lower: &str,
+    limit: usize,
+) -> Vec<(usize, usize, String)> {
+    if haystack.is_empty() || query_lower.is_empty() || limit == 0 {
+        return Vec::new();
     }
-    let mut end = (match_byte + 80).min(text.len());
-    while end < text.len() && !text.is_char_boundary(end) {
-        end += 1;
+    let mut lower = String::with_capacity(haystack.len());
+    let mut byte_to_char: Vec<(usize, usize)> = Vec::new();
+    for (ci, (_, ch)) in haystack.char_indices().enumerate() {
+        byte_to_char.push((lower.len(), ci));
+        for lc in ch.to_lowercase() {
+            lower.push(lc);
+        }
     }
-    text[start..end].replace('\n', " ")
+    let total_chars = byte_to_char.len();
+    byte_to_char.push((lower.len(), total_chars));
+
+    let mut out = Vec::new();
+    let mut search_from = 0usize;
+    let q_len = query_lower.len();
+    while search_from < lower.len() && out.len() < limit {
+        let Some(rel) = lower[search_from..].find(query_lower) else {
+            break;
+        };
+        let m_start_b = search_from + rel;
+        let m_end_b = m_start_b + q_len;
+        let c_start = byte_to_char.partition_point(|&(b, _)| b < m_start_b);
+        let c_end = byte_to_char
+            .partition_point(|&(b, _)| b < m_end_b)
+            .max(c_start + 1);
+        let snippet = extract_char_snippet(haystack, c_start, c_end);
+        out.push((c_start, c_end, snippet));
+        search_from = m_end_b.max(search_from + 1);
+    }
+    out
+}
+
+fn extract_char_snippet(text: &str, c_start: usize, c_end: usize) -> String {
+    let from = c_start.saturating_sub(18);
+    let to = c_end + 32;
+    let body: String = text.chars().skip(from).take(to.saturating_sub(from)).collect();
+    let clean = body.replace('\n', " ");
+    if from > 0 {
+        format!("…{clean}")
+    } else {
+        clean
+    }
 }
 
 fn install_system_fonts(ctx: &Context) {
@@ -7340,16 +8295,18 @@ mod tests {
             scroll_active_tab_into_view: false,
             smart_invert_btn_rect: None,
             splash: SplashState::Done,
-            sidebar_open: false,
+            sidebar_open: true,
             sidebar_pinned: false,
-            sidebar_tab: SidebarTab::Contents,
+            sidebar_tab: SidebarTab::Recent,
             active_outline_idx: None,
             focus_mode: false,
             show_settings: false,
             show_search: false,
             search_query: String::new(),
+            last_searched_query: String::new(),
             search_matches: Vec::new(),
             search_cursor: 0,
+            hovered_note: None,
             fixed_zoom: None,
             page_cache: HashMap::new(),
             use_tick: 0,
@@ -7534,19 +8491,25 @@ mod tests {
             }
         };
 
-        // Doc with outline opens sidebar on Contents in auto mode.
+        // Welcome screen without an active book shows sidebar on Recent with Contents/Notes disabled.
+        app.active_book = None;
+        app.sync_auto_sidebar(true);
+        assert!(app.sidebar_open);
+        assert_eq!(app.sidebar_tab, SidebarTab::Recent);
+
+        // Doc with outline opens sidebar and auto-switches to Contents.
         app.active_book = Some(make_flow_book(true, false));
         app.sidebar_tab = SidebarTab::Recent;
         app.sync_auto_sidebar(true);
         assert!(app.sidebar_open);
         assert_eq!(app.sidebar_tab, SidebarTab::Contents);
 
-        // Doc without outline but with annotations also opens sidebar on Contents.
+        // Doc without outline but with annotations opens sidebar on Notes.
         app.active_book = Some(make_flow_book(false, true));
-        app.sidebar_tab = SidebarTab::Notes;
+        app.sidebar_tab = SidebarTab::Recent;
         app.sync_auto_sidebar(true);
         assert!(app.sidebar_open);
-        assert_eq!(app.sidebar_tab, SidebarTab::Contents);
+        assert_eq!(app.sidebar_tab, SidebarTab::Notes);
 
         // Doc without outline or annotations hides sidebar in auto mode.
         app.active_book = Some(make_flow_book(false, false));
@@ -7905,5 +8868,91 @@ mod tests {
         let found = locate_anchor_in_text(text, &anchor).expect("should locate second occurrence");
         assert_eq!(slice_chars(text, found.0, found.1), "苹果");
         assert!(found.0 > 6);
+    }
+
+    #[test]
+    fn markdown_bullet_list_items_flatten_into_selectable_single_jobs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let md_path = dir.path().join("list.md");
+        fs::write(&md_path, "- 第一项苹果文本\n- 第二项香蕉文本\n").expect("write md");
+        let flow = crate::flow::open_markdown(&md_path).expect("parse md");
+
+        let (items, _, _) = build_flow_items_list(&flow, "markdown", false, 600.0, 19.0, 1.8);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].plain, "第一项苹果文本");
+        assert_eq!(items[1].plain, "第二项香蕉文本");
+
+        let ctx = Context::default();
+        install_system_fonts(&ctx);
+        let mut math_cache = MathCache::default();
+        let mut math_textures = HashMap::new();
+        let mut image_textures = HashMap::new();
+        let mut clicked_link = None;
+        let mut requested_menu = None;
+        let mut draw_ctx = FlowDrawCtx {
+            book_id: "b1",
+            palette: Palette::for_mode(ThemeMode::Light),
+            mode: ThemeMode::Light,
+            font_size: 19.0,
+            line_height: 1.8,
+            max_width: 600.0,
+            resources: &flow.resources,
+            math_cache: &mut math_cache,
+            math_textures: &mut math_textures,
+            image_textures: &mut image_textures,
+            clicked_link: &mut clicked_link,
+            requested_menu: &mut requested_menu,
+        };
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(raw, |ui| {
+            let (visual, _) = build_flow_item_visual(ui, &items[0].source, &flow, &mut draw_ctx);
+            assert!(matches!(
+                visual,
+                FlowVisual::SingleJob {
+                    bullet: Some(ref b),
+                    ..
+                } if b == "•"
+            ));
+        });
+        out.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn search_finds_all_occurrences_across_items_and_jumps_accurately() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let md_path = dir.path().join("search.md");
+        fs::write(&md_path, "Rust 很棒，学好 Rust 很有用。\n\n- 列表里的 rust 关键词").expect("write");
+        let flow = crate::flow::open_markdown(&md_path).expect("parse md");
+
+        let mut app = make_test_app(dir.path().to_path_buf());
+        app.active_book = Some(OpenBook {
+            id: "s1".to_owned(),
+            title: "search.md".to_owned(),
+            digest: "d".to_owned(),
+            kind: "markdown",
+            source: LoadedSource::Flow(Arc::new(flow)),
+            state: BookState::default(),
+        });
+        app.search_query = "Rust".to_owned();
+        app.run_search();
+
+        assert_eq!(app.search_matches.len(), 3);
+        assert_eq!(app.search_matches[0].item_idx, Some(0));
+        assert_eq!(app.search_matches[1].item_idx, Some(0));
+        assert_eq!(app.search_matches[2].item_idx, Some(1));
+        assert_ne!(
+            app.search_matches[0].char_start,
+            app.search_matches[1].char_start
+        );
+
+        app.jump_to_search_match(2);
+        assert_eq!(app.search_cursor, 2);
+        assert_eq!(
+            app.pending_jump.as_ref().and_then(|j| j.item_idx),
+            Some(1)
+        );
     }
 }

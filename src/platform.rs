@@ -55,7 +55,10 @@ pub struct DownloadProgress {
 
 pub fn installed_path() -> io::Result<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA").ok_or(io::ErrorKind::NotFound)?;
-    Ok(PathBuf::from(local).join("Programs/HayakuReader/HayakuReader.exe"))
+    Ok(PathBuf::from(local)
+        .join("Programs")
+        .join("HayakuReader")
+        .join("HayakuReader.exe"))
 }
 
 pub fn installed() -> bool {
@@ -167,7 +170,12 @@ pub fn check_manual_update(data: &Path) -> io::Result<bool> {
 fn association_defaults() -> Vec<String> {
     EXTENSIONS
         .iter()
-        .filter(|extension| !matches!(**extension, "txt" | "doc" | "docx"))
+        .filter(|extension| {
+            !matches!(
+                **extension,
+                "html" | "htm" | "xhtml" | "xml" | "doc" | "docx" | "txt"
+            )
+        })
         .map(|extension| (*extension).to_owned())
         .collect()
 }
@@ -806,6 +814,98 @@ pub fn report_replace_failure(error: &dyn std::error::Error) {
     }
 }
 
+pub fn windows_text_scale_factor() -> f32 {
+    let value: Option<u32> = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Accessibility")
+        .and_then(|key| key.get_value("TextScaleFactor"))
+        .ok();
+    match value {
+        Some(v) if (100..=225).contains(&v) => (v as f32 / 100.0).clamp(1.0, 2.25),
+        _ => 1.0,
+    }
+}
+
+pub fn windows_system_dpi_scale() -> f32 {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetDpiForSystem() -> u32;
+    }
+    let dpi = unsafe { GetDpiForSystem() };
+    if dpi >= 96 {
+        (dpi as f32 / 96.0).clamp(1.0, 4.0)
+    } else {
+        1.0
+    }
+}
+
+pub fn windows_system_prefers_dark() -> bool {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .and_then(|key| key.get_value::<u32, _>("AppsUseLightTheme"))
+        .is_ok_and(|val| val == 0)
+}
+
+pub fn format_local_timestamp(epoch_secs: u64) -> String {
+    if epoch_secs == 0 {
+        return String::new();
+    }
+    #[repr(C)]
+    struct FileTime {
+        dw_low_date_time: u32,
+        dw_high_date_time: u32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        w_year: u16,
+        w_month: u16,
+        w_day_of_week: u16,
+        w_day: u16,
+        w_hour: u16,
+        w_minute: u16,
+        w_second: u16,
+        w_milliseconds: u16,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn FileTimeToLocalFileTime(
+            lp_file_time: *const FileTime,
+            lp_local_file_time: *mut FileTime,
+        ) -> i32;
+        fn FileTimeToSystemTime(
+            lp_file_time: *const FileTime,
+            lp_system_time: *mut SystemTime,
+        ) -> i32;
+    }
+    let Some(ticks) = epoch_secs
+        .checked_add(11_644_473_600)
+        .and_then(|secs| secs.checked_mul(10_000_000))
+    else {
+        return String::new();
+    };
+    let utc = FileTime {
+        dw_low_date_time: ticks as u32,
+        dw_high_date_time: (ticks >> 32) as u32,
+    };
+    let mut local = FileTime {
+        dw_low_date_time: 0,
+        dw_high_date_time: 0,
+    };
+    let mut sys = SystemTime::default();
+    unsafe {
+        if FileTimeToLocalFileTime(&utc, &mut local) == 0 {
+            return String::new();
+        }
+        if FileTimeToSystemTime(&local, &mut sys) == 0 {
+            return String::new();
+        }
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        sys.w_year, sys.w_month, sys.w_day, sys.w_hour, sys.w_minute
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,7 +926,7 @@ mod tests {
             register_associations(&test_root, data.path(), &exe, &defaults)?;
             let selected = test_root.open_subkey(format!(r"{CAPABILITIES}\FileAssociations"))?;
             assert_eq!(selected.get_value::<String, _>(".pdf")?, PROG_ID);
-            for ext in [".txt", ".doc", ".docx"] {
+            for ext in [".html", ".htm", ".xhtml", ".xml", ".doc", ".docx", ".txt"] {
                 assert!(selected.get_value::<String, _>(ext).is_err());
             }
             let command =
@@ -895,5 +995,32 @@ mod tests {
         assert!(validate_external_url("file:///C:/Windows/win.ini").is_err());
         assert!(validate_external_url(r"C:\Windows\notepad.exe").is_err());
         assert!(validate_external_url("http://").is_err());
+    }
+
+    #[test]
+    fn installed_path_does_not_contain_forward_slash() -> io::Result<()> {
+        let path = installed_path()?;
+        assert!(!path.to_string_lossy().contains('/'));
+        Ok(())
+    }
+
+    #[test]
+    fn formats_local_timestamps() {
+        assert_eq!(format_local_timestamp(0), "");
+        let formatted = format_local_timestamp(1_700_000_000);
+        assert_eq!(formatted.len(), 16);
+        let bytes = formatted.as_bytes();
+        assert_eq!(bytes[4], b'-');
+        assert_eq!(bytes[7], b'-');
+        assert_eq!(bytes[10], b' ');
+        assert_eq!(bytes[13], b':');
+        for (idx, byte) in bytes.iter().enumerate() {
+            if !matches!(idx, 4 | 7 | 10 | 13) {
+                assert!(
+                    byte.is_ascii_digit(),
+                    "expected digit at {idx} in {formatted}"
+                );
+            }
+        }
     }
 }
