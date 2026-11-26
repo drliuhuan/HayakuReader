@@ -85,15 +85,83 @@ fn copy_binary(source: &Path, target: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn version_tuple(version: &str) -> Option<[u64; 3]> {
-    let clean = version.trim_start_matches('v').split('-').next()?;
-    let mut parts = clean.split('.');
-    let result = [
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-    ];
-    parts.next().is_none().then_some(result)
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PreId {
+    Numeric(u64),
+    AlphaNum(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    prerelease: Vec<PreId>,
+}
+
+impl Ord for ParsedVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            .then_with(
+                || match (self.prerelease.is_empty(), other.prerelease.is_empty()) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    (false, false) => self.prerelease.cmp(&other.prerelease),
+                },
+            )
+    }
+}
+
+impl PartialOrd for ParsedVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn parse_version(version: &str) -> Option<ParsedVersion> {
+    let without_v = version.trim().trim_start_matches(['v', 'V']);
+    let without_build = without_v.split('+').next()?;
+    let (core, pre) = match without_build.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (without_build, None),
+    };
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let mut prerelease = Vec::new();
+    if let Some(pre_str) = pre {
+        if pre_str.is_empty() {
+            return None;
+        }
+        for seg in pre_str.split('.') {
+            if seg.is_empty() {
+                return None;
+            }
+            if seg.bytes().all(|b| b.is_ascii_digit()) {
+                prerelease.push(PreId::Numeric(seg.parse().ok()?));
+            } else {
+                prerelease.push(PreId::AlphaNum(seg.to_ascii_lowercase()));
+            }
+        }
+    }
+    Some(ParsedVersion {
+        major,
+        minor,
+        patch,
+        prerelease,
+    })
+}
+
+fn is_newer_version(candidate: &str, current: &str) -> bool {
+    parse_version(candidate)
+        .zip(parse_version(current))
+        .is_some_and(|(cand, cur)| cand > cur)
 }
 
 pub fn record_version(app_data: &Path) -> io::Result<()> {
@@ -129,10 +197,7 @@ pub fn check_manual_update(data: &Path) -> io::Result<bool> {
         return Ok(false);
     }
     let previous: String = read_json(&data.join("installed-version.json"))?;
-    if !version_tuple(&previous)
-        .zip(version_tuple(VERSION))
-        .is_some_and(|(previous, current)| current > previous)
-    {
+    if !is_newer_version(VERSION, &previous) {
         Command::new(target)
             .args(std::env::args_os().skip(1))
             .spawn()?;
@@ -279,18 +344,45 @@ pub fn create_shortcuts(target: &Path) -> io::Result<()> {
     run_shortcut_script(target, None)
 }
 
+fn prog_id_for_extension(extension: &str) -> String {
+    format!("HayakuReader.{extension}")
+}
+
+fn icon_resource_id(extension: &str) -> i32 {
+    match extension {
+        "pdf" => 101,
+        "epub" => 102,
+        "txt" => 103,
+        "azw3" => 104,
+        "azw" => 105,
+        "mobi" => 106,
+        "doc" => 107,
+        "docx" => 108,
+        "md" => 109,
+        "markdown" => 110,
+        "html" => 111,
+        "htm" => 112,
+        "xhtml" => 113,
+        "xml" => 114,
+        _ => 1,
+    }
+}
+
 fn register_associations(
     root: &RegKey,
     data: &Path,
     exe: &Path,
     selected: &[String],
 ) -> io::Result<()> {
-    let (prog, _) = root.create_subkey(format!(r"Software\Classes\{PROG_ID}"))?;
-    prog.set_value("", &"HayakuReader document")?;
-    prog.create_subkey(r"shell\open\command")?
+    let command = format!("\"{}\" \"%1\"", exe.display());
+    let (legacy_prog, _) = root.create_subkey(format!(r"Software\Classes\{PROG_ID}"))?;
+    legacy_prog.set_value("", &"HayakuReader document")?;
+    legacy_prog
+        .create_subkey(r"shell\open\command")?
         .0
-        .set_value("", &format!("\"{}\" \"%1\"", exe.display()))?;
-    prog.create_subkey("DefaultIcon")?
+        .set_value("", &command)?;
+    legacy_prog
+        .create_subkey("DefaultIcon")?
         .0
         .set_value("", &format!("\"{}\",0", exe.display()))?;
     let (registered, _) = root.create_subkey(r"Software\RegisteredApplications")?;
@@ -303,21 +395,39 @@ fn register_associations(
     let mut previous: std::collections::BTreeMap<String, Option<String>> =
         read_json(&previous_file)?;
     for extension in EXTENSIONS {
+        let prog_id = prog_id_for_extension(extension);
+        let icon_id = icon_resource_id(extension);
+        let (prog, _) = root.create_subkey(format!(r"Software\Classes\{prog_id}"))?;
+        prog.set_value(
+            "",
+            &format!("HayakuReader {} Document", extension.to_uppercase()),
+        )?;
+        prog.create_subkey(r"shell\open\command")?
+            .0
+            .set_value("", &command)?;
+        prog.create_subkey("DefaultIcon")?
+            .0
+            .set_value("", &format!("\"{}\",-{}", exe.display(), icon_id))?;
+
         let dotted = format!(".{extension}");
         let (class, _) = root.create_subkey(format!(r"Software\Classes\{dotted}"))?;
         let (handlers, _) = class.create_subkey("OpenWithProgids")?;
         let current = class.get_value::<String, _>("").ok();
         if selected.iter().any(|value| value == extension) {
-            types.set_value(&dotted, &PROG_ID)?;
-            handlers.set_value(PROG_ID, &"")?;
-            if current.as_deref() != Some(PROG_ID) {
-                previous.insert(dotted.clone(), current);
-                class.set_value("", &PROG_ID)?;
+            types.set_value(&dotted, &prog_id)?;
+            handlers.set_value(&prog_id, &"")?;
+            let _ = remove_value(&handlers, PROG_ID);
+            if current.as_deref() != Some(prog_id.as_str()) {
+                if current.as_deref() != Some(PROG_ID) {
+                    previous.insert(dotted.clone(), current);
+                }
+                class.set_value("", &prog_id)?;
             }
         } else {
             remove_value(&types, &dotted)?;
+            remove_value(&handlers, &prog_id)?;
             remove_value(&handlers, PROG_ID)?;
-            if current.as_deref() == Some(PROG_ID) {
+            if current.as_deref() == Some(prog_id.as_str()) || current.as_deref() == Some(PROG_ID) {
                 if let Some(Some(old)) = previous.remove(&dotted) {
                     class.set_value("", &old)?;
                 } else {
@@ -559,10 +669,7 @@ pub fn check_latest_release() -> Result<Option<Release>, String> {
             .body_mut()
             .read_json()
             .map_err(|error| error.to_string())?;
-        Ok(version_tuple(&release.tag_name)
-            .zip(version_tuple(VERSION))
-            .is_some_and(|(latest, current)| latest > current)
-            .then_some(release))
+        Ok(is_newer_version(&release.tag_name, VERSION).then_some(release))
     };
     check().or_else(|_| check())
 }
@@ -756,7 +863,7 @@ pub fn apply_update(
         || !source
             .file_name()
             .is_some_and(|name| name.to_string_lossy().starts_with("update-"))
-        || version_tuple(version) != version_tuple(VERSION)
+        || parse_version(version) != parse_version(VERSION)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -925,15 +1032,27 @@ mod tests {
             let defaults = association_defaults();
             register_associations(&test_root, data.path(), &exe, &defaults)?;
             let selected = test_root.open_subkey(format!(r"{CAPABILITIES}\FileAssociations"))?;
-            assert_eq!(selected.get_value::<String, _>(".pdf")?, PROG_ID);
+            assert_eq!(selected.get_value::<String, _>(".pdf")?, "HayakuReader.pdf");
             for ext in [".html", ".htm", ".xhtml", ".xml", ".doc", ".docx", ".txt"] {
                 assert!(selected.get_value::<String, _>(ext).is_err());
             }
-            let command =
-                test_root.open_subkey(format!(r"Software\Classes\{PROG_ID}\shell\open\command"))?;
+            let pdf_command = test_root
+                .open_subkey(r"Software\Classes\HayakuReader.pdf\shell\open\command")?;
             assert_eq!(
-                command.get_value::<String, _>("")?,
+                pdf_command.get_value::<String, _>("")?,
                 format!("\"{}\" \"%1\"", exe.display())
+            );
+            let pdf_icon =
+                test_root.open_subkey(r"Software\Classes\HayakuReader.pdf\DefaultIcon")?;
+            assert_eq!(
+                pdf_icon.get_value::<String, _>("")?,
+                format!("\"{}\",-101", exe.display())
+            );
+            let txt_icon =
+                test_root.open_subkey(r"Software\Classes\HayakuReader.txt\DefaultIcon")?;
+            assert_eq!(
+                txt_icon.get_value::<String, _>("")?,
+                format!("\"{}\",-103", exe.display())
             );
             register_associations(&test_root, data.path(), &exe, &["txt".to_owned()])?;
             assert_eq!(
@@ -942,7 +1061,7 @@ mod tests {
                     .get_value::<String, _>("")?,
                 "OtherPDF"
             );
-            assert_eq!(selected.get_value::<String, _>(".txt")?, PROG_ID);
+            assert_eq!(selected.get_value::<String, _>(".txt")?, "HayakuReader.txt");
             Ok::<(), io::Error>(())
         })();
         let cleanup = profile.delete_subkey_all(&path);
@@ -950,11 +1069,30 @@ mod tests {
     }
 
     #[test]
+    fn every_supported_extension_has_unique_icon_resource_id() {
+        let mut seen = std::collections::BTreeSet::new();
+        for ext in EXTENSIONS {
+            let id = icon_resource_id(ext);
+            assert!(id >= 101, "missing dedicated icon id for {ext}");
+            assert!(seen.insert(id), "duplicate icon id {id} for {ext}");
+        }
+        assert_eq!(seen.len(), EXTENSIONS.len());
+    }
+
+    #[test]
     fn parses_and_orders_semver_versions() {
-        assert_eq!(version_tuple("0.2.3"), Some([0, 2, 3]));
-        assert_eq!(version_tuple("v1.10.2"), Some([1, 10, 2]));
-        assert!(version_tuple("0.3.0-alpha.1") > version_tuple("0.2.7"));
-        assert_eq!(version_tuple("0.2"), None);
+        assert!(is_newer_version("0.3.0-alpha.2", "0.3.0-alpha.1"));
+        assert!(is_newer_version("0.3.0-alpha.10", "0.3.0-alpha.2"));
+        assert!(is_newer_version("0.3.0-beta.1", "0.3.0-alpha.9"));
+        assert!(is_newer_version("v0.3.0-alpha.3", "0.3.0-alpha.2"));
+        assert!(is_newer_version("0.3.0", "0.3.0-rc.1"));
+        assert!(is_newer_version("0.3.0-rc.1", "0.3.0-beta.1"));
+        assert!(is_newer_version("0.3.0-beta.1", "0.3.0-alpha.2"));
+        assert!(is_newer_version("0.3.0-alpha.1", "0.2.7"));
+        assert!(!is_newer_version("0.3.0-alpha.2", "0.3.0-alpha.2"));
+        assert!(!is_newer_version("0.3.0-alpha.1", "0.3.0-alpha.2"));
+        assert!(parse_version("0.2").is_none());
+        assert!(parse_version("0.3.0-").is_none());
     }
 
     #[test]

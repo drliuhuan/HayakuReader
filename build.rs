@@ -73,6 +73,12 @@ fn main() {
 
     println!("cargo:rerun-if-changed=assets/logo.ico");
     println!("cargo:rerun-if-changed=assets/windows.rc");
+    for ext in [
+        "pdf", "epub", "txt", "azw3", "azw", "mobi", "doc", "docx", "md", "markdown", "html",
+        "htm", "xhtml", "xml",
+    ] {
+        println!("cargo:rerun-if-changed=assets/icons/{ext}.ico");
+    }
     let resource = out_dir.join("HayakuReader.res");
     let mut compiler = cc::windows_registry::find_tool(&target, "rc.exe").map_or_else(
         || std::process::Command::new("rc.exe"),

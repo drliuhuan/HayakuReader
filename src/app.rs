@@ -301,6 +301,8 @@ pub struct HayakuApp {
     math_textures: HashMap<MathTexKey, Option<CachedMathTex>>,
     image_textures: HashMap<(String, String), Option<TextureHandle>>,
     logo_texture: Option<TextureHandle>,
+    format_icon_textures: HashMap<String, TextureHandle>,
+    last_window_title: String,
 
     status_msg: Option<(String, Option<Instant>)>,
     context_menu: Option<ImageContextMenu>,
@@ -342,6 +344,7 @@ impl HayakuApp {
             cc.egui_ctx
                 .load_texture("app_logo", img, TextureOptions::LINEAR)
         });
+        let format_icon_textures = load_format_icon_textures(&cc.egui_ctx);
         let settings: Settings = storage::read_json(&data.join("settings.json")).unwrap_or_default();
         let recent: Vec<Recent> = storage::read_json(&data.join("recent.json")).unwrap_or_default();
         let workspace: Workspace =
@@ -434,6 +437,8 @@ impl HayakuApp {
             math_textures: HashMap::new(),
             image_textures: HashMap::new(),
             logo_texture,
+            format_icon_textures,
+            last_window_title: String::new(),
             status_msg: None,
             context_menu: None,
             link_warning: None,
@@ -1322,7 +1327,32 @@ impl HayakuApp {
 
     fn apply_egui_visuals(&self, ctx: &Context) {
         for theme in [egui::Theme::Light, egui::Theme::Dark] {
-            ctx.style_mut_of(theme, |s| s.interaction.selectable_labels = false);
+            ctx.style_mut_of(theme, |s| {
+                s.interaction.selectable_labels = false;
+                s.text_styles.insert(
+                    egui::TextStyle::Small,
+                    FontId::proportional(14.0),
+                );
+                s.text_styles.insert(
+                    egui::TextStyle::Body,
+                    FontId::proportional(18.0),
+                );
+                s.text_styles.insert(
+                    egui::TextStyle::Button,
+                    FontId::proportional(18.0),
+                );
+                s.text_styles.insert(
+                    egui::TextStyle::Monospace,
+                    FontId::monospace(17.0),
+                );
+                s.text_styles.insert(
+                    egui::TextStyle::Heading,
+                    FontId::proportional(26.0),
+                );
+                s.spacing.item_spacing = Vec2::new(8.0, 7.0);
+                s.spacing.button_padding = Vec2::new(10.0, 5.0);
+                s.spacing.interact_size.y = 28.0;
+            });
         }
         #[cfg(windows)]
         {
@@ -1593,8 +1623,18 @@ impl HayakuApp {
     fn draw_top_bar(&mut self, ui: &mut Ui) {
         let p = self.palette();
         let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+        let full_title = if let Some(book) = &self.active_book {
+            format!("HayakuReader v{} - {}", platform::VERSION, book.title)
+        } else {
+            format!("HayakuReader v{}", platform::VERSION)
+        };
+        if self.last_window_title != full_title {
+            self.last_window_title = full_title.clone();
+            ui.ctx()
+                .send_viewport_cmd(ViewportCommand::Title(full_title.clone()));
+        }
         Panel::top("top_toolbar")
-            .exact_size(46.0)
+            .exact_size(52.0)
             .show_separator_line(true)
             .frame(
                 Frame::new()
@@ -1607,12 +1647,13 @@ impl HayakuApp {
                     }),
             )
             .show(ui, |ui| {
+                let bar_center_x = ui.max_rect().center().x;
                 ui.horizontal_centered(|ui| {
                     if let Some(logo) = &self.logo_texture {
-                        ui.add(egui::Image::new((logo.id(), Vec2::splat(22.0))));
+                        ui.add(egui::Image::new((logo.id(), Vec2::splat(24.0))));
                     }
                     let (side_rect, side_resp) =
-                        ui.allocate_exact_size(Vec2::new(30.0, 28.0), Sense::click());
+                        ui.allocate_exact_size(Vec2::new(32.0, 32.0), Sense::click());
                     let side_tip = if self.sidebar_pinned {
                         "取消始终显示侧边栏（切回自动模式）(Ctrl+B)"
                     } else {
@@ -1641,10 +1682,10 @@ impl HayakuApp {
                     }
                     let sc = side_rect.center();
                     let icon_color = if self.sidebar_pinned { p.accent } else { p.ink };
-                    for dy in [-4.5f32, 0.0, 4.5] {
+                    for dy in [-5.0f32, 0.0, 5.0] {
                         ui.painter().line_segment(
-                            [Pos2::new(sc.x - 6.5, sc.y + dy), Pos2::new(sc.x + 6.5, sc.y + dy)],
-                            Stroke::new(1.6, icon_color),
+                            [Pos2::new(sc.x - 7.0, sc.y + dy), Pos2::new(sc.x + 7.0, sc.y + dy)],
+                            Stroke::new(1.8, icon_color),
                         );
                     }
                     if side_resp.clicked() {
@@ -1654,31 +1695,55 @@ impl HayakuApp {
 
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("打开文件").color(p.accent_ink))
+                            egui::Button::new(RichText::new("打开").color(p.accent_ink))
                                 .fill(p.accent),
                         )
                         .clicked()
                     {
                         self.pick_and_open_files();
                     }
-                    let title = self
+                    let mut controls_reserve = if self.active_book.is_some() {
+                        440.0
+                    } else {
+                        240.0
+                    };
+                    if self
                         .active_book
                         .as_ref()
-                        .map(|b| b.title.as_str())
-                        .unwrap_or("HayakuReader");
-                    let controls_reserve = 360.0;
+                        .is_some_and(|b| matches!(b.kind, "markdown" | "html" | "xml"))
+                    {
+                        controls_reserve += 100.0;
+                    }
                     let drag_width = (ui.available_width() - controls_reserve).max(40.0);
                     let (drag_rect, drag_resp) = ui.allocate_exact_size(
-                        Vec2::new(drag_width, 36.0),
+                        Vec2::new(drag_width, 42.0),
                         Sense::click_and_drag(),
                     );
-                    ui.painter().text(
-                        drag_rect.left_center() + Vec2::new(6.0, 0.0),
-                        egui::Align2::LEFT_CENTER,
-                        truncate_str(title, 48),
-                        FontId::proportional(14.5),
+                    let title_font = FontId::proportional(18.5);
+                    let avail_title_w = (drag_rect.width() - 16.0).max(20.0);
+                    let display_title =
+                        truncate_to_width(ui.painter(), &full_title, &title_font, avail_title_w);
+                    let title_galley = ui.painter().layout_no_wrap(
+                        display_title,
+                        title_font,
                         p.ink,
                     );
+                    let tw = title_galley.size().x;
+                    let half_w = tw * 0.5;
+                    let min_cx = drag_rect.left() + 8.0 + half_w;
+                    let max_cx = drag_rect.right() - 8.0 - half_w;
+                    let draw_cx = if min_cx <= max_cx {
+                        bar_center_x.clamp(min_cx, max_cx)
+                    } else {
+                        drag_rect.center().x
+                    };
+                    let text_pos = Pos2::new(
+                        draw_cx - half_w,
+                        drag_rect.center().y - title_galley.size().y * 0.5,
+                    );
+                    ui.painter()
+                        .with_clip_rect(drag_rect)
+                        .galley(text_pos, title_galley, p.ink);
                     if drag_resp.double_clicked() {
                         ui.ctx()
                             .send_viewport_cmd(ViewportCommand::Maximized(!maximized));
@@ -1689,7 +1754,7 @@ impl HayakuApp {
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         // Close button
                         let (close_rect, close_resp) =
-                            ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::click());
+                            ui.allocate_exact_size(Vec2::new(46.0, 50.0), Sense::click());
                         let close_resp = close_resp.on_hover_text("关闭");
                         if close_resp.hovered() {
                             ui.painter().rect_filled(
@@ -1701,12 +1766,12 @@ impl HayakuApp {
                         let x_col = if close_resp.hovered() { Color32::WHITE } else { p.ink };
                         let cc = close_rect.center();
                         ui.painter().line_segment(
-                            [cc - Vec2::splat(5.0), cc + Vec2::splat(5.0)],
-                            Stroke::new(1.5, x_col),
+                            [cc - Vec2::splat(5.5), cc + Vec2::splat(5.5)],
+                            Stroke::new(1.6, x_col),
                         );
                         ui.painter().line_segment(
-                            [cc + Vec2::new(-5.0, 5.0), cc + Vec2::new(5.0, -5.0)],
-                            Stroke::new(1.5, x_col),
+                            [cc + Vec2::new(-5.5, 5.5), cc + Vec2::new(5.5, -5.5)],
+                            Stroke::new(1.6, x_col),
                         );
                         if close_resp.clicked() {
                             self.save_active_book();
@@ -1716,7 +1781,7 @@ impl HayakuApp {
 
                         // Maximize / Restore button
                         let (max_rect, max_resp) =
-                            ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::click());
+                            ui.allocate_exact_size(Vec2::new(46.0, 50.0), Sense::click());
                         let max_resp =
                             max_resp.on_hover_text(if maximized { "还原" } else { "最大化" });
                         if max_resp.hovered() {
@@ -1756,7 +1821,7 @@ impl HayakuApp {
 
                         // Minimize button
                         let (min_rect, min_resp) =
-                            ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::click());
+                            ui.allocate_exact_size(Vec2::new(46.0, 50.0), Sense::click());
                         let min_resp = min_resp.on_hover_text("最小化");
                         if min_resp.hovered() {
                             ui.painter().rect_filled(min_rect, 0.0, p.side);
@@ -2162,19 +2227,19 @@ impl HayakuApp {
         let p = self.palette();
         let dark = self.theme_mode() == ThemeMode::Dark;
         Panel::top("document_tabs")
-            .exact_size(36.0)
+            .exact_size(46.0)
             .show_separator_line(true)
             .frame(
                 Frame::new()
                     .fill(p.side)
-                    .inner_margin(Margin::symmetric(6, 4)),
+                    .inner_margin(Margin::symmetric(6, 5)),
             )
             .show(ui, |ui| {
                 let bar_rect = ui.available_rect_before_wrap();
                 ui.allocate_rect(bar_rect, Sense::hover());
-                let arrow_w = 24.0;
+                let arrow_w = 28.0;
                 let arrow_gap = 6.0;
-                let bar_h = bar_rect.height().min(28.0);
+                let bar_h = bar_rect.height().min(36.0);
                 let top_y = bar_rect.center().y - bar_h * 0.5;
                 let left_rect = Rect::from_min_size(
                     Pos2::new(bar_rect.left(), top_y),
@@ -2455,8 +2520,8 @@ impl HayakuApp {
         let p = self.palette();
         Panel::left("sidebar_panel")
             .resizable(true)
-            .default_size(270.0)
-            .size_range(220.0..=380.0)
+            .default_size(320.0)
+            .size_range(260.0..=480.0)
             .show_separator_line(true)
             .frame(
                 Frame::new()
@@ -2465,7 +2530,7 @@ impl HayakuApp {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Recent, "最近打开的文件");
+                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Recent, "最近打开");
                     ui.add_enabled_ui(has_book, |ui| {
                         ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Contents, "目录");
                         ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Notes, "批注");
@@ -2478,11 +2543,14 @@ impl HayakuApp {
                         let mut open_path = None;
                         let mut clear_all = false;
                         if self.recent.is_empty() {
-                            ui.label(RichText::new("暂无最近打开的文件").color(p.muted));
+                            ui.label(RichText::new("暂无最近打开的文件").size(14.0).color(p.muted));
                         } else {
                             ui.horizontal(|ui| {
                                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                    if ui.button("清空记录").clicked() {
+                                    if ui
+                                        .button(RichText::new("清空记录").size(13.5))
+                                        .clicked()
+                                    {
                                         clear_all = true;
                                     }
                                 });
@@ -2505,7 +2573,7 @@ impl HayakuApp {
                                     .and_then(|e| e.to_str())
                                     .unwrap_or("");
                                 let card_w = ui.available_width();
-                                let row_h = 44.0;
+                                let row_h = 46.0;
                                 let (row_rect, row_resp) = ui.allocate_exact_size(
                                     Vec2::new(card_w, row_h),
                                     Sense::click(),
@@ -2514,7 +2582,7 @@ impl HayakuApp {
                                     row_resp.on_hover_text(item.path.display().to_string());
                                 let del_rect = Rect::from_center_size(
                                     Pos2::new(row_rect.right() - 14.0, row_rect.center().y),
-                                    Vec2::new(20.0, 20.0),
+                                    Vec2::new(22.0, 22.0),
                                 );
                                 let del_resp = ui.interact(
                                     del_rect,
@@ -2539,27 +2607,52 @@ impl HayakuApp {
                                     );
                                 }
                                 let icon_rect = Rect::from_min_size(
-                                    Pos2::new(row_rect.left() + 6.0, row_rect.center().y - 10.0),
-                                    Vec2::new(16.0, 20.0),
+                                    Pos2::new(row_rect.left() + 6.0, row_rect.center().y - 12.0),
+                                    Vec2::splat(24.0),
                                 );
-                                draw_file_icon(ui.painter(), icon_rect, ext, p);
+                                draw_format_icon(
+                                    &self.format_icon_textures,
+                                    ui.painter(),
+                                    icon_rect,
+                                    ext,
+                                    p,
+                                );
 
                                 let text_left = icon_rect.right() + 8.0;
-                                let max_chars_name = ((card_w - 58.0) / 8.5).floor().max(10.0) as usize;
-                                let max_chars_dir = ((card_w - 58.0) / 6.5).floor().max(12.0) as usize;
-                                ui.painter().text(
-                                    Pos2::new(text_left, row_rect.top() + 7.0),
+                                let text_right_limit = (del_rect.left() - 6.0).max(text_left + 12.0);
+                                let text_max_w = (text_right_limit - text_left).max(12.0);
+                                let text_clip = Rect::from_min_max(
+                                    Pos2::new(text_left, row_rect.top()),
+                                    Pos2::new(text_right_limit, row_rect.bottom()),
+                                );
+                                let clipped_painter = ui.painter().with_clip_rect(text_clip);
+                                let name_font = FontId::proportional(13.5);
+                                let shown_name = truncate_to_width(
+                                    ui.painter(),
+                                    &name,
+                                    &name_font,
+                                    text_max_w,
+                                );
+                                clipped_painter.text(
+                                    Pos2::new(text_left, row_rect.top() + 7.5),
                                     egui::Align2::LEFT_TOP,
-                                    truncate_str(&name, max_chars_name),
-                                    FontId::proportional(13.5),
+                                    shown_name,
+                                    name_font,
                                     p.ink,
                                 );
                                 if !folder.is_empty() {
-                                    ui.painter().text(
-                                        Pos2::new(text_left, row_rect.top() + 24.5),
+                                    let dir_font = FontId::proportional(11.0);
+                                    let shown_dir = truncate_to_width(
+                                        ui.painter(),
+                                        &folder,
+                                        &dir_font,
+                                        text_max_w,
+                                    );
+                                    clipped_painter.text(
+                                        Pos2::new(text_left, row_rect.top() + 26.0),
                                         egui::Align2::LEFT_TOP,
-                                        truncate_str(&folder, max_chars_dir),
-                                        FontId::proportional(11.0),
+                                        shown_dir,
+                                        dir_font,
                                         p.muted,
                                     );
                                 }
@@ -2607,6 +2700,7 @@ impl HayakuApp {
                         if entries.is_empty() {
                             ui.label(RichText::new("此文档没有目录").color(p.muted));
                         } else {
+                            ui.spacing_mut().item_spacing.y = 8.0;
                             let fallback_idx = entries.iter().position(|e| e.index == self.current_unit);
                             for (oi, entry) in entries.iter().enumerate() {
                                 let active = if let Some(sel) = self.active_outline_idx
@@ -2617,9 +2711,9 @@ impl HayakuApp {
                                     fallback_idx == Some(oi)
                                 };
                                 let text = if active {
-                                    RichText::new(&entry.title).strong().color(p.accent)
+                                    RichText::new(&entry.title).size(18.0).strong().color(p.accent)
                                 } else {
-                                    RichText::new(&entry.title)
+                                    RichText::new(&entry.title).size(18.0)
                                 };
                                 if ui.selectable_label(active, text).clicked() {
                                     self.pending_jump = Some(PendingJump {
@@ -2642,10 +2736,10 @@ impl HayakuApp {
                         if let Some(book) = &self.active_book {
                             if book.state.annotations.is_empty() {
                                 ui.label(RichText::new("暂无书签、高亮或批注").color(p.muted));
-                                ui.add_space(4.0);
+                                ui.add_space(6.0);
                                 ui.label(
                                     RichText::new("提示：拖动选中正文即可一键添加四色高亮或笔记。")
-                                        .size(12.5)
+                                        .size(16.5)
                                         .color(p.muted),
                                 );
                             } else {
@@ -2654,7 +2748,7 @@ impl HayakuApp {
                                         export_md = true;
                                     }
                                 });
-                                ui.add_space(6.0);
+                                ui.add_space(8.0);
                                 let is_fixed = matches!(
                                     book.source,
                                     LoadedSource::Pdf(_) | LoadedSource::Word(_)
@@ -2664,8 +2758,9 @@ impl HayakuApp {
                                         .fill(p.surface)
                                         .stroke(Stroke::new(1.0, p.line))
                                         .corner_radius(CornerRadius::same(7))
-                                        .inner_margin(Margin::same(8));
+                                        .inner_margin(Margin::same(10));
                                     card.show(ui, |ui| {
+                                        ui.spacing_mut().item_spacing.y = 6.0;
                                         ui.set_width(ui.available_width());
                                         ui.horizontal(|ui| {
                                             let dot_color = if ann.kind == "bookmark" {
@@ -2674,12 +2769,12 @@ impl HayakuApp {
                                                 highlight_swatch_color(&ann.color)
                                             };
                                             let (dot_rect, _) = ui.allocate_exact_size(
-                                                Vec2::splat(10.0),
+                                                Vec2::splat(12.0),
                                                 Sense::hover(),
                                             );
                                             ui.painter().circle_filled(
                                                 dot_rect.center(),
-                                                4.5,
+                                                5.5,
                                                 dot_color,
                                             );
                                             let kind_txt = match ann.kind.as_str() {
@@ -2704,7 +2799,7 @@ impl HayakuApp {
                                                         RichText::new(format!(
                                                             "{kind_txt} · {loc_txt}"
                                                         ))
-                                                        .size(12.5)
+                                                        .size(17.5)
                                                         .color(p.muted),
                                                     )
                                                     .frame(false),
@@ -2730,7 +2825,7 @@ impl HayakuApp {
                                                     if ui
                                                         .add(
                                                             egui::Button::new(
-                                                                RichText::new("编辑").size(12.0),
+                                                                RichText::new("编辑").size(17.0),
                                                             )
                                                             .frame(false),
                                                         )
@@ -2749,7 +2844,7 @@ impl HayakuApp {
                                                 .add(
                                                     egui::Label::new(
                                                         RichText::new(format!("“{q}”"))
-                                                            .size(12.5)
+                                                            .size(17.5)
                                                             .color(p.muted),
                                                     )
                                                     .wrap()
@@ -2773,6 +2868,7 @@ impl HayakuApp {
                                                             ann.text.trim(),
                                                             80,
                                                         ))
+                                                        .size(18.0)
                                                         .color(p.ink),
                                                     )
                                                     .wrap()
@@ -2788,12 +2884,12 @@ impl HayakuApp {
                                             let ts = platform::format_local_timestamp(ann.created_at);
                                             if !ts.is_empty() {
                                                 ui.label(
-                                                    RichText::new(ts).size(11.0).color(p.muted),
+                                                    RichText::new(ts).size(15.5).color(p.muted),
                                                 );
                                             }
                                         }
                                     });
-                                    ui.add_space(4.0);
+                                    ui.add_space(6.0);
                                 }
                             }
                         } else {
@@ -2836,12 +2932,12 @@ impl HayakuApp {
         let dark = self.theme_mode() == ThemeMode::Dark;
         let uses_smart_invert = self.active_book_uses_smart_invert();
         Panel::bottom("status_footer")
-            .exact_size(38.0)
+            .exact_size(46.0)
             .show_separator_line(true)
             .frame(
                 Frame::new()
                     .fill(p.surface)
-                    .inner_margin(Margin::symmetric(12, 4)),
+                    .inner_margin(Margin::symmetric(12, 5)),
             )
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
@@ -5180,14 +5276,14 @@ impl HayakuApp {
                             color: Color32::from_black_alpha(64),
                         })
                         .show(ui, |ui| {
-                            ui.set_max_width(270.0);
-                            ui.label(RichText::new(&note_text).size(13.5).color(p.ink));
+                            ui.set_max_width(360.0);
+                            ui.label(RichText::new(&note_text).size(18.5).color(p.ink));
                             #[cfg(windows)]
                             if created_at > 0 {
                                 let ts = platform::format_local_timestamp(created_at);
                                 if !ts.is_empty() {
-                                    ui.add_space(4.0);
-                                    ui.label(RichText::new(ts).size(11.5).color(p.muted));
+                                    ui.add_space(5.0);
+                                    ui.label(RichText::new(ts).size(15.5).color(p.muted));
                                 }
                             }
                         });
@@ -5202,11 +5298,12 @@ impl HayakuApp {
             egui::Window::new("设置")
                 .collapsible(false)
                 .resizable(false)
-                .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-16.0, 52.0))
+                .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-16.0, 56.0))
                 .show(ctx, |ui| {
-                    ui.set_width(356.0);
+                    ui.set_width(480.0);
+                    ui.spacing_mut().item_spacing.y = 10.0;
                     ui.horizontal(|ui| {
-                        let slot_w = (ui.available_width() - 68.0).max(198.0);
+                        let slot_w = (ui.available_width() - 96.0).max(280.0);
                         Frame::new()
                             .fill(p.code_bg)
                             .stroke(Stroke::new(1.0, p.line))
@@ -5216,7 +5313,7 @@ impl HayakuApp {
                                 ui.set_width(slot_w);
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 3.0;
-                                    let btn_w = ((slot_w - 6.0) / 3.0).max(58.0);
+                                    let btn_w = ((slot_w - 6.0) / 3.0).max(86.0);
                                     for (val, label) in [
                                         ("system", "跟随系统"),
                                         ("light", "浅色"),
@@ -5234,7 +5331,7 @@ impl HayakuApp {
                                         .fill(if active { p.accent } else { Color32::TRANSPARENT })
                                         .stroke(Stroke::NONE)
                                         .corner_radius(CornerRadius::same(6));
-                                        if ui.add_sized([btn_w, 26.0], btn).clicked() {
+                                        if ui.add_sized([btn_w, 36.0], btn).clicked() {
                                             self.settings.theme = val.to_owned();
                                             changed = true;
                                         }
@@ -5250,7 +5347,7 @@ impl HayakuApp {
                         let vis = ui.visuals_mut();
                         vis.slider_trailing_fill = true;
                         vis.selection.bg_fill = p.accent;
-                        ui.spacing_mut().slider_width = 215.0;
+                        ui.spacing_mut().slider_width = 260.0;
 
                         ui.horizontal(|ui| {
                             changed |= ui
@@ -5346,14 +5443,14 @@ impl HayakuApp {
             egui::Window::new("搜索正文")
                 .collapsible(false)
                 .resizable(false)
-                .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-16.0, 52.0))
+                .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-16.0, 56.0))
                 .show(ctx, |ui| {
-                    ui.set_min_width(360.0);
+                    ui.set_min_width(480.0);
                     ui.horizontal(|ui| {
                         let edit = ui.add(
                             egui::TextEdit::singleline(&mut self.search_query)
                                 .hint_text("输入关键词…")
-                                .desired_width(185.0),
+                                .desired_width(220.0),
                         );
                         let enter_pressed = (edit.has_focus() || edit.lost_focus())
                             && ui.input(|i| i.key_pressed(Key::Enter));
@@ -5429,7 +5526,7 @@ impl HayakuApp {
                                             ui.horizontal(|ui| {
                                                 ui.label(
                                                     RichText::new(unit_label)
-                                                        .size(11.5)
+                                                        .size(16.0)
                                                         .strong()
                                                         .color(if is_cur {
                                                             Color32::from_rgb(0xff, 0x57, 0x22)
@@ -5440,7 +5537,7 @@ impl HayakuApp {
                                                 ui.add(
                                                     egui::Label::new(
                                                         RichText::new(&m.snippet)
-                                                            .size(12.5)
+                                                            .size(17.5)
                                                             .color(p.ink),
                                                     )
                                                     .wrap()
@@ -5486,7 +5583,8 @@ impl HayakuApp {
             egui::Modal::new(Id::unique("install_modal"))
                 .frame(modal_frame)
                 .show(ctx, |ui| {
-                    ui.set_max_width(440.0);
+                    ui.set_max_width(620.0);
+                    ui.spacing_mut().item_spacing.y = 8.0;
                     ui.heading(if st.installed {
                         "文件关联"
                     } else {
@@ -5495,11 +5593,127 @@ impl HayakuApp {
                     ui.separator();
                     ui.label(st.path.display().to_string());
                     ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("关联文件类型").color(p.ink).strong());
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("全不选").clicked() {
+                                for ext in EXTENSIONS {
+                                    self.install_selected.insert((*ext).to_owned(), false);
+                                }
+                            }
+                            if ui.button("全选").clicked() {
+                                for ext in EXTENSIONS {
+                                    self.install_selected.insert((*ext).to_owned(), true);
+                                }
+                            }
+                        });
+                    });
                     ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                         for ext in EXTENSIONS {
                             let checked =
                                 self.install_selected.entry((*ext).to_owned()).or_insert(false);
-                            ui.checkbox(checked, format!(".{ext}"));
+                            let tile_size = Vec2::new(108.0, 96.0);
+                            let (tile_rect, tile_resp) =
+                                ui.allocate_exact_size(tile_size, Sense::click());
+                            if tile_resp.hovered() {
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            let tile_fill = if *checked {
+                                Color32::from_rgba_unmultiplied(
+                                    p.accent.r(),
+                                    p.accent.g(),
+                                    p.accent.b(),
+                                    if tile_resp.hovered() { 48 } else { 30 },
+                                )
+                            } else if tile_resp.hovered() {
+                                p.side
+                            } else {
+                                p.code_bg
+                            };
+                            let tile_stroke = Stroke::new(
+                                if *checked { 1.5 } else { 1.0 },
+                                if *checked || tile_resp.hovered() {
+                                    p.accent
+                                } else {
+                                    p.line
+                                },
+                            );
+                            ui.painter().rect_filled(tile_rect, 8.0, tile_fill);
+                            ui.painter().rect_stroke(
+                                tile_rect,
+                                8.0,
+                                tile_stroke,
+                                StrokeKind::Inside,
+                            );
+
+                            let icon_rect = Rect::from_center_size(
+                                Pos2::new(tile_rect.center().x, tile_rect.top() + 31.0),
+                                Vec2::splat(44.0),
+                            );
+                            draw_format_icon(
+                                &self.format_icon_textures,
+                                ui.painter(),
+                                icon_rect,
+                                ext,
+                                p,
+                            );
+
+                            let ext_label = format!(".{ext}");
+                            let label_font = FontId::proportional(15.5);
+                            let label_galley = ui.painter().layout_no_wrap(
+                                ext_label,
+                                label_font,
+                                if *checked { p.ink } else { p.muted },
+                            );
+                            let box_sz = 14.0;
+                            let gap = 5.0;
+                            let row_w = box_sz + gap + label_galley.size().x;
+                            let start_x = tile_rect.center().x - row_w * 0.5;
+                            let row_cy = tile_rect.bottom() - 20.0;
+                            let check_rect = Rect::from_center_size(
+                                Pos2::new(start_x + box_sz * 0.5, row_cy),
+                                Vec2::splat(box_sz),
+                            );
+                            ui.painter().rect_filled(
+                                check_rect,
+                                3.0,
+                                if *checked { p.accent } else { p.surface },
+                            );
+                            ui.painter().rect_stroke(
+                                check_rect,
+                                3.0,
+                                Stroke::new(1.2, if *checked { p.accent } else { p.line }),
+                                StrokeKind::Inside,
+                            );
+                            if *checked {
+                                ui.painter().line_segment(
+                                    [
+                                        Pos2::new(check_rect.left() + 3.0, check_rect.center().y),
+                                        Pos2::new(check_rect.center().x - 0.5, check_rect.bottom() - 3.5),
+                                    ],
+                                    Stroke::new(1.8, p.accent_ink),
+                                );
+                                ui.painter().line_segment(
+                                    [
+                                        Pos2::new(check_rect.center().x - 0.5, check_rect.bottom() - 3.5),
+                                        Pos2::new(check_rect.right() - 2.8, check_rect.top() + 3.2),
+                                    ],
+                                    Stroke::new(1.8, p.accent_ink),
+                                );
+                            }
+                            ui.painter().galley(
+                                Pos2::new(
+                                    check_rect.right() + gap,
+                                    row_cy - label_galley.size().y * 0.5,
+                                ),
+                                label_galley,
+                                p.ink,
+                            );
+
+                            if tile_resp.clicked() {
+                                *checked = !*checked;
+                            }
                         }
                     });
                     ui.label(
@@ -7634,6 +7848,26 @@ fn paint_fixed_page_search_matches(
     }
 }
 
+fn draw_format_icon(
+    textures: &HashMap<String, TextureHandle>,
+    painter: &egui::Painter,
+    rect: Rect,
+    ext: &str,
+    p: Palette,
+) {
+    let key = ext.to_ascii_lowercase();
+    if let Some(tex) = textures.get(&key) {
+        painter.image(
+            tex.id(),
+            rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    } else {
+        draw_file_icon(painter, rect, ext, p);
+    }
+}
+
 fn draw_file_icon(painter: &egui::Painter, rect: Rect, ext: &str, p: Palette) {
     let badge_color = match ext.to_ascii_lowercase().as_str() {
         "pdf" => Color32::from_rgb(0xc9, 0x45, 0x3b),
@@ -7735,7 +7969,7 @@ fn draw_callout_bubble(
     p: Palette,
 ) -> bool {
     let screen = ctx.content_rect();
-    let bubble_w = (screen.width() - 24.0).clamp(240.0, 356.0);
+    let bubble_w = (screen.width() - 24.0).clamp(280.0, 460.0);
     let anchor_cx = anchor.center().x.clamp(screen.left() + 20.0, screen.right() - 20.0);
     let bubble_x = (anchor_cx - bubble_w * 0.5)
         .clamp(screen.left() + 12.0, (screen.right() - bubble_w - 12.0).max(12.0));
@@ -7784,9 +8018,9 @@ fn draw_callout_bubble(
                 })
                 .show(ui, |ui| {
                     ui.set_width(bubble_w - 28.0);
-                    ui.label(RichText::new(title).size(15.0).strong().color(p.ink));
+                    ui.label(RichText::new(title).size(21.0).strong().color(p.ink));
                     ui.add_space(6.0);
-                    ui.label(RichText::new(body).size(13.5).color(p.ink));
+                    ui.label(RichText::new(body).size(18.0).color(p.ink));
                     ui.add_space(10.0);
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         if ui
@@ -8101,6 +8335,49 @@ fn crop_rgba_png(
     Some(buf.into_inner())
 }
 
+fn truncate_to_width(
+    painter: &egui::Painter,
+    text: &str,
+    font: &FontId,
+    max_width: f32,
+) -> String {
+    if painter
+        .layout_no_wrap(text.to_owned(), font.clone(), Color32::TRANSPARENT)
+        .size()
+        .x
+        <= max_width
+    {
+        return text.to_owned();
+    }
+    if max_width <= 6.0 {
+        return "…".to_owned();
+    }
+    let bounds: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    if bounds.is_empty() {
+        return String::new();
+    }
+    let mut lo = 0usize;
+    let mut hi = bounds.len().saturating_sub(1);
+    let mut best = 0usize;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let candidate = format!("{}…", &text[..bounds[mid]]);
+        let w = painter
+            .layout_no_wrap(candidate, font.clone(), Color32::TRANSPARENT)
+            .size()
+            .x;
+        if w <= max_width {
+            best = mid;
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    format!("{}…", &text[..bounds[best]])
+}
+
 fn truncate_str(s: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for (i, ch) in s.chars().enumerate() {
@@ -8205,6 +8482,87 @@ fn install_system_fonts(ctx: &Context) {
         }
     }
     ctx.set_fonts(defs);
+}
+
+fn embedded_icon_bytes(ext: &str) -> Option<&'static [u8]> {
+    match ext {
+        "pdf" => Some(include_bytes!("../assets/icons/pdf.ico")),
+        "epub" => Some(include_bytes!("../assets/icons/epub.ico")),
+        "txt" => Some(include_bytes!("../assets/icons/txt.ico")),
+        "azw3" => Some(include_bytes!("../assets/icons/azw3.ico")),
+        "azw" => Some(include_bytes!("../assets/icons/azw.ico")),
+        "mobi" => Some(include_bytes!("../assets/icons/mobi.ico")),
+        "doc" => Some(include_bytes!("../assets/icons/doc.ico")),
+        "docx" => Some(include_bytes!("../assets/icons/docx.ico")),
+        "md" => Some(include_bytes!("../assets/icons/md.ico")),
+        "markdown" => Some(include_bytes!("../assets/icons/markdown.ico")),
+        "html" => Some(include_bytes!("../assets/icons/html.ico")),
+        "htm" => Some(include_bytes!("../assets/icons/htm.ico")),
+        "xhtml" => Some(include_bytes!("../assets/icons/xhtml.ico")),
+        "xml" => Some(include_bytes!("../assets/icons/xml.ico")),
+        _ => None,
+    }
+}
+
+fn extract_ico_png_frame(ico_bytes: &[u8], preferred_size: u16) -> Option<&[u8]> {
+    const PNG_SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if ico_bytes.len() < 6 {
+        return None;
+    }
+    let reserved = u16::from_le_bytes([ico_bytes[0], ico_bytes[1]]);
+    let icon_type = u16::from_le_bytes([ico_bytes[2], ico_bytes[3]]);
+    let count = usize::from(u16::from_le_bytes([ico_bytes[4], ico_bytes[5]]));
+    if reserved != 0 || icon_type != 1 || count == 0 || ico_bytes.len() < 6 + count * 16 {
+        return None;
+    }
+    let mut best_ge: Option<(u16, &[u8])> = None;
+    let mut best_any: Option<(u16, &[u8])> = None;
+    for i in 0..count {
+        let off = 6 + i * 16;
+        let w = if ico_bytes[off] == 0 {
+            256
+        } else {
+            u16::from(ico_bytes[off])
+        };
+        let size_len = u32::from_le_bytes(ico_bytes[off + 8..off + 12].try_into().ok()?) as usize;
+        let img_offset = u32::from_le_bytes(ico_bytes[off + 12..off + 16].try_into().ok()?) as usize;
+        let end = img_offset.checked_add(size_len)?;
+        if end > ico_bytes.len() {
+            continue;
+        }
+        let slice = &ico_bytes[img_offset..end];
+        if !slice.starts_with(PNG_SIG) {
+            continue;
+        }
+        if w >= preferred_size && best_ge.is_none_or(|(bw, _)| w < bw) {
+            best_ge = Some((w, slice));
+        }
+        if best_any.is_none_or(|(bw, _)| w > bw) {
+            best_any = Some((w, slice));
+        }
+    }
+    best_ge.or(best_any).map(|(_, slice)| slice)
+}
+
+fn load_format_icon_textures(ctx: &Context) -> HashMap<String, TextureHandle> {
+    let mut map = HashMap::new();
+    for ext in EXTENSIONS {
+        let Some(ico_bytes) = embedded_icon_bytes(ext) else {
+            continue;
+        };
+        let Some(png_bytes) = extract_ico_png_frame(ico_bytes, 48) else {
+            continue;
+        };
+        let Ok(img) = image::load_from_memory_with_format(png_bytes, image::ImageFormat::Png) else {
+            continue;
+        };
+        let rgba = img.to_rgba8();
+        let color_img =
+            ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw());
+        let tex = ctx.load_texture(format!("fmt_icon_{ext}"), color_img, TextureOptions::LINEAR);
+        map.insert((*ext).to_owned(), tex);
+    }
+    map
 }
 
 pub fn render_app_icon() -> Option<egui::IconData> {
@@ -8327,6 +8685,8 @@ mod tests {
             math_textures: HashMap::new(),
             image_textures: HashMap::new(),
             logo_texture: None,
+            format_icon_textures: HashMap::new(),
+            last_window_title: String::new(),
             status_msg: None,
             context_menu: None,
             link_warning: None,
@@ -8952,5 +9312,42 @@ mod tests {
             app.pending_jump.as_ref().and_then(|j| j.item_idx),
             Some(1)
         );
+    }
+
+    #[test]
+    fn embedded_format_icons_decode_cleanly() {
+        for ext in EXTENSIONS {
+            let bytes = embedded_icon_bytes(ext).expect("embedded icon bytes");
+            let png = extract_ico_png_frame(bytes, 48).expect("48px PNG frame in ICO");
+            let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+                .expect("decode PNG frame");
+            assert_eq!(img.width(), 48, "expected 48px icon width for {ext}");
+            assert_eq!(img.height(), 48, "expected 48px icon height for {ext}");
+        }
+    }
+
+    #[test]
+    fn truncate_to_width_fits_within_pixel_budget() {
+        let ctx = Context::default();
+        install_system_fonts(&ctx);
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 200.0))),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(raw, |ui| {
+            let font = FontId::proportional(13.5);
+            let short = truncate_to_width(ui.painter(), "短.pdf", &font, 200.0);
+            assert_eq!(short, "短.pdf");
+            let long_path = r"C:\Users\Reader\Documents\VeryLongFolderName\非常长的文件路径用于测试截断不会遮挡按钮\sample.epub";
+            let trimmed = truncate_to_width(ui.painter(), long_path, &font, 110.0);
+            assert!(trimmed.ends_with('…'));
+            let measured = ui
+                .painter()
+                .layout_no_wrap(trimmed, font, Color32::WHITE)
+                .size()
+                .x;
+            assert!(measured <= 110.5, "trimmed width {measured} exceeded 110.0");
+        });
+        out.drop_without_applying_deltas();
     }
 }
