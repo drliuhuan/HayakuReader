@@ -144,3 +144,9 @@ pub fn run(url: &str, app: Shared) -> Result<(), Box<dyn Error>> {
     let _ = poller.join();
     Ok(())
 }
+
+#[cfg(all(test, target_env = "msvc"))]
+#[test]
+fn executable_contains_the_application_icon() {
+    assert!(Icon::from_resource(1, None).is_ok());
+}
