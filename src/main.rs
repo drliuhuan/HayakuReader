@@ -423,6 +423,7 @@ struct ContentQuery {
     chapter: Option<usize>,
     encoding: Option<String>,
     raster: Option<bool>,
+    raw: Option<bool>,
 }
 
 fn parse_range(header: &str, len: u64) -> Option<std::result::Result<(u64, u64), ()>> {
@@ -558,10 +559,18 @@ async fn content(
                     formats::decode(&formats::read_bytes(path).map_err(bad)?, None).map_err(bad)?;
                 bytes("text/plain; charset=utf-8", text.into_bytes())
             }
-            Source::Markdown(path) => bytes(
-                "text/plain; charset=utf-8",
-                formats::markdown(path).map_err(bad)?.into_bytes(),
-            ),
+            Source::Markdown(path) => {
+                if query.raw.unwrap_or(false) {
+                    let text =
+                        formats::decode(&formats::read_bytes(path).map_err(bad)?, None).map_err(bad)?;
+                    bytes("text/plain; charset=utf-8", text.into_bytes())
+                } else {
+                    bytes(
+                        "text/plain; charset=utf-8",
+                        formats::markdown(path).map_err(bad)?.into_bytes(),
+                    )
+                }
+            }
             Source::Epub(zip, chapters, _) => {
                 let chapter = chapters
                     .get(query.chapter.unwrap_or(0))
@@ -701,6 +710,14 @@ async fn frontend(RoutePath(file): RoutePath<String>) -> Result<Response> {
         "word.js" => Ok(bytes(
             "text/javascript; charset=utf-8",
             include_bytes!("../ui/word.js").to_vec(),
+        )),
+        "theme-color.js" => Ok(bytes(
+            "text/javascript; charset=utf-8",
+            include_bytes!("../ui/theme-color.js").to_vec(),
+        )),
+        "code.js" => Ok(bytes(
+            "text/javascript; charset=utf-8",
+            include_bytes!("../ui/code.js").to_vec(),
         )),
         "reader.css" => Ok(bytes(
             "text/css; charset=utf-8",

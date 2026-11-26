@@ -1,4 +1,6 @@
-export function openWord(metadata, contentRoute, request, reader, scroll, onRender) {
+import { applySmartInvertToCanvas } from "/ui/theme-color.js";
+
+export function openWord(metadata, contentRoute, request, reader, scroll, onRender, shouldSmartInvert = () => false) {
   const firstWidth = Math.max(1, metadata.pages[0]?.[0] || 1);
   const entries = [];
   const measure = document.createElement("canvas").getContext("2d");
@@ -35,6 +37,27 @@ export function openWord(metadata, contentRoute, request, reader, scroll, onRend
     return entry.text;
   }
 
+  function paintCanvas(entry, index) {
+    if (!entry.bitmap || !entry.canvas) return;
+    const ctx = entry.canvas.getContext("2d", { willReadFrequently: true });
+    ctx.clearRect(0, 0, entry.canvas.width, entry.canvas.height);
+    ctx.drawImage(entry.bitmap, 0, 0);
+    if (shouldSmartInvert()) {
+      const [pw, ph] = metadata.pages[index];
+      const sx = entry.canvas.width / Math.max(1, pw);
+      const sy = entry.canvas.height / Math.max(1, ph);
+      const pageArea = Math.max(1, pw * ph);
+      const boxes = metadata.images?.[index] ?? [];
+      const hasFullPage = boxes.some(([, , w, h]) => w * h >= pageArea * 0.75);
+      const preserveRects = hasFullPage
+        ? []
+        : boxes
+            .filter(([, , w, h]) => w >= 8 && h >= 8)
+            .map(([x, y, w, h]) => ({ x: x * sx, y: y * sy, width: w * sx, height: h * sy }));
+      applySmartInvertToCanvas(entry.canvas, preserveRects);
+    }
+  }
+
   function render(index) {
     const entry = entries[index];
     if (!entry || closed) return Promise.resolve();
@@ -42,11 +65,17 @@ export function openWord(metadata, contentRoute, request, reader, scroll, onRend
       const [runs, response] = await Promise.all([getText(index), request(contentRoute(index) + "&raster=true")]);
       const blob = await response.blob();
       if (closed) return;
-      const picture = document.createElement("img");
-      picture.alt = "";
-      picture.draggable = false;
-      entry.url = URL.createObjectURL(blob);
-      picture.src = entry.url;
+      const bitmap = await createImageBitmap(blob);
+      if (closed) {
+        bitmap.close();
+        return;
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      entry.bitmap = bitmap;
+      entry.canvas = canvas;
+      paintCanvas(entry, index);
       const [width, height] = metadata.pages[index];
       const layer = document.createElement("div");
       layer.className = "word-text";
@@ -66,7 +95,7 @@ export function openWord(metadata, contentRoute, request, reader, scroll, onRend
         layer.append(span);
       }
       entry.layer = layer;
-      entry.element.replaceChildren(picture, layer);
+      entry.element.replaceChildren(canvas, layer);
       onRender();
     })().catch(error => {
       entry.pending = null;
@@ -91,6 +120,11 @@ export function openWord(metadata, contentRoute, request, reader, scroll, onRend
     count: metadata.pages.length,
     fit() { zoom = null; resize(); },
     zoom(by) { zoom = Math.max(.25, Math.min(5, scale() * by)); resize(); },
+    refreshTheme() {
+      for (const [index, entry] of entries.entries()) {
+        if (entry.bitmap && entry.canvas) paintCanvas(entry, index);
+      }
+    },
     async text(index) {
       const runs = await getText(index);
       return runs.map(run => (run.line_break ? "\n" : "") + run.text).join("");
@@ -99,7 +133,7 @@ export function openWord(metadata, contentRoute, request, reader, scroll, onRend
       closed = true;
       observer.disconnect();
       for (const entry of entries) {
-        if (entry.url) URL.revokeObjectURL(entry.url);
+        entry.bitmap?.close();
       }
     }
   };

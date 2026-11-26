@@ -3,6 +3,10 @@
   color-scheme: light;
   --paper: #fbfaf6; --side: #efeee6; --surface: #fffefa; --ink: #232b26;
   --muted: #59645e; --line: #dbded3; --accent: #285847; --accent-ink: #fff;
+  --code-bg: #f5f3ec; --code-gutter: #838d86; --code-border: #dcdad0;
+  --tok-comment: #768079; --tok-tag: #1b684b; --tok-attr: #9a5216; --tok-string: #2c6e91;
+  --tok-punct: #6d7570; --tok-heading: #195e44; --tok-keyword: #8d4375; --tok-code: #8f4719;
+  --tok-quote: #56635c; --tok-entity: #9c4b14; --tok-meta: #6e6496;
   --size: 19px; --leading: 1.8; --measure: 760px;
   font: 14px system-ui, "Microsoft YaHei UI", sans-serif;
 }
@@ -10,6 +14,10 @@
   color-scheme: dark;
   --paper: #202622; --side: #242e28; --surface: #29342d; --ink: #f0f3eb;
   --muted: #bdc9bd; --line: #46564b; --accent: #a9d7ba; --accent-ink: #15271c;
+  --code-bg: #181d1a; --code-gutter: #6f7f75; --code-border: #35423a;
+  --tok-comment: #7c8c82; --tok-tag: #7ad3a6; --tok-attr: #e5b567; --tok-string: #8bc6ec;
+  --tok-punct: #8ea095; --tok-heading: #8fe3b5; --tok-keyword: #d49cdb; --tok-code: #e8b07b;
+  --tok-quote: #a4b5ab; --tok-entity: #f0a875; --tok-meta: #b1a3eb;
 }
 [hidden] { display: none !important; }
 body { margin: 0; color: var(--ink); background: var(--paper); display: flex; height: 100dvh; }
@@ -88,10 +96,29 @@ main { position: relative; display: flex; flex-direction: column; flex: 1; min-w
 .flow table { border-collapse: collapse; }
 .flow th, .flow td { border: 1px solid var(--line); padding: .2em .55em; }
 .flow blockquote { margin-inline: 0; padding-inline-start: 1em; border-inline-start: 3px solid var(--line); }
+#reader.code-mode { max-width: min(1160px, calc(var(--measure) + 280px)); }
+.code-view { counter-reset: code-line; --gutter-ch: 4ch; background: var(--code-bg); border: 1px solid var(--code-border); border-radius: 10px; padding: 14px 0; font: 400 14px/1.65 ui-monospace, "Cascadia Code", "Consolas", monospace; overflow-x: auto; }
+.code-line { position: relative; min-height: 1.65em; padding: 0 18px 0 calc(var(--gutter-ch) + 22px); white-space: pre-wrap; overflow-wrap: anywhere; }
+.code-line::before { counter-increment: code-line; content: counter(code-line); position: absolute; left: 0; width: var(--gutter-ch); padding-right: 12px; text-align: right; color: var(--code-gutter); border-right: 1px solid var(--code-border); user-select: none; }
+.code-line:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.code-nl { white-space: normal; font-size: 0; }
+.tok-comment { color: var(--tok-comment); font-style: italic; }
+.tok-tag { color: var(--tok-tag); }
+.tok-attr { color: var(--tok-attr); }
+.tok-string { color: var(--tok-string); }
+.tok-punct { color: var(--tok-punct); }
+.tok-heading { color: var(--tok-heading); font-weight: 700; }
+.tok-keyword { color: var(--tok-keyword); font-weight: 600; }
+.tok-code { color: var(--tok-code); }
+.tok-quote { color: var(--tok-quote); font-style: italic; }
+.tok-entity { color: var(--tok-entity); }
+.tok-meta { color: var(--tok-meta); }
+.tok-strong { font-weight: 700; }
+.tok-em { font-style: italic; }
 #reader.fixed { min-width: max-content; padding: 18px 12px 64px; }
 .pdf-page { position: relative; margin: 0 auto 16px; background: white; box-shadow: 0 2px 8px #1b252329; }
 .pdf-page canvas { position: absolute; inset: 0; }
-.word-page > img { position: absolute; inset: 0; width: 100%; height: 100%; user-select: none; }
+.word-page > canvas { position: absolute; inset: 0; width: 100%; height: 100%; user-select: none; }
 .word-text { position: absolute; inset: 0 auto auto 0; transform-origin: top left; color: transparent; overflow: hidden; white-space: pre; cursor: text; }
 .word-text > span { position: absolute; font-family: sans-serif; line-height: 1; transform-origin: top left; }
 .word-text ::selection { background: #347ecc70; color: transparent; }
@@ -103,9 +130,7 @@ footer { justify-content: space-between; border-top: 1px solid var(--line); colo
 #selection-tools .swatch[data-highlight="green"] { background: #72c681; }
 #selection-tools .swatch[data-highlight="blue"] { background: #72b7ea; }
 #selection-tools .swatch[data-highlight="pink"] { background: #e98dc2; }
-:root[data-theme="dark"] .pdf-page canvas,
-:root[data-theme="dark"] .word-page > img { filter: invert(.88) hue-rotate(180deg); }
-:root[data-theme="dark"] .pdf-page { background: #1e211f; }
+:root[data-theme="dark"][data-smart-invert="true"] .pdf-page { background: #1e211f; }
 body.focus-mode .toolbar,
 body.focus-mode #document-tabs,
 body.focus-mode footer,

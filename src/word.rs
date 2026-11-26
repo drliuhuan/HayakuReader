@@ -1,6 +1,6 @@
 use docboss_core::{Block, Error};
 use docboss_font::FontDatabase;
-use docboss_layout::{GlyphRun, Layout};
+use docboss_layout::{GlyphRun, Item, Layout, Page};
 use docboss_render::Format;
 use serde::Serialize;
 use std::{
@@ -11,6 +11,7 @@ use std::{
 #[derive(Clone, Serialize)]
 pub struct Metadata {
     pub pages: Vec<[f32; 2]>,
+    pub images: Vec<Vec<[f32; 4]>>,
     pub outline: Vec<Heading>,
 }
 
@@ -53,6 +54,64 @@ fn system_fonts() -> FontDatabase {
     database
 }
 
+fn page_images(page: &Page) -> Vec<[f32; 4]> {
+    let mut stack: Vec<[f32; 6]> = vec![[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]];
+    let mut boxes = Vec::new();
+    for item in &page.items {
+        match item {
+            Item::TransformBegin(m) => {
+                let top = *stack.last().unwrap_or(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+                // [a, b, c, d, e, f] composes top * m
+                stack.push([
+                    top[0] * m[0] + top[2] * m[1],
+                    top[1] * m[0] + top[3] * m[1],
+                    top[0] * m[2] + top[2] * m[3],
+                    top[1] * m[2] + top[3] * m[3],
+                    top[0] * m[4] + top[2] * m[5] + top[4],
+                    top[1] * m[4] + top[3] * m[5] + top[5],
+                ]);
+            }
+            Item::TransformEnd => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+            }
+            Item::Image { rect, .. } | Item::Picture { rect, .. } => {
+                let m = *stack.last().unwrap_or(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+                let corners = [
+                    (rect.x, rect.y),
+                    (rect.x + rect.width, rect.y),
+                    (rect.x, rect.y + rect.height),
+                    (rect.x + rect.width, rect.y + rect.height),
+                ];
+                let mut min_x = f32::INFINITY;
+                let mut min_y = f32::INFINITY;
+                let mut max_x = f32::NEG_INFINITY;
+                let mut max_y = f32::NEG_INFINITY;
+                for (x, y) in corners {
+                    let tx = m[0] * x + m[2] * y + m[4];
+                    let ty = m[1] * x + m[3] * y + m[5];
+                    min_x = min_x.min(tx);
+                    min_y = min_y.min(ty);
+                    max_x = max_x.max(tx);
+                    max_y = max_y.max(ty);
+                }
+                let x = min_x.clamp(0.0, page.width);
+                let y = min_y.clamp(0.0, page.height);
+                let right = max_x.clamp(0.0, page.width);
+                let bottom = max_y.clamp(0.0, page.height);
+                let w = right - x;
+                let h = bottom - y;
+                if w > 0.0 && h > 0.0 {
+                    boxes.push([x, y, w, h]);
+                }
+            }
+            _ => {}
+        }
+    }
+    boxes
+}
+
 impl Word {
     pub fn open(path: &Path) -> Result<Self, String> {
         let data = crate::formats::read_bytes(path)?;
@@ -83,6 +142,7 @@ impl Word {
         if pages.is_empty() {
             return Err("Word 文件没有可显示的页面".into());
         }
+        let images = layout.pages.iter().map(page_images).collect::<Vec<_>>();
         let mut outline = Vec::new();
         for (number, block) in document
             .sections
@@ -118,7 +178,11 @@ impl Word {
             });
         }
         Ok(Self {
-            metadata: Metadata { pages, outline },
+            metadata: Metadata {
+                pages,
+                images,
+                outline,
+            },
             layout,
         })
     }

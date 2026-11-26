@@ -1,4 +1,6 @@
 import purify from "/vendor/purify.mjs";
+import { adaptCssColor } from "/ui/theme-color.js";
+import { renderCodeView } from "/ui/code.js";
 
 const $ = id => document.getElementById(id);
 const reader = $("reader");
@@ -33,7 +35,13 @@ let workspaceQueue = Promise.resolve();
 let started = false;
 let installDismissed = false;
 let drainingDrops = false;
+let rawBookRules = [];
+let lastSmartInvert = false;
 const textEncoder = new TextEncoder();
+
+function isSmartInvertActive() {
+  return $("theme").value === "dark" && $("smart-invert").checked;
+}
 
 async function request(url, options = {}) {
   const response = await fetch(url, { ...options, headers: { ...headers, ...options.headers } });
@@ -98,9 +106,10 @@ function units() {
   return Array.from(reader.querySelectorAll("#reader > [data-unit]"));
 }
 
-function contentRoute(index, encoding = "") {
+function contentRoute(index, encoding = "", raw = false) {
   const query = new URLSearchParams({ chapter: index });
   if (encoding) query.set("encoding", encoding);
+  if (raw) query.set("raw", "true");
   return sessionUrl("content") + "?" + query;
 }
 
@@ -124,15 +133,15 @@ function resourceUrl(path) {
   return "/resource/" + key + "/" + book.session + "?" + new URLSearchParams({ path });
 }
 
-function safeDeclarations(style) {
-  const declarations = [];
+function safePairs(style) {
+  const pairs = [];
   for (const property of safeStyle) {
     const value = style.getPropertyValue(property);
     if (value && /^[a-z0-9 #.,()%+-]+$/i.test(value) && !/(?:url|var|attr)\s*\(/i.test(value)) {
-      declarations.push(property + ":" + value);
+      pairs.push([property, value]);
     }
   }
-  return declarations;
+  return pairs;
 }
 
 async function readStyles(markup, base, index) {
@@ -155,11 +164,11 @@ async function readStyles(markup, base, index) {
     for (const rule of parsed.cssRules) {
       if (!(rule instanceof CSSStyleRule)) continue;
       if (/[{}@;]/.test(rule.selectorText)) continue;
-      const declarations = safeDeclarations(rule.style);
-      if (!declarations.length) continue;
+      const pairs = safePairs(rule.style);
+      if (!pairs.length) continue;
       const selector = rule.selectorText.replace(/#([^\s.#,:[\]>+~()]+)/g, "#user-content-$1");
       const scoped = /^(?:body|html|:root)$/i.test(selector) ? scope : scope + " :is(" + selector + ")";
-      rules.push(scoped + "{" + declarations.join(";") + "}");
+      rules.push({ selector: scoped, pairs });
     }
   }
   return rules;
@@ -167,6 +176,30 @@ async function readStyles(markup, base, index) {
 
 const bookStyles = new CSSStyleSheet();
 document.adoptedStyleSheets = [...document.adoptedStyleSheets, bookStyles];
+
+function applyFlowColors() {
+  const invert = isSmartInvertActive();
+  bookStyles.replaceSync("");
+  for (const rule of rawBookRules) {
+    const declarations = rule.pairs.map(([property, value]) => {
+      if (!invert) return property + ":" + value;
+      if (property === "color") return property + ":" + adaptCssColor(value, false);
+      if (property === "background-color") return property + ":" + adaptCssColor(value, true);
+      return property + ":" + value;
+    });
+    try {
+      bookStyles.insertRule(rule.selector + "{" + declarations.join(";") + "}", bookStyles.cssRules.length);
+    } catch { /* Skip malformed or unsupported rules. */ }
+  }
+  for (const element of reader.querySelectorAll("[data-orig-color]")) {
+    const original = element.dataset.origColor;
+    element.style.color = invert ? adaptCssColor(original, false) : original;
+  }
+  for (const element of reader.querySelectorAll("[data-orig-bg]")) {
+    const original = element.dataset.origBg;
+    element.style.backgroundColor = invert ? adaptCssColor(original, true) : original;
+  }
+}
 
 function addMarkup(target, markup, base, kind, index) {
   const parsed = purify.sanitize(markup, {
@@ -176,9 +209,15 @@ function addMarkup(target, markup, base, kind, index) {
     ALLOW_DATA_ATTR: false, SANITIZE_NAMED_PROPS: true
   });
   for (const element of parsed.querySelectorAll("[style]")) {
-    const declarations = safeDeclarations(element.style);
+    const pairs = safePairs(element.style);
     element.removeAttribute("style");
-    if (declarations.length) element.setAttribute("style", declarations.join(";"));
+    if (pairs.length) {
+      element.setAttribute("style", pairs.map(([p, v]) => p + ":" + v).join(";"));
+      for (const [property, value] of pairs) {
+        if (property === "color") element.dataset.origColor = value;
+        if (property === "background-color") element.dataset.origBg = value;
+      }
+    }
   }
   for (const image of parsed.querySelectorAll("img")) {
     const source = image.getAttribute("src");
@@ -225,16 +264,36 @@ function addHeadings(target, index) {
   }
 }
 
+function updateViewModeButton() {
+  const btn = $("view-mode");
+  const canToggle = Boolean(book && (book.kind === "markdown" || book.kind === "html"));
+  btn.hidden = !canToggle;
+  if (!canToggle) return;
+  const code = getState().viewMode === "code";
+  btn.textContent = code ? translate("渲染模式", "Rendered") : translate("代码模式", "Code");
+  btn.setAttribute("aria-pressed", String(code));
+}
+
 async function loadFlow() {
-  reader.className = "flow";
+  rawBookRules = [];
   if (book.kind === "text") {
+    reader.className = "flow";
     const pre = document.createElement("pre");
     pre.className = "plain-text";
     pre.dataset.unit = 0;
     pre.textContent = await (await request(contentRoute(0, getState().encoding))).text();
     reader.replaceChildren(pre);
+    bookStyles.replaceSync("");
     return;
   }
+  if ((book.kind === "markdown" || book.kind === "html") && getState().viewMode === "code") {
+    reader.className = "flow code-mode";
+    const source = await (await request(contentRoute(0, "", book.kind === "markdown"))).text();
+    reader.replaceChildren(renderCodeView(source, book.kind));
+    bookStyles.replaceSync("");
+    return;
+  }
+  reader.className = "flow";
   const chapters = book.chapters.length ? book.chapters : [{ path: "", title: book.title }];
   const markups = new Array(chapters.length);
   let nextChapter = 0;
@@ -257,11 +316,9 @@ async function loadFlow() {
     if (book.kind !== "epub" && !book.outline?.length) addHeadings(part, index);
     fragment.append(part);
   }
+  rawBookRules = rules;
   reader.replaceChildren(fragment);
-  bookStyles.replaceSync("");
-  for (const rule of rules) {
-    try { bookStyles.insertRule(rule, bookStyles.cssRules.length); } catch { /* Skip malformed or unsupported rules. */ }
-  }
+  applyFlowColors();
 }
 
 async function present(next) {
@@ -284,6 +341,7 @@ async function present(next) {
   picked = null;
   $("selection-tools").hidden = true;
   $("reader").replaceChildren();
+  rawBookRules = [];
   bookStyles.replaceSync("");
   $("reader").hidden = false;
   $("welcome").hidden = true;
@@ -293,19 +351,20 @@ async function present(next) {
   $("pdf-tools").hidden = !["pdf", "word"].includes(book.kind);
   $("encoding-label").hidden = book.kind !== "text";
   $("encoding").value = getState().encoding || "";
+  updateViewModeButton();
   for (const id of ["search-toggle", "bookmark", "page-note"]) $(id).disabled = true;
   restoring = true;
   try {
     if (book.kind === "pdf") {
       reader.className = "fixed";
       const { openPdf } = await import("/ui/pdf.js");
-      pdf = await openPdf(contentRoute(0), headers, reader, scroll, refreshHighlights);
+      pdf = await openPdf(contentRoute(0), headers, reader, scroll, refreshHighlights, isSmartInvertActive);
       contents = await pdf.outline().catch(() => []);
       $("page-number").max = pdf.count;
     } else if (book.kind === "word") {
       reader.className = "fixed";
       const { openWord } = await import("/ui/word.js");
-      pdf = openWord(book.word, contentRoute, request, reader, scroll, refreshHighlights);
+      pdf = openWord(book.word, contentRoute, request, reader, scroll, refreshHighlights, isSmartInvertActive);
       contents = book.word.outline;
       $("page-number").max = pdf.count;
     } else {
@@ -340,6 +399,7 @@ async function present(next) {
     if (documentTabs.has(book.id)) documentTabs.get(book.id).document = null;
     book = null;
     $("file-name").textContent = "";
+    $("view-mode").hidden = true;
     document.title = "HayakuReader";
     renderDocumentTabs();
     throw error;
@@ -436,6 +496,8 @@ async function closeDocumentTab(entry) {
     $("file-name").textContent = "";
     $("selection-tools").hidden = true;
     $("search-form").hidden = true;
+    $("view-mode").hidden = true;
+    rawBookRules = [];
     document.title = "HayakuReader";
     setSidebar(false);
     for (const id of ["search-toggle", "bookmark", "page-note"]) $(id).disabled = true;
@@ -930,13 +992,14 @@ function settingsValues() {
   return {
     ...Object.fromEntries(["theme", "font-size", "line-height", "text-width"].map(id => [id, $(id).value])),
     "restore-session": $("restore-session").checked,
+    "smart-invert": $("smart-invert").checked,
     "auto-update": $("auto-update").checked,
     "install-dismissed": installDismissed
   };
 }
 
 function applySettings(values) {
-  for (const id of ["restore-session", "auto-update"]) {
+  for (const id of ["restore-session", "smart-invert", "auto-update"]) {
     if (values?.[id] != null) $(id).checked = Boolean(values[id]);
   }
   for (const id of ["theme", "font-size", "line-height", "text-width"]) {
@@ -944,12 +1007,20 @@ function applySettings(values) {
   }
   const root = document.documentElement;
   root.dataset.theme = $("theme").value;
+  $("smart-invert-label").hidden = $("theme").value !== "dark";
+  const invert = isSmartInvertActive();
+  root.dataset.smartInvert = String(invert);
   root.style.setProperty("--size", $("font-size").value + "px");
   root.style.setProperty("--leading", $("line-height").value);
   root.style.setProperty("--measure", $("text-width").value + "px");
   $("font-size-val").textContent = $("font-size").value + "px";
   $("line-height-val").textContent = $("line-height").value;
   $("text-width-val").textContent = $("text-width").value + "px";
+  if (invert !== lastSmartInvert) {
+    lastSmartInvert = invert;
+    pdf?.refreshTheme?.();
+    if (book && !pdf) applyFlowColors();
+  }
 }
 
 for (const id of ["open-file", "welcome-open"]) {
@@ -1045,11 +1116,29 @@ for (const id of ["theme", "font-size", "line-height", "text-width"]) {
   $(id).addEventListener("input", () => applySettings());
   $(id).addEventListener("change", () => post("/api/settings", settingsValues()).catch(report));
 }
-for (const id of ["restore-session", "auto-update"]) {
-  $(id).addEventListener("change", () => post("/api/settings", settingsValues()).catch(report));
+for (const id of ["restore-session", "smart-invert", "auto-update"]) {
+  $(id).addEventListener("change", () => {
+    applySettings();
+    post("/api/settings", settingsValues()).catch(report);
+  });
 }
+$("view-mode").addEventListener("click", async () => {
+  if (!book || !["markdown", "html"].includes(book.kind)) return;
+  const position = activePosition();
+  getState().viewMode = getState().viewMode === "code" ? "rendered" : "code";
+  updateViewModeButton();
+  contents = [];
+  try {
+    await loadFlow();
+    await jump(position.index, null, "", position.fraction);
+    refreshHighlights();
+    updateProgress();
+    await renderSidebar();
+    save();
+  } catch (error) { report(error); }
+});
 $("reset-settings").addEventListener("click", () => {
-  applySettings({ "font-size": 19, "line-height": 1.8, "text-width": 760 });
+  applySettings({ "font-size": 19, "line-height": 1.8, "text-width": 760, "smart-invert": true });
   post("/api/settings", settingsValues()).catch(report);
   message(translate("已恢复默认阅读设置。", "Reading settings reset."));
 });
@@ -1305,7 +1394,9 @@ function localizeStaticUi() {
   labelText("encoding", "TXT encoding ");
   text('#encoding option[value=""]', "Auto");
   labelText("restore-session", "Restore tabs on startup");
+  labelText("smart-invert", "Smart page inversion");
   labelText("auto-update", "Install updates automatically");
+  updateViewModeButton();
   labelText("note-text", "Note ");
   labelText("color", "Color ");
   text('#color option[value="yellow"]', "Yellow");

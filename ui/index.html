@@ -31,6 +31,7 @@
       <button id="open-file" class="primary">打开文件</button>
       <strong id="file-name"></strong>
       <div class="tools">
+        <button type="button" id="view-mode" hidden>代码模式</button>
         <button id="search-toggle" disabled>搜索</button>
         <button id="bookmark" disabled>书签</button>
         <button id="page-note" disabled>笔记</button>
@@ -45,6 +46,7 @@
       <label>阅读宽度 <input id="text-width" type="range" min="480" max="1150" step="10" value="760"><output id="text-width-val">760px</output></label>
       <label id="encoding-label" hidden>TXT 编码 <select id="encoding"><option value="">自动</option><option value="utf-8">UTF-8</option><option value="utf-16le">UTF-16 LE</option><option value="utf-16be">UTF-16 BE</option><option value="gb18030">GB18030</option></select></label>
       <label><input id="restore-session" type="checkbox" checked>启动时恢复标签页</label>
+      <label id="smart-invert-label" hidden><input id="smart-invert" type="checkbox" checked>页面智能反色</label>
       <label id="auto-update-label" hidden><input id="auto-update" type="checkbox">自动安装更新</label>
       <div class="settings-actions">
         <button type="button" id="reset-settings">恢复默认</button>

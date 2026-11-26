@@ -1,8 +1,86 @@
 import * as pdfjs from "/vendor/pdf.mjs";
+import { applySmartInvertToCanvas } from "/ui/theme-color.js";
 
 pdfjs.GlobalWorkerOptions.workerSrc = "/vendor/pdf.worker.mjs";
 
-export async function openPdf(url, headers, reader, scroll, onRender) {
+function mulMatrix(m1, m2) {
+  return [
+    m1[0] * m2[0] + m1[2] * m2[1],
+    m1[1] * m2[0] + m1[3] * m2[1],
+    m1[0] * m2[2] + m1[2] * m2[3],
+    m1[1] * m2[2] + m1[3] * m2[3],
+    m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+    m1[1] * m2[4] + m1[3] * m2[5] + m1[5]
+  ];
+}
+
+function unitSquareRect(ctm, maxW, maxH) {
+  const corners = [[0, 0], [1, 0], [0, 1], [1, 1]];
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const [x, y] of corners) {
+    const tx = ctm[0] * x + ctm[2] * y + ctm[4];
+    const ty = ctm[1] * x + ctm[3] * y + ctm[5];
+    if (tx < minX) minX = tx;
+    if (ty < minY) minY = ty;
+    if (tx > maxX) maxX = tx;
+    if (ty > maxY) maxY = ty;
+  }
+  const x = Math.max(0, minX);
+  const y = Math.max(0, minY);
+  const right = Math.min(maxW, maxX);
+  const bottom = Math.min(maxH, maxY);
+  return { x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y) };
+}
+
+async function getInsertedImageRects(page, viewport, pixelRatio) {
+  try {
+    const opList = await page.getOperatorList();
+    const OPS = pdfjs.OPS;
+    const stack = [viewport.transform];
+    const rects = [];
+    const pageArea = Math.max(1, viewport.width * viewport.height);
+    const { fnArray, argsArray } = opList;
+    for (let i = 0; i < fnArray.length; i++) {
+      const fn = fnArray[i];
+      const args = argsArray[i];
+      if (fn === OPS.save) {
+        stack.push(stack[stack.length - 1]);
+      } else if (fn === OPS.restore) {
+        if (stack.length > 1) stack.pop();
+      } else if (fn === OPS.transform && args) {
+        stack[stack.length - 1] = mulMatrix(stack[stack.length - 1], args);
+      } else if (fn === OPS.paintFormXObjectBegin) {
+        const top = stack[stack.length - 1];
+        stack.push(Array.isArray(args?.[0]) ? mulMatrix(top, args[0]) : top);
+      } else if (fn === OPS.paintFormXObjectEnd) {
+        if (stack.length > 1) stack.pop();
+      } else if (
+        fn === OPS.paintImageXObject ||
+        fn === OPS.paintInlineImageXObject ||
+        fn === OPS.paintImageXObjectRepeat
+      ) {
+        const rect = unitSquareRect(stack[stack.length - 1], viewport.width, viewport.height);
+        if (rect.width * rect.height >= pageArea * 0.75) {
+          // Full-page scanned / image-based PDF: smart-invert the entire page.
+          return [];
+        }
+        if (rect.width >= 8 && rect.height >= 8) {
+          rects.push({
+            x: rect.x * pixelRatio,
+            y: rect.y * pixelRatio,
+            width: rect.width * pixelRatio,
+            height: rect.height * pixelRatio
+          });
+        }
+      }
+    }
+    return rects;
+  } catch {
+    return [];
+  }
+}
+
+export async function openPdf(url, headers, reader, scroll, onRender, shouldSmartInvert = () => false) {
   const task = pdfjs.getDocument({
     url, httpHeaders: headers, rangeChunkSize: 65536, cMapUrl: "/vendor/cmaps/", cMapPacked: true,
     standardFontDataUrl: "/vendor/standard_fonts/", wasmUrl: "/vendor/wasm/", iccUrl: "/vendor/iccs/",
@@ -61,9 +139,14 @@ export async function openPdf(url, headers, reader, scroll, onRender) {
       const text = new pdfjs.TextLayer({ textContentSource: page.streamTextContent(), container: layer, viewport });
       target.replaceChildren(canvas, layer);
       const raster = page.render({ canvas, viewport, transform: [pixelRatio, 0, 0, pixelRatio, 0, 0] });
+      const opsPromise = shouldSmartInvert()
+        ? getInsertedImageRects(page, viewport, pixelRatio)
+        : Promise.resolve([]);
       entry.cancel = () => { raster.cancel(); text.cancel(); };
-      await Promise.all([raster.promise, text.render()]);
-      if (!closed && version === revision) onRender();
+      const [, , preserveRects] = await Promise.all([raster.promise, text.render(), opsPromise]);
+      if (closed || version !== revision) return;
+      if (shouldSmartInvert()) applySmartInvertToCanvas(canvas, preserveRects);
+      onRender();
     })().catch(error => {
       if (!closed && version === revision) {
         entry.pending = null;
@@ -127,6 +210,7 @@ export async function openPdf(url, headers, reader, scroll, onRender) {
     fit() { zoom = null; reset(); },
     zoom(by) { zoom = Math.max(.25, Math.min(5, scale() * by)); reset(); },
     resize() { if (zoom === null) reset(); },
+    refreshTheme() { reset(); },
     async text(index) {
       const page = await document.getPage(index + 1);
       const data = await page.getTextContent();
