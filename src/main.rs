@@ -13,7 +13,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path as RoutePath, Query, State},
     http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use formats::{Chapter, OutlineEntry, Source};
 use serde::{Deserialize, Serialize};
@@ -223,6 +223,31 @@ async fn recent(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<Ve
             .cloned()
             .collect(),
     ))
+}
+
+async fn delete_recent(
+    State(app): State<Shared>,
+    RoutePath(id): RoutePath<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode> {
+    authorize(&headers, &app)?;
+    let next = {
+        let mut recent = app.recent.lock().map_err(internal)?;
+        recent.retain(|item| item.id != id);
+        recent.clone()
+    };
+    write_json(&app.data.join("recent.json"), &next).map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn clear_recent(State(app): State<Shared>, headers: HeaderMap) -> Result<StatusCode> {
+    authorize(&headers, &app)?;
+    {
+        let mut recent = app.recent.lock().map_err(internal)?;
+        recent.clear();
+    }
+    write_json(&app.data.join("recent.json"), &Vec::<Recent>::new()).map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn settings(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<Value>> {
@@ -863,7 +888,8 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .route("/", get(index))
         .route("/ui/{file}", get(frontend))
         .route("/vendor/{*file}", get(vendor))
-        .route("/api/recent", get(recent))
+        .route("/api/recent", get(recent).delete(clear_recent))
+        .route("/api/recent/{id}", delete(delete_recent))
         .route("/api/settings", get(settings).post(save_settings))
         .route("/api/workspace", get(workspace).post(save_workspace))
         .route("/api/open", post(open_book))
@@ -1011,6 +1037,49 @@ mod tests {
         let normalized = dunce_path(&file)?;
         assert!(!normalized.to_string_lossy().starts_with(r"\\?\"));
         assert!(normalized.is_file());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_and_clear_recent_updates_memory_and_disk() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let app = Arc::new(test_app(dir.path().to_path_buf()));
+        {
+            let mut recent = app.recent.lock().unwrap();
+            recent.push(Recent {
+                id: "id-1".into(),
+                path: PathBuf::from("a.pdf"),
+                digest: "d1".into(),
+            });
+            recent.push(Recent {
+                id: "id-2".into(),
+                path: PathBuf::from("b.epub"),
+                digest: "d2".into(),
+            });
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-hayaku-key", "test-secret".parse().unwrap());
+        assert_eq!(
+            delete_recent(
+                State(app.clone()),
+                RoutePath("id-1".into()),
+                headers.clone()
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        let stored: Vec<Recent> = read_json(&dir.path().join("recent.json"))?;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, "id-2");
+
+        assert_eq!(
+            clear_recent(State(app.clone()), headers).await.unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(app.recent.lock().unwrap().is_empty());
+        let cleared: Vec<Recent> = read_json(&dir.path().join("recent.json"))?;
+        assert!(cleared.is_empty());
         Ok(())
     }
 }

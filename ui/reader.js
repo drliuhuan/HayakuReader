@@ -13,6 +13,9 @@ let currentTab = "contents";
 let openBusy = false;
 let sideRevision = 0;
 let searchRevision = 0;
+let searchIndex = -1;
+let lastSearchQuery = "";
+let statusTimer;
 let saveTimer;
 let saveQueue = Promise.resolve();
 let picked = null;
@@ -48,8 +51,12 @@ function post(url, payload, keepalive = false) {
   });
 }
 
-function message(text = "") {
+function message(text = "", duration = 3200) {
+  clearTimeout(statusTimer);
   $("status").textContent = text;
+  if (text && duration > 0) {
+    statusTimer = setTimeout(() => { $("status").textContent = ""; }, duration);
+  }
 }
 
 function report(error) {
@@ -345,7 +352,7 @@ async function openDocument(payload = {}, file = null) {
   if (openBusy) return false;
   openBusy = true;
   for (const id of ["open-file", "welcome-open"]) $(id).disabled = true;
-  message("正在打开文件…");
+  message(translate("正在打开文件…", "Opening file…"), 0);
   try {
     const cached = payload.id && documentTabs.get(payload.id)?.document;
     if (cached && cached.id === book?.id) return true;
@@ -395,12 +402,20 @@ function renderDocumentTabs() {
     const select = document.createElement("button");
     select.setAttribute("role", "tab");
     select.setAttribute("aria-selected", String(active));
-    select.textContent = select.title = entry.title;
+    select.textContent = entry.title;
+    select.title = entry.title + (!entry.document ? translate("（已休眠，点击恢复）", " (Sleeping, click to resume)") : "");
     select.onclick = () => openDocument({ id: entry.id });
     const close = document.createElement("button");
     close.textContent = "×";
     close.setAttribute("aria-label", translate("关闭 ", "Close ") + entry.title);
     close.onclick = () => closeDocumentTab(entry).catch(report);
+    item.addEventListener("mousedown", event => { if (event.button === 1) event.preventDefault(); });
+    item.addEventListener("auxclick", event => {
+      if (event.button === 1) {
+        event.preventDefault();
+        closeDocumentTab(entry).catch(report);
+      }
+    });
     item.append(select, close);
     host.append(item);
   }
@@ -432,6 +447,7 @@ async function closeDocumentTab(entry) {
     await openDocument({ id: next.id });
   }
   renderDocumentTabs();
+  if (!book) renderWelcomeRecent().catch(() => {});
   await persistWorkspace();
 }
 
@@ -511,6 +527,7 @@ function updateProgress() {
   if (!restoring && reader.childElementCount) {
     scheduleSave();
   }
+  syncActiveToc(position.index);
 }
 
 async function jump(index, part = null, fragment = "", fraction = 0) {
@@ -650,10 +667,15 @@ function addAnnotation(annotation) {
   getState().annotations.push({ id: crypto.randomUUID(), ...annotation });
   document.getSelection()?.removeAllRanges();
   refreshHighlights();
-  currentTab = "notes";
-  setSidebar(true);
   save();
-  renderSidebar().catch(report);
+  if (annotation.kind !== "highlight") {
+    currentTab = "notes";
+    setSidebar(true);
+  }
+  if (!$("sidebar").hidden && currentTab === "notes") {
+    renderSidebar().catch(report);
+  }
+  message(translate("已保存批注。", "Annotation saved."));
 }
 
 function showEditor(annotation, existing = false) {
@@ -699,7 +721,7 @@ async function goAnnotation(annotation) {
   }
 }
 
-function sideRow(title, action, secondaryLabel, secondaryAction) {
+function sideRow(title, action, extras = [], host = $("side-list")) {
   const row = document.createElement("div");
   row.className = "side-row";
   const button = document.createElement("button");
@@ -707,13 +729,16 @@ function sideRow(title, action, secondaryLabel, secondaryAction) {
   button.title = title;
   button.addEventListener("click", () => Promise.resolve(action()).catch(report));
   row.append(button);
-  if (secondaryLabel) {
+  for (const extra of extras) {
     const secondary = document.createElement("button");
-    secondary.textContent = secondaryLabel;
-    secondary.addEventListener("click", secondaryAction);
+    secondary.textContent = extra.label;
+    if (extra.ariaLabel) secondary.setAttribute("aria-label", extra.ariaLabel);
+    if (extra.title) secondary.title = extra.title;
+    secondary.addEventListener("click", () => Promise.resolve(extra.action()).catch(report));
     row.append(secondary);
   }
-  $("side-list").append(row);
+  host.append(row);
+  return button;
 }
 
 function sideMessage(text) {
@@ -721,6 +746,77 @@ function sideMessage(text) {
   item.className = "side-message";
   item.textContent = text;
   $("side-list").append(item);
+}
+
+function syncActiveToc(unitIndex) {
+  if ($("sidebar").hidden || currentTab !== "contents") return;
+  const buttons = Array.from($("side-list").querySelectorAll("button[data-unit]"));
+  let active = null;
+  for (const button of buttons) {
+    button.removeAttribute("aria-current");
+    if (Number(button.dataset.unit) <= unitIndex) active = button;
+  }
+  if (active) active.setAttribute("aria-current", "true");
+}
+
+async function deleteRecentItem(id) {
+  await request("/api/recent/" + encodeURIComponent(id), { method: "DELETE" });
+  await Promise.all([
+    renderWelcomeRecent(),
+    currentTab === "recent" ? renderSidebar() : Promise.resolve()
+  ]);
+}
+
+async function clearRecentHistory() {
+  await request("/api/recent", { method: "DELETE" });
+  await Promise.all([
+    renderWelcomeRecent(),
+    currentTab === "recent" ? renderSidebar() : Promise.resolve()
+  ]);
+  message(translate("已清空阅读记录。", "Reading history cleared."));
+}
+
+async function renderWelcomeRecent() {
+  const items = await (await request("/api/recent")).json();
+  const section = $("welcome-recent");
+  const list = $("welcome-recent-list");
+  list.replaceChildren();
+  section.hidden = !items.length;
+  for (const item of items.slice(0, 5)) {
+    const label = item.path.split(/[\\/]/).at(-1);
+    sideRow(
+      label,
+      () => openDocument({ id: item.id }),
+      [{
+        label: "×",
+        ariaLabel: translate("删除记录 ", "Remove ") + label,
+        title: translate("删除记录", "Remove from history"),
+        action: () => deleteRecentItem(item.id)
+      }],
+      list
+    );
+  }
+}
+
+function exportAnnotations() {
+  if (!book) return;
+  const lines = ["# " + book.title, ""];
+  for (const item of getState().annotations) {
+    const kind = { bookmark: translate("书签", "Bookmark"), note: translate("笔记", "Note"), highlight: translate("高亮", "Highlight") }[item.kind] || item.kind;
+    lines.push("## " + kind + (item.color ? " (" + item.color + ")" : ""));
+    const excerpt = item.parts?.map(part => part.quote).join("\n");
+    if (excerpt) lines.push("> " + excerpt.replace(/\n/g, "\n> "));
+    if (item.text) lines.push("", item.text);
+    lines.push("");
+  }
+  const blob = new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = book.title + ".annotations.md";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  message(translate("已导出批注。", "Annotations exported."));
 }
 
 async function renderSidebar() {
@@ -732,42 +828,82 @@ async function renderSidebar() {
   if (currentTab === "recent") {
     const items = await (await request("/api/recent")).json();
     if (revision !== sideRevision) return;
-    if (!items.length) sideMessage("暂无阅读记录");
+    if (!items.length) sideMessage(translate("暂无阅读记录", "No recent files"));
+    else {
+      const actions = document.createElement("div");
+      actions.className = "side-actions";
+      const clear = document.createElement("button");
+      clear.textContent = translate("清空记录", "Clear history");
+      clear.addEventListener("click", () => clearRecentHistory().catch(report));
+      actions.append(clear);
+      $("side-list").append(actions);
+    }
     for (const item of items) {
       const label = item.path.split(/[\\/]/).at(-1);
-      sideRow(label, () => openDocument({ id: item.id }), "重新关联", () => openDocument({ relocate: item.id }));
+      sideRow(label, () => openDocument({ id: item.id }), [
+        { label: translate("重新关联", "Relocate"), action: () => openDocument({ relocate: item.id }) },
+        { label: "×", ariaLabel: translate("删除 ", "Remove ") + label, title: translate("删除记录", "Remove from history"), action: () => deleteRecentItem(item.id) }
+      ]);
     }
   } else if (currentTab === "contents") {
-    if (!contents.length) sideMessage("暂无目录");
-    for (const item of contents) sideRow(item.title, () => jump(item.index, null, item.fragment));
+    if (!contents.length) sideMessage(translate("暂无目录", "No table of contents"));
+    for (const item of contents) {
+      const button = sideRow(item.title, () => jump(item.index, null, item.fragment));
+      button.dataset.unit = item.index;
+    }
+    if (book) syncActiveToc(activePosition().index);
   } else if (currentTab === "notes") {
-    if (!book?.saved.annotations.length) sideMessage("暂无高亮、笔记或书签");
-    for (const item of book?.saved.annotations ?? []) {
-      const prefix = { bookmark: "书签", note: "笔记", highlight: "高亮" }[item.kind];
+    const annotations = book?.saved.annotations ?? [];
+    if (!annotations.length) sideMessage(translate("暂无高亮、笔记或书签", "No highlights, notes, or bookmarks"));
+    else {
+      const actions = document.createElement("div");
+      actions.className = "side-actions";
+      const exportBtn = document.createElement("button");
+      exportBtn.textContent = translate("导出批注 (.md)", "Export (.md)");
+      exportBtn.addEventListener("click", exportAnnotations);
+      actions.append(exportBtn);
+      $("side-list").append(actions);
+    }
+    for (const item of annotations) {
+      const prefix = { bookmark: translate("书签", "Bookmark"), note: translate("笔记", "Note"), highlight: translate("高亮", "Highlight") }[item.kind];
       const title = item.text || item.parts?.[0]?.quote || prefix;
-      sideRow(prefix + " · " + (item.missing ? "位置已失效 · " : "") + title, () => goAnnotation(item), "编辑", () => showEditor(item, true));
+      sideRow(prefix + " · " + (item.missing ? translate("位置已失效 · ", "Location lost · ") : "") + title, () => goAnnotation(item), [
+        { label: translate("编辑", "Edit"), action: () => showEditor(item, true) }
+      ]);
     }
   } else {
-    if (!results.length) sideMessage("没有匹配结果");
-    for (const result of results) {
-      sideRow(result.label, async () => {
-        await jump(result.index, result);
-        const range = locate(result);
-        if (range && CSS.highlights) CSS.highlights.set("hayaku-search", new Highlight(range));
-      });
+    if (!results.length) sideMessage(translate("没有匹配结果", "No matches"));
+    for (const [index, result] of results.entries()) {
+      sideRow(result.label, () => showSearchMatch(index));
     }
   }
+}
+
+async function showSearchMatch(index) {
+  if (!results.length) {
+    searchIndex = -1;
+    $("search-count").textContent = "0 / 0";
+    CSS.highlights?.delete("hayaku-search");
+    return;
+  }
+  searchIndex = ((index % results.length) + results.length) % results.length;
+  $("search-count").textContent = (searchIndex + 1) + " / " + results.length;
+  const result = results[searchIndex];
+  await jump(result.index, result);
+  const range = locate(result);
+  if (range && CSS.highlights) CSS.highlights.set("hayaku-search", new Highlight(range));
 }
 
 async function find(query) {
   query = query.trim();
   if (!book || !query) return;
+  lastSearchQuery = query;
   const revision = ++searchRevision;
   const activeBook = book;
   const found = [];
   const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const expression = new RegExp(escaped, "giu");
-  message("正在搜索…");
+  message(translate("正在搜索…", "Searching…"), 0);
   for (const element of units()) {
     const index = Number(element.dataset.unit);
     const text = pdf ? await pdf.text(index) : element.textContent;
@@ -784,24 +920,24 @@ async function find(query) {
     if (found.length >= 300) break;
   }
   results = found;
-  currentTab = "search";
-  $("sidebar").hidden = false;
-  $("toggle-sidebar").setAttribute("aria-expanded", "true");
-  await renderSidebar();
-  message(found.length === 300 ? "显示前 300 条结果。" : "找到 " + found.length + " 条结果。");
+  searchIndex = -1;
+  await showSearchMatch(0);
+  if (!$("sidebar").hidden && currentTab === "search") await renderSidebar();
+  message(found.length === 300 ? translate("显示前 300 条结果。", "Showing first 300 results.") : translate("找到 " + found.length + " 条结果。", "Found " + found.length + " matches."));
 }
 
 function settingsValues() {
   return {
     ...Object.fromEntries(["theme", "font-size", "line-height", "text-width"].map(id => [id, $(id).value])),
     "restore-session": $("restore-session").checked,
+    "pdf-dark": $("pdf-dark").checked,
     "auto-update": $("auto-update").checked,
     "install-dismissed": installDismissed
   };
 }
 
 function applySettings(values) {
-  for (const id of ["restore-session", "auto-update"]) {
+  for (const id of ["restore-session", "pdf-dark", "auto-update"]) {
     if (values?.[id] != null) $(id).checked = Boolean(values[id]);
   }
   for (const id of ["theme", "font-size", "line-height", "text-width"]) {
@@ -809,9 +945,13 @@ function applySettings(values) {
   }
   const root = document.documentElement;
   root.dataset.theme = $("theme").value;
+  root.dataset.pdfDark = String($("pdf-dark").checked);
   root.style.setProperty("--size", $("font-size").value + "px");
   root.style.setProperty("--leading", $("line-height").value);
   root.style.setProperty("--measure", $("text-width").value + "px");
+  $("font-size-val").textContent = $("font-size").value + "px";
+  $("line-height-val").textContent = $("line-height").value;
+  $("text-width-val").textContent = $("text-width").value + "px";
 }
 
 for (const id of ["open-file", "welcome-open"]) {
@@ -837,11 +977,33 @@ $("search-toggle").addEventListener("click", () => {
 });
 $("search-close").addEventListener("click", () => {
   $("search-form").hidden = true;
+  results = [];
+  searchIndex = -1;
+  lastSearchQuery = "";
+  $("search-count").textContent = "";
   CSS.highlights?.delete("hayaku-search");
 });
+$("search-prev").addEventListener("click", () => showSearchMatch(searchIndex - 1).catch(report));
+$("search-next").addEventListener("click", () => showSearchMatch(searchIndex + 1).catch(report));
 $("search-form").addEventListener("submit", event => {
   event.preventDefault();
-  find($("query").value).catch(report);
+  const query = $("query").value.trim();
+  if (query && query === lastSearchQuery && results.length) {
+    showSearchMatch(searchIndex + 1).catch(report);
+  } else {
+    find(query).catch(report);
+  }
+});
+$("query").addEventListener("keydown", event => {
+  if (event.key === "Enter" && event.shiftKey) {
+    event.preventDefault();
+    const query = $("query").value.trim();
+    if (query && query === lastSearchQuery && results.length) {
+      showSearchMatch(searchIndex - 1).catch(report);
+    } else {
+      find(query).catch(report);
+    }
+  }
 });
 $("bookmark").addEventListener("click", () => {
   const position = activePosition();
@@ -852,11 +1014,13 @@ $("page-note").addEventListener("click", () => {
 });
 $("selection-tools").addEventListener("pointerdown", event => event.preventDefault());
 $("copy").addEventListener("click", () => {
-  if (picked) navigator.clipboard.writeText(picked.text).then(() => message("已复制选中文字。")).catch(report);
+  if (picked) navigator.clipboard.writeText(picked.text).then(() => message(translate("已复制选中文字。", "Copied to clipboard."))).catch(report);
 });
-$("highlight").addEventListener("click", () => {
-  if (picked) addAnnotation({ kind: "highlight", color: "yellow", parts: picked.parts });
-});
+for (const swatch of document.querySelectorAll("[data-highlight]")) {
+  swatch.addEventListener("click", () => {
+    if (picked) addAnnotation({ kind: "highlight", color: swatch.dataset.highlight, parts: picked.parts });
+  });
+}
 $("selection-note").addEventListener("click", () => {
   if (picked) showEditor({ kind: "note", parts: picked.parts, color: "yellow" });
 });
@@ -883,9 +1047,148 @@ for (const id of ["theme", "font-size", "line-height", "text-width"]) {
   $(id).addEventListener("input", () => applySettings());
   $(id).addEventListener("change", () => post("/api/settings", settingsValues()).catch(report));
 }
-for (const id of ["restore-session", "auto-update"]) {
+for (const id of ["restore-session", "pdf-dark", "auto-update"]) {
   $(id).addEventListener("change", () => post("/api/settings", settingsValues()).catch(report));
 }
+$("reset-settings").addEventListener("click", () => {
+  applySettings({ "font-size": 19, "line-height": 1.8, "text-width": 760, "pdf-dark": false });
+  post("/api/settings", settingsValues()).catch(report);
+  message(translate("已恢复默认阅读设置。", "Reading settings reset."));
+});
+document.addEventListener("click", event => {
+  const settings = $("settings");
+  if (!settings.hidden && !settings.contains(event.target) && !$("settings-toggle").contains(event.target)) {
+    settings.hidden = true;
+    $("settings-toggle").setAttribute("aria-expanded", "false");
+  }
+});
+reader.addEventListener("click", event => {
+  if (!book || event.target.closest("a[href]") || !getSelection().isCollapsed) return;
+  const element = event.target.closest("#reader > [data-unit]");
+  const root = element && textRoot(element);
+  if (!root) return;
+  let caretNode = null;
+  let caretOffset = 0;
+  if (document.caretRangeFromPoint) {
+    const caret = document.caretRangeFromPoint(event.clientX, event.clientY);
+    if (caret) {
+      caretNode = caret.startContainer;
+      caretOffset = caret.startOffset;
+    }
+  } else if (document.caretPositionFromPoint) {
+    const pos = document.caretPositionFromPoint(event.clientX, event.clientY);
+    if (pos) {
+      caretNode = pos.offsetNode;
+      caretOffset = pos.offset;
+    }
+  }
+  if (!caretNode || !root.contains(caretNode)) return;
+  const unitIndex = Number(element.dataset.unit);
+  for (const annotation of getState().annotations) {
+    for (const part of annotation.parts ?? []) {
+      if (part.index !== unitIndex) continue;
+      const range = locate(part);
+      if (range && range.isPointInRange(caretNode, caretOffset)) {
+        showEditor(annotation, true);
+        return;
+      }
+    }
+  }
+});
+let wheelSaveTimer;
+scroll.addEventListener("wheel", event => {
+  if (!event.ctrlKey || !book) return;
+  event.preventDefault();
+  if (pdf) {
+    changeZoom(() => pdf.zoom(event.deltaY < 0 ? 1.12 : 1 / 1.12));
+  } else {
+    const slider = $("font-size");
+    const next = Math.max(Number(slider.min), Math.min(Number(slider.max), Number(slider.value) + (event.deltaY < 0 ? 1 : -1)));
+    if (next !== Number(slider.value)) {
+      applySettings({ "font-size": next });
+      clearTimeout(wheelSaveTimer);
+      wheelSaveTimer = setTimeout(() => post("/api/settings", settingsValues()).catch(report), 300);
+    }
+  }
+}, { passive: false });
+document.addEventListener("keydown", event => {
+  if (document.querySelector("dialog[open]")) return;
+  const ctrl = event.ctrlKey || event.metaKey;
+  const inInput = event.target.matches("input, textarea, select") || event.target.isContentEditable;
+  if (ctrl && event.key.toLowerCase() === "o") {
+    event.preventDefault();
+    openDocument().then(opened => { if (opened) drainDropped().catch(report); });
+    return;
+  }
+  if (ctrl && event.key.toLowerCase() === "f" && book) {
+    event.preventDefault();
+    $("search-form").hidden = false;
+    $("query").focus();
+    $("query").select();
+    return;
+  }
+  if (ctrl && event.key.toLowerCase() === "b") {
+    event.preventDefault();
+    setSidebar($("sidebar").hidden);
+    if (!$("sidebar").hidden) renderSidebar().catch(report);
+    return;
+  }
+  if (ctrl && event.key.toLowerCase() === "w" && book && documentTabs.has(book.id)) {
+    event.preventDefault();
+    closeDocumentTab(documentTabs.get(book.id)).catch(report);
+    return;
+  }
+  if (ctrl && event.key === "Tab" && documentTabs.size > 1) {
+    event.preventDefault();
+    const list = [...documentTabs.values()];
+    const currentIndex = list.findIndex(entry => entry.id === book?.id);
+    const nextIndex = (currentIndex + (event.shiftKey ? -1 : 1) + list.length) % list.length;
+    openDocument({ id: list[nextIndex].id });
+    return;
+  }
+  if (event.key === "F11" && book) {
+    event.preventDefault();
+    document.body.classList.toggle("focus-mode");
+    return;
+  }
+  if (ctrl && (event.key === "+" || event.key === "=" || event.key === "-" || event.key === "0") && book) {
+    event.preventDefault();
+    if (pdf) {
+      if (event.key === "0") changeZoom(() => pdf.fit());
+      else changeZoom(() => pdf.zoom(event.key === "-" ? 1 / 1.2 : 1.2));
+    } else {
+      const next = event.key === "0" ? 19 : Math.max(14, Math.min(32, Number($("font-size").value) + (event.key === "-" ? -1 : 1)));
+      applySettings({ "font-size": next });
+      post("/api/settings", settingsValues()).catch(report);
+    }
+    return;
+  }
+  if (event.key === "Escape") {
+    if (document.body.classList.contains("focus-mode")) {
+      document.body.classList.remove("focus-mode");
+    } else if (!$("settings").hidden) {
+      $("settings").hidden = true;
+      $("settings-toggle").setAttribute("aria-expanded", "false");
+    } else if (!$("search-form").hidden) {
+      $("search-close").click();
+    } else if (!$("selection-tools").hidden) {
+      $("selection-tools").hidden = true;
+      getSelection()?.removeAllRanges();
+    }
+    return;
+  }
+  if (inInput || !book) return;
+  if (event.key.toLowerCase() === "b") {
+    event.preventDefault();
+    $("bookmark").click();
+  } else if (pdf && (event.key === "ArrowLeft" || event.key === "PageUp")) {
+    event.preventDefault();
+    jump(Math.max(0, activePosition().index - 1)).catch(report);
+  } else if (pdf && (event.key === "ArrowRight" || event.key === "PageDown")) {
+    event.preventDefault();
+    jump(Math.min(pdf.count - 1, activePosition().index + 1)).catch(report);
+  }
+});
 $("encoding").addEventListener("change", async () => {
   if (book?.kind !== "text") return;
   getState().encoding = $("encoding").value;
@@ -972,6 +1275,8 @@ function localizeStaticUi() {
   $("query").placeholder = "Search text";
   $("query").setAttribute("aria-label", "Search text");
   text('#search-form button[type="submit"]', "Find");
+  $("search-prev").setAttribute("aria-label", "Previous match");
+  $("search-next").setAttribute("aria-label", "Next match");
   $("search-close").textContent = "Close";
   $("previous").setAttribute("aria-label", "Previous page");
   $("page-number").setAttribute("aria-label", "Go to page");
@@ -980,12 +1285,19 @@ function localizeStaticUi() {
   $("fit").textContent = "Fit width";
   $("zoom-in").setAttribute("aria-label", "Zoom in");
   $("copy").textContent = "Copy";
-  $("highlight").textContent = "Highlight";
+  document.querySelector('[data-highlight="yellow"]')?.setAttribute("aria-label", "Yellow highlight");
+  document.querySelector('[data-highlight="green"]')?.setAttribute("aria-label", "Green highlight");
+  document.querySelector('[data-highlight="blue"]')?.setAttribute("aria-label", "Blue highlight");
+  document.querySelector('[data-highlight="pink"]')?.setAttribute("aria-label", "Pink highlight");
+  for (const swatch of document.querySelectorAll("[data-highlight]")) swatch.title = swatch.getAttribute("aria-label");
   $("selection-note").textContent = "Note";
   $("delete-note").textContent = "Delete";
   text('#editor button[value="cancel"]', "Cancel");
   text('#editor button[value="save"]', "Save");
   $("check-updates").textContent = "Check for updates";
+  $("reset-settings").textContent = "Reset defaults";
+  $("welcome-recent-title").textContent = "Recent";
+  $("welcome-clear-recent").textContent = "Clear history";
   labelText("theme", "Theme ");
   text('#theme option[value="light"]', "Light");
   text('#theme option[value="dark"]', "Dark");
@@ -995,6 +1307,7 @@ function localizeStaticUi() {
   labelText("encoding", "TXT encoding ");
   text('#encoding option[value=""]', "Auto");
   labelText("restore-session", "Restore tabs on startup");
+  labelText("pdf-dark", "Invert pages in dark mode");
   labelText("auto-update", "Install updates automatically");
   labelText("note-text", "Note ");
   labelText("color", "Color ");
@@ -1004,22 +1317,14 @@ function localizeStaticUi() {
   text('#color option[value="pink"]', "Pink");
 }
 
-async function start() {
-  if (!key) { message("请从 HayakuReader 启动阅读窗口。"); return; }
-  document.documentElement.lang = english ? "en" : "zh-CN";
-  localizeStaticUi();
-  const language = english ? "en" : "zh";
-  const project = isDesktop
-    ? request("/api/project?lang=" + language).then(response => response.json()).then(value => value.html).catch(() => "")
-    : Promise.resolve("");
-  const local = request("/api/project/local?lang=" + language).then(response => response.text()).catch(() => "");
-  const release = isDesktop ? request("/api/release").then(response => response.json()).catch(() => null) : Promise.resolve(null);
-  const splash = new Promise(resolve => setTimeout(resolve, isDesktop ? 3000 : 0));
-  const preferences = request("/api/settings").then(response => response.json());
-  const workspace = request("/api/workspace").then(response => response.json());
-  const installState = isDesktop ? request("/api/installation").then(response => response.json()) : Promise.resolve(null);
-  const remoteIntro = await Promise.race([project, splash.then(() => "")]);
-  const intro = remoteIntro || await local;
+function hideSplash() {
+  const splash = $("splash");
+  if (splash.hidden || splash.classList.contains("fading")) return;
+  splash.classList.add("fading");
+  setTimeout(() => { splash.hidden = true; }, 220);
+}
+
+function renderIntro(intro) {
   $("project-intro").replaceChildren(purify.sanitize(intro, {
     RETURN_DOM_FRAGMENT: true,
     ALLOWED_TAGS: ["h1", "h2", "p", "ul", "ol", "li", "strong", "em", "code", "a"],
@@ -1041,29 +1346,89 @@ async function start() {
       link.removeAttribute("href");
     }
   }
-  await splash;
-  $("splash").hidden = true;
-  const settings = await preferences;
-  applySettings(settings);
-  installDismissed = Boolean(settings?.["install-dismissed"]);
-  installation = await installState;
-  if (installation) {
-    $("association-settings").hidden = installation.installationExists && !installation.installed;
-    $("association-settings").textContent = installation.installed
-      ? translate("文件关联", "File associations") : translate("安装", "Install");
-    $("auto-update-label").hidden = !installation.installed;
-    $("check-updates").hidden = false;
-  }
-  const saved = await workspace;
-  if ($("restore-session").checked && saved?.tabs) {
-    for (const entry of saved.tabs) documentTabs.set(entry.id, { ...entry, document: null });
-    renderDocumentTabs();
-  }
-  await renderSidebar();
-  if (new URLSearchParams(location.search).has("open")) {
-    await openDocument({ initial: true });
-  } else if ($("restore-session").checked && saved?.active && documentTabs.has(saved.active)) {
-    await openDocument({ id: saved.active });
+}
+
+$("welcome-clear-recent").addEventListener("click", () => clearRecentHistory().catch(report));
+
+async function start() {
+  if (!key) { message("请从 HayakuReader 启动阅读窗口。"); return; }
+  document.documentElement.lang = english ? "en" : "zh-CN";
+  localizeStaticUi();
+  const hasOpen = new URLSearchParams(location.search).has("open");
+  const language = english ? "en" : "zh";
+  const project = isDesktop
+    ? request("/api/project?lang=" + language).then(response => response.json()).then(value => value.html).catch(() => "")
+    : Promise.resolve("");
+  const local = request("/api/project/local?lang=" + language).then(response => response.text()).catch(() => "");
+  const release = isDesktop ? request("/api/release").then(response => response.json()).catch(() => null) : Promise.resolve(null);
+  const preferences = request("/api/settings").then(response => response.json());
+  const workspace = request("/api/workspace").then(response => response.json());
+  const installState = isDesktop ? request("/api/installation").then(response => response.json()) : Promise.resolve(null);
+
+  let skipSplash = () => {};
+  const splash = new Promise(resolve => {
+    const timer = setTimeout(resolve, isDesktop && !hasOpen ? 3000 : 0);
+    skipSplash = () => { clearTimeout(timer); resolve(); };
+  });
+  $("splash").addEventListener("click", skipSplash, { once: true });
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape" && !$("splash").hidden) skipSplash();
+  }, { once: true });
+
+  if (hasOpen) {
+    const settings = await preferences;
+    applySettings(settings);
+    installDismissed = Boolean(settings?.["install-dismissed"]);
+    installation = await installState;
+    if (installation) {
+      $("association-settings").hidden = installation.installationExists && !installation.installed;
+      $("association-settings").textContent = installation.installed
+        ? translate("文件关联", "File associations") : translate("安装", "Install");
+      $("auto-update-label").hidden = !installation.installed;
+      $("check-updates").hidden = false;
+    }
+    const saved = await workspace;
+    if ($("restore-session").checked && saved?.tabs) {
+      for (const entry of saved.tabs) documentTabs.set(entry.id, { ...entry, document: null });
+      renderDocumentTabs();
+    }
+    try {
+      await openDocument({ initial: true });
+    } finally {
+      hideSplash();
+    }
+    Promise.race([project, new Promise(resolve => setTimeout(() => resolve(""), 2500))])
+      .then(async remote => renderIntro(remote || await local))
+      .catch(() => {});
+    renderWelcomeRecent().catch(() => {});
+    await renderSidebar();
+  } else {
+    const remoteIntro = await Promise.race([project, splash.then(() => "")]);
+    const intro = remoteIntro || await local;
+    renderIntro(intro);
+    await splash;
+    hideSplash();
+    const settings = await preferences;
+    applySettings(settings);
+    installDismissed = Boolean(settings?.["install-dismissed"]);
+    installation = await installState;
+    if (installation) {
+      $("association-settings").hidden = installation.installationExists && !installation.installed;
+      $("association-settings").textContent = installation.installed
+        ? translate("文件关联", "File associations") : translate("安装", "Install");
+      $("auto-update-label").hidden = !installation.installed;
+      $("check-updates").hidden = false;
+    }
+    const saved = await workspace;
+    if ($("restore-session").checked && saved?.tabs) {
+      for (const entry of saved.tabs) documentTabs.set(entry.id, { ...entry, document: null });
+      renderDocumentTabs();
+    }
+    renderWelcomeRecent().catch(() => {});
+    await renderSidebar();
+    if ($("restore-session").checked && saved?.active && documentTabs.has(saved.active)) {
+      await openDocument({ id: saved.active });
+    }
   }
   started = true;
   if (installation && !installation.installationExists && !installDismissed) showInstallation();
@@ -1134,7 +1499,7 @@ async function installUpdate() {
   $("update-progress").value = 0;
   $("update-speed").textContent = "0% · 0 B/s";
   $("manual-download").hidden = true;
-  message(translate("正在下载并验证更新…", "Downloading and verifying update…"));
+  message(translate("正在下载并验证更新…", "Downloading and verifying update…"), 0);
   const poll = setInterval(async () => {
     try {
       const progress = await (await request("/api/release/progress")).json();
@@ -1159,7 +1524,7 @@ async function installUpdate() {
 }
 
 function showUpdateFailure(error) {
-  message(translate("更新失败：", "Update failed: ") + error.message);
+  message(translate("更新失败：", "Update failed: ") + error.message, 0);
   $("update-transfer").hidden = false;
   $("update-progress").hidden = true;
   $("update-speed").textContent = "";

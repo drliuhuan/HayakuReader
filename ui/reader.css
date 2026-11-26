@@ -28,7 +28,8 @@ a { color: var(--accent); }
 .brand-mark.large { width: 54px; height: 54px; font-size: 36px; border-radius: 14px; }
 .brand-logo { width: 30px; height: 30px; }
 .large-logo { width: 56px; height: 56px; }
-#splash { position: fixed; inset: 0; z-index: 99; display: grid; align-content: center; justify-items: center; background: var(--paper); text-align: center; }
+#splash { position: fixed; inset: 0; z-index: 99; display: grid; align-content: center; justify-items: center; background: var(--paper); text-align: center; transition: opacity .22s ease; }
+#splash.fading { opacity: 0; pointer-events: none; }
 #splash img { width: 80px; height: 80px; }
 #splash h1 { margin: 14px 0 6px; font-size: 36px; }
 #splash p { margin: 4px 0; color: var(--muted); }
@@ -47,22 +48,37 @@ nav { display: flex; padding: 6px 12px; gap: 4px; }
 nav button { flex: 1; border-color: transparent; background: transparent; padding-inline: .4rem; }
 nav button[aria-pressed="true"] { background: var(--surface); border-color: var(--line); }
 .side-list { overflow: auto; padding: 8px 12px; }
+.side-actions { display: flex; justify-content: flex-end; gap: 6px; margin-bottom: 8px; }
+.side-actions button { padding: .35rem .6rem; font-size: .88rem; }
 .side-row { display: flex; gap: 5px; margin-bottom: 6px; }
 .side-row button:first-child { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.side-row button[aria-current="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--surface)); font-weight: 600; }
 .side-message { color: var(--muted); padding: 0 6px; }
-main { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+main { position: relative; display: flex; flex-direction: column; flex: 1; min-width: 0; }
 .toolbar, footer { min-height: 56px; padding: 10px 16px; display: flex; align-items: center; gap: 8px; background: var(--surface); }
 .toolbar { min-height: 64px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
 #file-name { flex: 1; min-width: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tools, #pdf-tools { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .panel { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; padding: 9px 16px; border-bottom: 1px solid var(--line); background: var(--surface); }
 .panel label { display: flex; align-items: center; gap: 7px; }
-#status:not(:empty) { padding: 6px 16px; color: var(--accent); background: var(--surface); border-bottom: 1px solid var(--line); }
+#settings { position: fixed; top: 64px; right: 16px; z-index: 30; width: min(360px, 92vw); flex-direction: column; align-items: stretch; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; box-shadow: 0 8px 28px #141c2438; }
+#settings label { justify-content: space-between; }
+#settings input[type="range"] { flex: 1; min-width: 0; }
+#settings output { min-width: 3.4em; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+.settings-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; padding-top: 4px; border-top: 1px solid var(--line); }
+#search-form { position: fixed; top: 64px; right: 16px; z-index: 25; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; gap: 6px; box-shadow: 0 6px 20px #141c2430; }
+#search-count { color: var(--muted); font-size: .9rem; min-width: 3.6em; text-align: center; font-variant-numeric: tabular-nums; }
+#status:not(:empty) { position: fixed; right: 18px; bottom: 68px; z-index: 40; max-width: min(380px, 86vw); padding: 9px 14px; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 9px; box-shadow: 0 6px 20px #141c2430; }
 #scroll { flex: 1; min-height: 0; overflow: auto; }
 #welcome { min-height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 32px 16px; }
 #welcome h1 { margin: 16px 0 4px; font-size: 32px; }
 #welcome p { color: var(--muted); }
 #welcome .formats { font-size: .9rem; }
+#welcome-recent { width: min(560px, 100%); margin-top: 24px; text-align: left; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.welcome-recent-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.welcome-recent-header h2 { margin: 0; font-size: 15px; }
+.welcome-recent-header button { padding: .3rem .65rem; font-size: .88rem; }
+#welcome-recent-list { display: flex; flex-direction: column; gap: 6px; }
 #reader { margin: 0 auto; padding: 32px 24px 90px; }
 #reader.flow { max-width: calc(var(--measure) + 48px); font-size: var(--size); line-height: var(--leading); overflow-wrap: anywhere; }
 .flow section + section { margin-top: 3em; border-top: 1px solid var(--line); padding-top: 2em; }
@@ -81,7 +97,19 @@ main { display: flex; flex-direction: column; flex: 1; min-width: 0; }
 .word-text ::selection { background: #347ecc70; color: transparent; }
 footer { justify-content: space-between; border-top: 1px solid var(--line); color: var(--muted); }
 #page-number { width: 5em; }
-#selection-tools { position: fixed; z-index: 20; display: flex; padding: 4px; gap: 4px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); box-shadow: 0 4px 18px #141c2431; }
+#selection-tools { position: fixed; z-index: 20; display: flex; align-items: center; padding: 4px; gap: 4px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); box-shadow: 0 4px 18px #141c2431; }
+#selection-tools .swatch { width: 24px; height: 24px; padding: 0; border-radius: 999px; border: 1px solid #00000028; }
+#selection-tools .swatch[data-highlight="yellow"] { background: #efc643; }
+#selection-tools .swatch[data-highlight="green"] { background: #72c681; }
+#selection-tools .swatch[data-highlight="blue"] { background: #72b7ea; }
+#selection-tools .swatch[data-highlight="pink"] { background: #e98dc2; }
+:root[data-theme="dark"][data-pdf-dark="true"] .pdf-page canvas,
+:root[data-theme="dark"][data-pdf-dark="true"] .word-page > img { filter: invert(.88) hue-rotate(180deg); }
+:root[data-theme="dark"][data-pdf-dark="true"] .pdf-page { background: #1e211f; }
+body.focus-mode .toolbar,
+body.focus-mode #document-tabs,
+body.focus-mode footer,
+body.focus-mode #sidebar { display: none !important; }
 dialog { width: min(480px, 90vw); border: 1px solid var(--line); border-radius: 12px; padding: 20px; background: var(--surface); color: var(--ink); }
 dialog::backdrop { background: #14221b70; }
 dialog h2 { margin-top: 0; }
