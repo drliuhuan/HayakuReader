@@ -7,7 +7,6 @@ Windows 本地阅读器，使用 Rust 构建。作者为 **drliuhuan**。
 - [项目介绍](docs/intro.zh.md)
 - [Project introduction](docs/intro.en.md)
 - [下载 Windows x64 版](https://github.com/drliuhuan/HayakuReader/releases/latest)
-- [需求文档](HayakuReader-需求文档.md)
 
 ## 安装和使用
 

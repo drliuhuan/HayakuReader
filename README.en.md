@@ -7,7 +7,6 @@ A local Windows document reader built in Rust by **drliuhuan**.
 - [Project introduction](docs/intro.en.md)
 - [中文项目介绍](docs/intro.zh.md)
 - [Download Windows x64](https://github.com/drliuhuan/HayakuReader/releases/latest)
-- [Requirements (ZH)](HayakuReader-需求文档.md)
 
 ## Installation and Usage
 
