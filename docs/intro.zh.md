@@ -14,6 +14,8 @@ v0.2.4 安装时会在开始菜单和桌面自动创建快捷方式；通过关�
 
 v0.2.5 进一步优化性能与内存占用：为 PDF/Word 页面增加 LRU 显存回收与合理像素预算、优化滚动与批注高亮热路径、采用零分配智能反色 LUT 与零拷贝静态资源响应，并启用 Thin LTO 减小单文件体积。
 
+v0.2.6 修复深色智能反色在小字号/低缩放下出现彩色毛边的问题，恢复 PDF/Word 原始高清晰度并对小缩放 PDF 启用 2× 超采样渲染；同时改用兼容构建的 PDF.js 与路径回退逻辑，解决部分旧版 WebView2 环境下无法打开 PDF 的问题，并将错误提示改为常驻显示（点击可关闭）。
+
 复杂的 Word 排版可能存在显示差异。受 DRM 保护或采用 HUFF/CDIC 压缩的 Kindle 文件暂不可读。OCR 与 Markdown 编辑暂列后续版本。
 
 GitHub 仓库 [github.com/drliuhuan/HayakuReader](https://github.com/drliuhuan/HayakuReader)

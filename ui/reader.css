@@ -20,7 +20,7 @@
   --tok-quote: #a4b5ab; --tok-entity: #f0a875; --tok-meta: #b1a3eb;
 }
 [hidden] { display: none !important; }
-body { margin: 0; color: var(--ink); background: var(--paper); display: flex; height: 100dvh; }
+body { margin: 0; color: var(--ink); background: var(--paper); display: flex; height: 100vh; height: 100dvh; }
 button, input, select, textarea { font: inherit; color: inherit; }
 button, select, input[type="search"], input[type="number"], textarea {
   border: 1px solid var(--line); border-radius: 7px; background: var(--surface); padding: .55rem .75rem;

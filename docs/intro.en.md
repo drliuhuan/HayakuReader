@@ -14,6 +14,8 @@ v0.2.4 creates Start Menu and Desktop shortcuts on installation and dismisses th
 
 v0.2.5 further improves speed and memory efficiency with LRU page canvas/bitmap eviction for PDF and Word, scroll and highlight hot-path optimizations, a zero-allocation smart dark-mode LUT, zero-copy static asset serving, and Thin LTO release builds.
 
+v0.2.6 eliminates colored fringes around small text in smart dark-mode inversion, restores full PDF/Word rendering sharpness with 2× supersampling at small zoom, switches to the polyfilled legacy PDF.js build and adds path resolution fallbacks for older WebView2 runtimes, and keeps error notifications visible until clicked.
+
 Complex Word layouts may differ from the originals. Kindle files protected by DRM or compressed with HUFF/CDIC are currently unsupported. OCR and Markdown editing are planned for later releases.
 
 GitHub repository [github.com/drliuhuan/HayakuReader](https://github.com/drliuhuan/HayakuReader)
