@@ -16,6 +16,8 @@ v0.2.5 further improves speed and memory efficiency with LRU page canvas/bitmap 
 
 v0.2.6 eliminates colored fringes around small text in smart dark-mode inversion, restores full PDF/Word rendering sharpness with 2× supersampling at small zoom, switches to the polyfilled legacy PDF.js build and adds path resolution fallbacks for older WebView2 runtimes, and keeps error notifications visible until clicked.
 
+v0.2.7 introduces a frameless custom title bar with top-bar dragging, double-click maximize/restore, top-edge resizing, and dedicated minimize/maximize/close controls; moves the smart-invert toggle to the bottom status bar with a one-time first-use callout in dark mode; prevents UI controls from being accidentally selected, and limits `Ctrl+A` to document content (showing a loading progress dialog for large PDF/Word documents before selecting all text).
+
 Complex Word layouts may differ from the originals. Kindle files protected by DRM or compressed with HUFF/CDIC are currently unsupported. OCR and Markdown editing are planned for later releases.
 
 GitHub repository [github.com/drliuhuan/HayakuReader](https://github.com/drliuhuan/HayakuReader)
