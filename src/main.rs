@@ -11,8 +11,40 @@ mod storage;
 mod theme;
 mod word;
 
-use std::{collections::VecDeque, error::Error, fs, path::PathBuf, sync::Arc};
+use std::{
+    collections::VecDeque,
+    error::Error,
+    fs,
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 use uuid::Uuid;
+
+#[cfg(windows)]
+fn acquire_instance_lock(lock_path: &Path, wait_for_lock: bool) -> io::Result<Option<fs::File>> {
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    let attempts = if wait_for_lock { 100 } else { 1 };
+    for attempt in 0..attempts {
+        match lock.try_lock() {
+            Ok(()) => return Ok(Some(lock)),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if attempt + 1 < attempts {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(None)
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -38,6 +70,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     #[cfg(windows)]
     {
         let mut launch_paths = VecDeque::new();
+        let mut wait_for_lock = false;
         let data = storage::app_data()?;
         fs::create_dir_all(&data)?;
         let mut args = std::env::args_os().skip(1);
@@ -50,30 +83,25 @@ fn run() -> Result<(), Box<dyn Error>> {
                 )?;
                 return Ok(());
             }
+            if argument == "--relaunch" {
+                wait_for_lock = true;
+                continue;
+            }
             let path = PathBuf::from(argument);
             launch_paths.push_back(std::path::absolute(&path)?);
         }
         if platform::check_manual_update(&data)? {
             return Ok(());
         }
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(data.join("instance.lock"))?;
-        let _instance = match lock.try_lock() {
-            Ok(()) => lock,
-            Err(std::fs::TryLockError::WouldBlock) => {
-                let inbox = data.join("inbox");
-                fs::create_dir_all(&inbox)?;
-                storage::write_json(
-                    &inbox.join(format!("{}.json", Uuid::new_v4())),
-                    &launch_paths,
-                )?;
-                return Ok(());
-            }
-            Err(error) => return Err(error.into()),
+        let Some(instance_lock) = acquire_instance_lock(&data.join("instance.lock"), wait_for_lock)? else {
+            let inbox = data.join("inbox");
+            fs::create_dir_all(&inbox)?;
+            storage::write_json(
+                &inbox.join(format!("{}.json", Uuid::new_v4())),
+                &launch_paths,
+            )?;
+            platform::allow_set_foreground_window();
+            return Ok(());
         };
 
         platform::cleanup_updates(&data);
@@ -95,11 +123,40 @@ fn run() -> Result<(), Box<dyn Error>> {
         eframe::run_native(
             "HayakuReader",
             options,
-            Box::new(move |cc| Ok(Box::new(app::HayakuApp::new(cc, data, initial, launch_paths)))),
+            Box::new(move |cc| {
+                Ok(Box::new(app::HayakuApp::new(
+                    cc,
+                    data,
+                    initial,
+                    launch_paths,
+                    Some(instance_lock),
+                )))
+            }),
         )
         .map_err(|e| format!("无法创建原生窗口：{e}"))?;
         Ok(())
     }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn acquire_instance_lock_waits_when_relaunch_requested() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let lock_path = dir.path().join("instance.lock");
+    let first = acquire_instance_lock(&lock_path, false)?.expect("first lock should succeed");
+    assert!(
+        acquire_instance_lock(&lock_path, false)?.is_none(),
+        "non-waiting acquisition should return None immediately"
+    );
+    let handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(120));
+        let _ = first.unlock();
+        drop(first);
+    });
+    let reacquired = acquire_instance_lock(&lock_path, true)?;
+    handle.join().expect("thread join");
+    assert!(reacquired.is_some(), "relaunch acquisition should wait and succeed");
+    Ok(())
 }
 
 #[cfg(all(test, windows, target_env = "msvc"))]

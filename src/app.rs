@@ -22,7 +22,11 @@ use std::{
     fs,
     io::Cursor,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -92,7 +96,7 @@ struct SearchMatch {
     snippet: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SidebarTab {
     Recent,
     Contents,
@@ -176,6 +180,8 @@ struct FlowLayoutCache {
 enum BgEvent {
     ReleaseChecked(Result<Option<Release>, String>),
     UpdateFinished(Result<platform::Restart, String>),
+    InboxFiles(Vec<PathBuf>),
+    RequestRestart,
 }
 
 pub struct HayakuApp {
@@ -186,6 +192,7 @@ pub struct HayakuApp {
     tabs: Vec<TabEntry>,
     active_book: Option<OpenBook>,
     sidebar_open: bool,
+    sidebar_pinned: bool,
     sidebar_tab: SidebarTab,
     active_outline_idx: Option<usize>,
     focus_mode: bool,
@@ -208,6 +215,7 @@ pub struct HayakuApp {
     flow_sel_anchor: Option<FlowTextPos>,
     flow_sel_head: Option<FlowTextPos>,
     flow_sel_dragging: bool,
+    flow_width_dragging: bool,
 
     fixed_sel_anchor: Option<FixedTextPos>,
     fixed_sel_head: Option<FixedTextPos>,
@@ -233,9 +241,10 @@ pub struct HayakuApp {
     update_progress: Arc<Mutex<Option<DownloadProgress>>>,
     update_downloading: bool,
 
+    instance_lock: Option<fs::File>,
     bg_rx: mpsc::Receiver<BgEvent>,
     bg_tx: mpsc::Sender<BgEvent>,
-    last_inbox_poll: Instant,
+    bg_stop: Arc<AtomicBool>,
     scroll_fraction: f32,
     current_unit: usize,
 }
@@ -246,6 +255,7 @@ impl HayakuApp {
         data: PathBuf,
         initial: Option<PathBuf>,
         mut dropped: VecDeque<PathBuf>,
+        instance_lock: Option<fs::File>,
     ) -> Self {
         install_system_fonts(&cc.egui_ctx);
         let logo_texture = render_app_icon().map(|icon| {
@@ -276,6 +286,7 @@ impl HayakuApp {
             Vec::new()
         };
         let (bg_tx, bg_rx) = mpsc::channel();
+        let bg_stop = Arc::new(AtomicBool::new(false));
         let mut app = Self {
             data,
             settings,
@@ -284,6 +295,7 @@ impl HayakuApp {
             tabs,
             active_book: None,
             sidebar_open: false,
+            sidebar_pinned: false,
             sidebar_tab: SidebarTab::Contents,
             active_outline_idx: None,
             focus_mode: false,
@@ -304,6 +316,7 @@ impl HayakuApp {
             flow_sel_anchor: None,
             flow_sel_head: None,
             flow_sel_dragging: false,
+            flow_width_dragging: false,
             fixed_sel_anchor: None,
             fixed_sel_head: None,
             fixed_sel_dragging: false,
@@ -323,9 +336,10 @@ impl HayakuApp {
             show_update_dialog: false,
             update_progress: Arc::new(Mutex::new(None)),
             update_downloading: false,
+            instance_lock,
             bg_rx,
             bg_tx,
-            last_inbox_poll: Instant::now(),
+            bg_stop,
             scroll_fraction: 0.0,
             current_unit: 0,
         };
@@ -349,9 +363,64 @@ impl HayakuApp {
         {
             app.show_install_dialog = true;
         }
-        app.spawn_release_check(false);
+
+        let watch_ctx = cc.egui_ctx.clone();
+        let watch_data = app.data.clone();
+        let watch_tx = app.bg_tx.clone();
+        let watch_stop = Arc::clone(&app.bg_stop);
+        std::thread::spawn(move || {
+            while !watch_stop.load(Ordering::Relaxed) {
+                if watch_data.join("request-restart").is_file() {
+                    let _ = fs::remove_file(watch_data.join("request-restart"));
+                    let _ = watch_tx.send(BgEvent::RequestRestart);
+                    watch_ctx.request_repaint();
+                }
+                if let Some(paths) = drain_inbox_dir(&watch_data.join("inbox")) {
+                    let _ = watch_tx.send(BgEvent::InboxFiles(paths));
+                    watch_ctx.request_repaint();
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        });
+
+        app.spawn_release_check(&cc.egui_ctx, false);
         app.maybe_trigger_smart_invert_hint();
         app
+    }
+
+    fn release_instance_lock(&mut self) {
+        if let Some(lock) = self.instance_lock.take() {
+            #[cfg(windows)]
+            let _ = lock.unlock();
+            drop(lock);
+        }
+    }
+
+    fn active_book_has_outline_or_notes(&self) -> bool {
+        let Some(book) = &self.active_book else {
+            return false;
+        };
+        if !book.state.annotations.is_empty() {
+            return true;
+        }
+        match &book.source {
+            LoadedSource::Pdf(p) => !p.outline().is_empty(),
+            LoadedSource::Word(w) => !w.metadata.outline.is_empty(),
+            LoadedSource::Flow(f) => !f.outline.is_empty(),
+        }
+    }
+
+    fn sync_auto_sidebar(&mut self, select_contents_if_opened: bool) {
+        if self.sidebar_pinned {
+            self.sidebar_open = true;
+        } else if self.active_book_has_outline_or_notes() {
+            self.sidebar_open = true;
+            if select_contents_if_opened {
+                self.sidebar_tab = SidebarTab::Contents;
+            }
+        } else {
+            self.sidebar_open = false;
+        }
     }
 
     fn theme_mode(&self) -> ThemeMode {
@@ -400,12 +469,14 @@ impl HayakuApp {
         }
     }
 
-    fn spawn_release_check(&self, manual: bool) {
+    fn spawn_release_check(&self, ctx: &Context, manual: bool) {
         let tx = self.bg_tx.clone();
+        let repaint_ctx = ctx.clone();
         std::thread::spawn(move || {
             let res = platform::check_latest_release();
             if manual || matches!(&res, Ok(Some(_))) {
                 let _ = tx.send(BgEvent::ReleaseChecked(res));
+                repaint_ctx.request_repaint();
             }
         });
     }
@@ -531,19 +602,6 @@ impl HayakuApp {
             })
         };
 
-        let has_outline = match &source {
-            LoadedSource::Pdf(p) => !p.outline().is_empty(),
-            LoadedSource::Word(w) => !w.metadata.outline.is_empty(),
-            LoadedSource::Flow(f) => !f.outline.is_empty(),
-        };
-        if has_outline {
-            self.sidebar_open = true;
-            self.sidebar_tab = SidebarTab::Contents;
-        } else if !state.annotations.is_empty() {
-            self.sidebar_open = true;
-            self.sidebar_tab = SidebarTab::Notes;
-        }
-
         self.active_book = Some(OpenBook {
             id,
             title,
@@ -552,6 +610,7 @@ impl HayakuApp {
             source,
             state,
         });
+        self.sync_auto_sidebar(true);
         self.fixed_zoom = None;
         self.page_cache.clear();
         self.flow_cache = None;
@@ -583,6 +642,7 @@ impl HayakuApp {
         {
             self.open_path(&rec.path);
         } else {
+            self.sync_auto_sidebar(false);
             self.save_workspace();
         }
     }
@@ -788,6 +848,7 @@ impl HayakuApp {
                     self.update_downloading = false;
                     self.save_active_book();
                     self.save_workspace();
+                    self.release_instance_lock();
                     if platform::restart(restart_req).is_ok() {
                         ctx.send_viewport_cmd(ViewportCommand::Close);
                     }
@@ -796,34 +857,20 @@ impl HayakuApp {
                     self.update_downloading = false;
                     self.set_status(format!("更新失败：{e}"), None);
                 }
-            }
-        }
-        if self.last_inbox_poll.elapsed() >= Duration::from_millis(450) {
-            self.last_inbox_poll = Instant::now();
-            if self.data.join("request-restart").is_file() {
-                let _ = fs::remove_file(self.data.join("request-restart"));
-                self.save_active_book();
-                self.save_workspace();
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-                return;
-            }
-            let inbox = self.data.join("inbox");
-            if let Ok(entries) = fs::read_dir(&inbox) {
-                let mut opened_any = false;
-                for file in entries.flatten().filter(|e| {
-                    e.path().extension().is_some_and(|ext| ext == "json")
-                }) {
-                    let path = file.path();
-                    if let Ok(paths) = storage::read_json::<Vec<PathBuf>>(&path) {
-                        let _ = fs::remove_file(&path);
-                        for p in paths {
-                            self.open_path(&p);
-                            opened_any = true;
-                        }
+                BgEvent::InboxFiles(paths) => {
+                    for p in paths {
+                        self.open_path(&p);
                     }
-                }
-                if opened_any {
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    #[cfg(windows)]
+                    platform::bring_current_process_window_to_front();
+                }
+                BgEvent::RequestRestart => {
+                    self.save_active_book();
+                    self.save_workspace();
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    return;
                 }
             }
         }
@@ -844,9 +891,10 @@ impl HayakuApp {
         visuals.extreme_bg_color = p.code_bg;
         visuals.faint_bg_color = p.side;
         visuals.selection.bg_fill = p.selection;
+        visuals.slider_trailing_fill = true;
         visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.ink);
         visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.line);
-        visuals.widgets.inactive.bg_fill = p.surface;
+        visuals.widgets.inactive.bg_fill = p.line;
         visuals.widgets.inactive.weak_bg_fill = p.surface;
         visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, p.ink);
         visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, p.line);
@@ -916,8 +964,9 @@ impl HayakuApp {
         if find && self.active_book.is_some() {
             self.show_search = !self.show_search;
         }
-        if side && self.active_book.is_some() {
-            self.sidebar_open = !self.sidebar_open;
+        if side {
+            self.sidebar_pinned = !self.sidebar_pinned;
+            self.sync_auto_sidebar(false);
         }
         if close_tab && let Some(id) = self.active_book.as_ref().map(|b| b.id.clone()) {
             self.close_tab(&id);
@@ -1010,7 +1059,7 @@ impl HayakuApp {
             }
         }
 
-        if self.active_book.is_some() && (zoom_in || zoom_out || zoom_reset || wheel != 0.0) {
+        if zoom_in || zoom_out || zoom_reset || wheel != 0.0 {
             let is_fixed = self
                 .active_book
                 .as_ref()
@@ -1031,6 +1080,7 @@ impl HayakuApp {
                 } else {
                     self.settings.font_size = (self.settings.font_size - 1.0).max(13.0);
                 }
+                self.flow_cache = None;
                 self.save_settings();
             }
         }
@@ -1088,6 +1138,7 @@ impl HayakuApp {
         let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
         Panel::top("top_toolbar")
             .exact_size(46.0)
+            .show_separator_line(true)
             .frame(
                 Frame::new()
                     .fill(p.surface)
@@ -1096,8 +1147,7 @@ impl HayakuApp {
                         right: 0,
                         top: 0,
                         bottom: 0,
-                    })
-                    .stroke(Stroke::new(1.0, p.line)),
+                    }),
             )
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
@@ -1106,19 +1156,43 @@ impl HayakuApp {
                     }
                     let (side_rect, side_resp) =
                         ui.allocate_exact_size(Vec2::new(30.0, 28.0), Sense::click());
-                    let side_resp = side_resp.on_hover_text("切换侧栏 (Ctrl+B)");
-                    if side_resp.hovered() || self.sidebar_open {
+                    let side_tip = if self.sidebar_pinned {
+                        "取消始终显示侧边栏（切回自动模式）(Ctrl+B)"
+                    } else {
+                        "始终显示侧边栏（当前：自动模式）(Ctrl+B)"
+                    };
+                    let side_resp = side_resp.on_hover_text(side_tip);
+                    if self.sidebar_pinned {
+                        ui.painter().rect_filled(
+                            side_rect,
+                            5.0,
+                            Color32::from_rgba_unmultiplied(
+                                p.accent.r(),
+                                p.accent.g(),
+                                p.accent.b(),
+                                36,
+                            ),
+                        );
+                        ui.painter().rect_stroke(
+                            side_rect,
+                            5.0,
+                            Stroke::new(1.0, p.accent),
+                            StrokeKind::Inside,
+                        );
+                    } else if side_resp.hovered() {
                         ui.painter().rect_filled(side_rect, 5.0, p.side);
                     }
                     let sc = side_rect.center();
+                    let icon_color = if self.sidebar_pinned { p.accent } else { p.ink };
                     for dy in [-4.5f32, 0.0, 4.5] {
                         ui.painter().line_segment(
                             [Pos2::new(sc.x - 6.5, sc.y + dy), Pos2::new(sc.x + 6.5, sc.y + dy)],
-                            Stroke::new(1.6, p.ink),
+                            Stroke::new(1.6, icon_color),
                         );
                     }
                     if side_resp.clicked() {
-                        self.sidebar_open = !self.sidebar_open;
+                        self.sidebar_pinned = !self.sidebar_pinned;
+                        self.sync_auto_sidebar(false);
                     }
 
                     if ui
@@ -1240,7 +1314,7 @@ impl HayakuApp {
                         }
 
                         ui.separator();
-                        if ui.button("阅读设置").clicked() {
+                        if ui.button("设置").clicked() {
                             self.show_settings = !self.show_settings;
                         }
                         if self.active_book.is_some() {
@@ -1330,11 +1404,11 @@ impl HayakuApp {
         let p = self.palette();
         Panel::top("document_tabs")
             .exact_size(34.0)
+            .show_separator_line(true)
             .frame(
                 Frame::new()
                     .fill(p.side)
-                    .inner_margin(Margin::symmetric(8, 3))
-                    .stroke(Stroke::new(1.0, p.line)),
+                    .inner_margin(Margin::symmetric(8, 3)),
             )
             .show(ui, |ui| {
                 ScrollArea::horizontal().show(ui, |ui| {
@@ -1391,11 +1465,11 @@ impl HayakuApp {
             .resizable(true)
             .default_size(250.0)
             .size_range(180.0..=360.0)
+            .show_separator_line(true)
             .frame(
                 Frame::new()
                     .fill(p.side)
-                    .inner_margin(Margin::same(10))
-                    .stroke(Stroke::new(1.0, p.line)),
+                    .inner_margin(Margin::same(10)),
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -1516,6 +1590,7 @@ impl HayakuApp {
                         {
                             book.state.annotations.remove(idx);
                             self.save_active_book();
+                            self.sync_auto_sidebar(false);
                         }
                         if let Some((unit, fraction)) = jump_to {
                             self.pending_jump = Some(PendingJump {
@@ -1531,18 +1606,18 @@ impl HayakuApp {
     }
 
     fn draw_bottom_bar(&mut self, ui: &mut Ui) {
-        if self.active_book.is_none() || self.focus_mode {
+        if self.focus_mode {
             return;
         }
         let p = self.palette();
         let dark = self.theme_mode() == ThemeMode::Dark;
         Panel::bottom("status_footer")
             .exact_size(38.0)
+            .show_separator_line(true)
             .frame(
                 Frame::new()
                     .fill(p.surface)
-                    .inner_margin(Margin::symmetric(12, 4))
-                    .stroke(Stroke::new(1.0, p.line)),
+                    .inner_margin(Margin::symmetric(12, 4)),
             )
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
@@ -1572,11 +1647,11 @@ impl HayakuApp {
                             }
                         }
                     } else {
-                        String::new()
+                        "就绪".to_owned()
                     };
                     ui.label(RichText::new(loc).color(p.muted));
 
-                    if dark {
+                    if dark && self.active_book.is_some() {
                         ui.add_space(8.0);
                         let active = self.settings.smart_invert;
                         let label = if active {
@@ -1611,13 +1686,18 @@ impl HayakuApp {
                     let is_fixed = self.active_book.as_ref().is_some_and(|b| {
                         matches!(b.source, LoadedSource::Pdf(_) | LoadedSource::Word(_))
                     });
-                    if is_fixed {
-                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if is_fixed {
                             if ui.button("+").clicked() {
                                 let cur = self.fixed_zoom.unwrap_or(1.0);
                                 self.fixed_zoom = Some((cur * 1.15).min(4.5));
                             }
-                            if ui.button("适合页宽").clicked() {
+                            let pct = (self.fixed_zoom.unwrap_or(1.0) * 100.0).round() as i32;
+                            if ui
+                                .button(format!("{pct}%"))
+                                .on_hover_text("点击恢复适合页宽 (100%)")
+                                .clicked()
+                            {
                                 self.fixed_zoom = None;
                             }
                             if ui.button("−").clicked() {
@@ -1647,8 +1727,32 @@ impl HayakuApp {
                                     fraction: 0.0,
                                 });
                             }
-                        });
-                    }
+                        } else {
+                            if ui.button("+").clicked() {
+                                self.settings.font_size =
+                                    (self.settings.font_size + 1.0).min(34.0);
+                                self.flow_cache = None;
+                                self.save_settings();
+                            }
+                            let pct =
+                                (self.settings.font_size / 19.0 * 100.0).round() as i32;
+                            if ui
+                                .button(format!("{pct}%"))
+                                .on_hover_text("点击恢复默认缩放 (100%，字号 19px)")
+                                .clicked()
+                            {
+                                self.settings.font_size = 19.0;
+                                self.flow_cache = None;
+                                self.save_settings();
+                            }
+                            if ui.button("−").clicked() {
+                                self.settings.font_size =
+                                    (self.settings.font_size - 1.0).max(13.0);
+                                self.flow_cache = None;
+                                self.save_settings();
+                            }
+                        }
+                    });
                 });
             });
     }
@@ -1791,6 +1895,15 @@ impl HayakuApp {
         }
 
         let scroll_out = scroll.show_viewport(ui, |ui, viewport| {
+            let clip = ui.clip_rect();
+            let view_pointer_pos = pointer_pos
+                .filter(|&pos| clip.contains(pos) && ui.ctx().layer_id_at(pos) == Some(ui.layer_id()));
+            let drag_pointer_pos = pointer_pos.filter(|&pos| clip.contains(pos));
+            let hit_pointer_pos = if self.fixed_sel_dragging {
+                drag_pointer_pos
+            } else {
+                view_pointer_pos
+            };
             let (rect, _) = ui.allocate_exact_size(
                 Vec2::new(avail_w.max(viewport.width()), total_h),
                 Sense::hover(),
@@ -2016,7 +2129,7 @@ impl HayakuApp {
                     }
 
                     // Pointer drag selection over runs
-                    if let Some(pos) = pointer_pos
+                    if let Some(pos) = hit_pointer_pos
                         && page_rect.contains(pos)
                     {
                         let hit = hit_test_fixed_page(
@@ -2027,10 +2140,10 @@ impl HayakuApp {
                             &cached.pdf_runs,
                             &cached.word_runs,
                         );
-                        if hit.is_some() {
+                        if view_pointer_pos.is_some() && hit.is_some() {
                             ui.ctx().set_cursor_icon(CursorIcon::Text);
                         }
-                        if primary_pressed {
+                        if primary_pressed && view_pointer_pos.is_some() {
                             self.fixed_all_selected = false;
                             if let Some(h) = hit {
                                 self.fixed_sel_anchor = Some(h);
@@ -2054,7 +2167,11 @@ impl HayakuApp {
                                     page_rect.top() + link.rect_pt[1] * factor,
                                 ),
                                 Vec2::new(link.rect_pt[2] * factor, link.rect_pt[3] * factor),
-                            );
+                            )
+                            .intersect(clip);
+                            if !lr.is_positive() {
+                                continue;
+                            }
                             let resp = ui.interact(
                                 lr,
                                 ui.scope_id()
@@ -2086,7 +2203,11 @@ impl HayakuApp {
                                         page_rect.top() + run.top * factor,
                                     ),
                                     Vec2::new(run.width * factor, (run.size * 1.2) * factor),
-                                );
+                                )
+                                .intersect(clip);
+                                if !lr.is_positive() {
+                                    continue;
+                                }
                                 let resp = ui.interact(
                                     lr,
                                     ui.scope_id().with(("wlink", idx, ri)),
@@ -2110,15 +2231,18 @@ impl HayakuApp {
                     let page_resp = if modal_open {
                         None
                     } else {
-                        Some(ui.interact(
-                            page_rect,
-                            ui.scope_id().with(("fixed-page-ctx", idx)),
-                            Sense::click(),
-                        ))
+                        let visible_page = page_rect.intersect(clip);
+                        visible_page.is_positive().then(|| {
+                            ui.interact(
+                                visible_page,
+                                ui.scope_id().with(("fixed-page-ctx", idx)),
+                                Sense::click(),
+                            )
+                        })
                     };
                     if let Some(page_resp) = page_resp
                         && page_resp.secondary_clicked()
-                        && let Some(pointer) = pointer_pos
+                        && let Some(pointer) = view_pointer_pos
                     {
                         let px_pt = (pointer.x - page_rect.left()) / factor;
                         let py_pt = (pointer.y - page_rect.top()) / factor;
@@ -2357,10 +2481,12 @@ impl HayakuApp {
             .as_ref()
             .and_then(|b| b.state.view_mode.as_deref())
             == Some("code");
+        let max_measure = (avail_w - 32.0).max(320.0);
+        let min_measure = 360.0_f32.min(max_measure);
         let measure = if is_code_mode {
             (avail_w - 64.0).clamp(320.0, 1180.0)
         } else {
-            self.settings.text_width.min((avail_w - 48.0).max(260.0))
+            self.settings.text_width.clamp(min_measure, max_measure)
         };
 
         let (book_id, flow) = match self.active_book.as_ref() {
@@ -2441,7 +2567,28 @@ impl HayakuApp {
         }
 
         let scroll_out = scroll.show_viewport(ui, |ui, viewport| {
-            let canvas_sense = if modal_open { Sense::hover() } else { Sense::click() };
+            let clip = ui.clip_rect();
+            let view_pointer_pos = if modal_open || self.flow_width_dragging {
+                None
+            } else {
+                pointer_pos
+                    .filter(|&pos| clip.contains(pos) && ui.ctx().layer_id_at(pos) == Some(ui.layer_id()))
+            };
+            let drag_pointer_pos = if modal_open || self.flow_width_dragging {
+                None
+            } else {
+                pointer_pos.filter(|&pos| clip.contains(pos))
+            };
+            let hit_pointer_pos = if self.flow_sel_dragging {
+                drag_pointer_pos
+            } else {
+                view_pointer_pos
+            };
+            let canvas_sense = if modal_open || self.flow_width_dragging {
+                Sense::hover()
+            } else {
+                Sense::click()
+            };
             let (canvas_rect, canvas_resp) =
                 ui.allocate_exact_size(Vec2::new(avail_w.max(viewport.width()), total_h), canvas_sense);
             let col_left = canvas_rect.left() + ((canvas_rect.width() - measure) * 0.5).max(16.0);
@@ -2605,7 +2752,10 @@ impl HayakuApp {
 
                             if !modal_open {
                                 for lb in compute_galley_link_boxes(&galley, link_spans) {
-                                    let lr = lb.rel_rect.translate(content_pos.to_vec2());
+                                    let lr = lb.rel_rect.translate(content_pos.to_vec2()).intersect(clip);
+                                    if !lr.is_positive() {
+                                        continue;
+                                    }
                                     let resp = ui.interact(
                                         lr,
                                         ui.scope_id()
@@ -2621,10 +2771,12 @@ impl HayakuApp {
                                 }
                             }
 
-                            if let Some(pos) = pointer_pos
+                            if let Some(pos) = hit_pointer_pos
                                 && item_rect.contains(pos)
                             {
-                                hover_text_cursor = true;
+                                if view_pointer_pos.is_some() {
+                                    hover_text_cursor = true;
+                                }
                                 let local = pos - content_pos;
                                 let cursor = galley.cursor_from_pos(local);
                                 new_hit_pos = Some(FlowTextPos {
@@ -2667,10 +2819,12 @@ impl HayakuApp {
                                 );
                             }
                             ui.painter().galley(code_pos, code_galley.clone(), p.ink);
-                            if let Some(pos) = pointer_pos
+                            if let Some(pos) = hit_pointer_pos
                                 && item_rect.contains(pos)
                             {
-                                hover_text_cursor = true;
+                                if view_pointer_pos.is_some() {
+                                    hover_text_cursor = true;
+                                }
                                 let cursor = code_galley.cursor_from_pos(pos - code_pos);
                                 new_hit_pos = Some(FlowTextPos {
                                     item_idx: idx,
@@ -2731,6 +2885,10 @@ impl HayakuApp {
                                     );
                                     if !modal_open {
                                         for (lr, target) in click_hit_boxes {
+                                            let lr = lr.intersect(clip);
+                                            if !lr.is_positive() {
+                                                continue;
+                                            }
                                             let resp = ui.interact(
                                                 lr,
                                                 ui.scope_id().with((
@@ -2749,10 +2907,12 @@ impl HayakuApp {
                                             }
                                         }
                                     }
-                                    if let Some(pos) = pointer_pos
+                                    if let Some(pos) = hit_pointer_pos
                                         && item_rect.contains(pos)
                                     {
-                                        hover_text_cursor = true;
+                                        if view_pointer_pos.is_some() {
+                                            hover_text_cursor = true;
+                                        }
                                         let origin = item_rect.min + Vec2::new(0.0, *pad_top);
                                         let rel = pos - origin;
                                         let ci = hit_test_char_boxes(rel, &char_boxes);
@@ -2807,11 +2967,11 @@ impl HayakuApp {
                 }
             }
 
-            if !modal_open {
+            if !modal_open && !self.flow_width_dragging {
                 if hover_text_cursor {
                     ui.ctx().set_cursor_icon(CursorIcon::Text);
                 }
-                if primary_pressed && canvas_resp.hovered() {
+                if primary_pressed && view_pointer_pos.is_some() && canvas_resp.hovered() {
                     if let Some(pos) = new_hit_pos {
                         self.flow_sel_anchor = Some(pos);
                         self.flow_sel_head = Some(pos);
@@ -2824,7 +2984,7 @@ impl HayakuApp {
                     self.flow_sel_head = Some(pos);
                 }
                 if canvas_resp.secondary_clicked()
-                    && let Some(pointer) = pointer_pos
+                    && let Some(pointer) = view_pointer_pos
                 {
                     let sel = self.selected_flow_text();
                     if !sel.is_empty() {
@@ -2846,6 +3006,70 @@ impl HayakuApp {
             let max_s = (total_h - viewport.height()).max(1.0);
             self.scroll_fraction = (vis_top / max_s).clamp(0.0, 1.0);
         });
+
+        if !modal_open && !is_code_mode {
+            let vp = scroll_out.inner_rect;
+            let center_x = vp.center().x;
+            let col_left_x = (center_x - measure * 0.5).max(vp.left() + 8.0);
+            let col_right_x = (center_x + measure * 0.5).min(vp.right() - 22.0);
+            let left_zone = Rect::from_min_max(
+                Pos2::new((col_left_x - 18.0).max(vp.left()), vp.top()),
+                Pos2::new((col_left_x - 2.0).max(vp.left() + 10.0), vp.bottom()),
+            );
+            let right_zone = Rect::from_min_max(
+                Pos2::new((col_right_x + 2.0).min(vp.right() - 24.0), vp.top()),
+                Pos2::new((col_right_x + 18.0).min(vp.right() - 14.0), vp.bottom()),
+            );
+            let mut active_drag = false;
+            for (salt, zone, guide_x) in [
+                ("flow_width_drag_left", left_zone, col_left_x),
+                ("flow_width_drag_right", right_zone, col_right_x),
+            ] {
+                if !zone.is_positive() {
+                    continue;
+                }
+                let resp = ui
+                    .interact(zone, ui.scope_id().with(salt), Sense::drag())
+                    .on_hover_text("拖动调整阅读区域宽度");
+                let dragging = resp.dragged();
+                if resp.hovered() || dragging {
+                    ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                    let stroke = if dragging {
+                        Stroke::new(1.5, p.accent)
+                    } else {
+                        Stroke::new(1.0, p.line)
+                    };
+                    ui.painter().line_segment(
+                        [Pos2::new(guide_x, vp.top()), Pos2::new(guide_x, vp.bottom())],
+                        stroke,
+                    );
+                    let grip = Rect::from_center_size(
+                        Pos2::new(guide_x, vp.center().y),
+                        Vec2::new(4.0, 36.0),
+                    );
+                    ui.painter().rect_filled(
+                        grip,
+                        2.0,
+                        if dragging { p.accent } else { p.muted },
+                    );
+                }
+                if dragging {
+                    active_drag = true;
+                    self.flow_sel_dragging = false;
+                    if let Some(pos) = ui.ctx().pointer_latest_pos() {
+                        let new_w = ((pos.x - center_x).abs() * 2.0).clamp(min_measure, max_measure);
+                        self.settings.text_width = new_w.round();
+                    }
+                }
+                if resp.drag_stopped() {
+                    self.flow_width_dragging = false;
+                    self.save_settings();
+                }
+            }
+            self.flow_width_dragging = active_drag;
+        } else {
+            self.flow_width_dragging = false;
+        }
 
         self.last_scroll_y = scroll_out.state.clamped_offset().y;
         self.last_viewport_h = scroll_out.inner_rect.height();
@@ -3048,7 +3272,7 @@ impl HayakuApp {
             let mut changed = false;
             let mut open_install = false;
             let mut check_upd = false;
-            egui::Window::new("阅读设置")
+            egui::Window::new("设置")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-16.0, 52.0))
@@ -3070,23 +3294,31 @@ impl HayakuApp {
                             changed = true;
                         }
                     });
-                    changed |= ui
-                        .add(egui::Slider::new(&mut self.settings.font_size, 13.0..=34.0).text("字号"))
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.settings.line_height, 1.3..=2.4)
-                                .step_by(0.1)
-                                .text("行距"),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.settings.text_width, 480.0..=1150.0)
-                                .step_by(10.0)
-                                .text("阅读宽度"),
-                        )
-                        .changed();
+                    ui.scope(|ui| {
+                        let vis = ui.visuals_mut();
+                        vis.slider_trailing_fill = true;
+                        vis.selection.bg_fill = p.accent;
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.settings.font_size, 13.0..=34.0)
+                                    .text("字号"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.settings.line_height, 1.3..=2.4)
+                                    .step_by(0.1)
+                                    .text("行距"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.settings.text_width, 360.0..=1800.0)
+                                    .step_by(10.0)
+                                    .text("阅读宽度"),
+                            )
+                            .changed();
+                    });
                     changed |= ui
                         .checkbox(&mut self.settings.restore_session, "启动时恢复标签页")
                         .changed();
@@ -3129,7 +3361,7 @@ impl HayakuApp {
                 self.show_install_dialog = true;
             }
             if check_upd {
-                self.spawn_release_check(true);
+                self.spawn_release_check(ctx, true);
             }
             if close {
                 self.show_settings = false;
@@ -3252,6 +3484,7 @@ impl HayakuApp {
                     Ok(Some(restart_req)) => {
                         self.save_active_book();
                         self.save_workspace();
+                        self.release_instance_lock();
                         if let Err(e) = platform::restart(restart_req) {
                             self.set_status(format!("重启失败：{e}"), None);
                             self.show_install_dialog = false;
@@ -3284,7 +3517,7 @@ impl HayakuApp {
                     ui.heading(format!("发现新版本 {}", rel.tag_name));
                     ui.separator();
                     if !platform::installed() {
-                        ui.label("当前为便携运行版。如需应用内更新，请先通过「阅读设置 -> 安装」安装到本机，或前往 GitHub 手动下载。");
+                        ui.label("当前为便携运行版。如需应用内更新，请先通过「设置 -> 安装」安装到本机，或前往 GitHub 手动下载。");
                         ui.horizontal(|ui| {
                             if ui.button("前往下载").clicked() {
                                 let _ = platform::shell_open(&format!(
@@ -3333,9 +3566,11 @@ impl HayakuApp {
                                 let data = self.data.clone();
                                 let slot = self.update_progress.clone();
                                 let tx = self.bg_tx.clone();
+                                let repaint_ctx = ctx.clone();
                                 std::thread::spawn(move || {
                                     let res = platform::download_and_stage_update(&data, &rel, &slot);
                                     let _ = tx.send(BgEvent::UpdateFinished(res));
+                                    repaint_ctx.request_repaint();
                                 });
                             }
                         });
@@ -3393,13 +3628,45 @@ impl eframe::App for HayakuApp {
             });
 
         self.draw_popups(&ctx);
+        if !ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+            ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                Id::unique("window_outer_border"),
+            ))
+            .rect_stroke(
+                ctx.content_rect(),
+                0.0,
+                Stroke::new(1.0, p.line),
+                StrokeKind::Inside,
+            );
+        }
         self.draw_resize_edges(&ctx);
     }
 
     fn on_exit(&mut self) {
+        self.bg_stop.store(true, Ordering::Relaxed);
         self.save_active_book();
         self.save_workspace();
+        self.release_instance_lock();
     }
+}
+
+fn drain_inbox_dir(inbox: &Path) -> Option<Vec<PathBuf>> {
+    let entries = fs::read_dir(inbox).ok()?;
+    let mut processed = false;
+    let mut collected = Vec::new();
+    for file in entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+    {
+        let path = file.path();
+        if let Ok(paths) = storage::read_json::<Vec<PathBuf>>(&path) {
+            let _ = fs::remove_file(&path);
+            collected.extend(paths);
+            processed = true;
+        }
+    }
+    processed.then_some(collected)
 }
 
 struct FlowDrawCtx<'a> {
@@ -4901,18 +5168,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn install_modal_cancel_button_responds_to_click() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn make_test_app(data: PathBuf) -> HayakuApp {
         let (bg_tx, bg_rx) = mpsc::channel();
-        let mut app = HayakuApp {
-            data: dir.path().to_path_buf(),
+        HayakuApp {
+            data,
             settings: Settings::default(),
             recent: Vec::new(),
             workspace: Workspace::default(),
             tabs: Vec::new(),
             active_book: None,
             sidebar_open: false,
+            sidebar_pinned: false,
             sidebar_tab: SidebarTab::Contents,
             active_outline_idx: None,
             focus_mode: false,
@@ -4933,6 +5199,7 @@ mod tests {
             flow_sel_anchor: None,
             flow_sel_head: None,
             flow_sel_dragging: false,
+            flow_width_dragging: false,
             fixed_sel_anchor: None,
             fixed_sel_head: None,
             fixed_sel_dragging: false,
@@ -4945,24 +5212,33 @@ mod tests {
             context_menu: None,
             link_warning: None,
             smart_invert_hint_open: false,
-            install_status: Some(platform::InstallationStatus {
-                installed: false,
-                installation_exists: false,
-                path: dir.path().join("HayakuReader.exe"),
-                associations: vec![".pdf".to_owned()],
-            }),
-            show_install_dialog: true,
+            install_status: None,
+            show_install_dialog: false,
             install_selected: HashMap::new(),
             pending_release: None,
             show_update_dialog: false,
             update_progress: Arc::new(Mutex::new(None)),
             update_downloading: false,
+            instance_lock: None,
             bg_rx,
             bg_tx,
-            last_inbox_poll: Instant::now(),
+            bg_stop: Arc::new(AtomicBool::new(false)),
             scroll_fraction: 0.0,
             current_unit: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn install_modal_cancel_button_responds_to_click() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_test_app(dir.path().to_path_buf());
+        app.install_status = Some(platform::InstallationStatus {
+            installed: false,
+            installation_exists: false,
+            path: dir.path().join("HayakuReader.exe"),
+            associations: vec![".pdf".to_owned()],
+        });
+        app.show_install_dialog = true;
 
         let ctx = Context::default();
         install_system_fonts(&ctx);
@@ -5046,5 +5322,160 @@ mod tests {
             app.settings.install_dismissed,
             "clicking '取消' on install modal should persist install_dismissed"
         );
+    }
+
+    #[test]
+    fn auto_sidebar_mode_and_pin_switch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_test_app(dir.path().to_path_buf());
+
+        let make_flow_book = |with_outline: bool, with_notes: bool| -> OpenBook {
+            let outline = if with_outline {
+                vec![OutlineEntry {
+                    title: "Chapter 1".to_owned(),
+                    index: 0,
+                    fragment: String::new(),
+                }]
+            } else {
+                Vec::new()
+            };
+            let mut state = BookState::default();
+            if with_notes {
+                state.annotations.push(Annotation {
+                    id: "b1".to_owned(),
+                    kind: "bookmark".to_owned(),
+                    text: "Bookmark".to_owned(),
+                    ..Default::default()
+                });
+            }
+            OpenBook {
+                id: "id1".to_owned(),
+                title: "Book".to_owned(),
+                digest: "d".to_owned(),
+                kind: "txt",
+                source: LoadedSource::Flow(Arc::new(FlowDocument {
+                    kind: "txt",
+                    chapters: vec![crate::flow::FlowChapter {
+                        path: "ch1".to_owned(),
+                        title: "Chapter 1".to_owned(),
+                        blocks: vec![Block::Paragraph(vec![Inline::Text("Hello".to_owned())])],
+                        anchors: HashMap::new(),
+                        raw_source: "Hello".to_owned(),
+                    }],
+                    outline,
+                    resources: HashMap::new(),
+                })),
+                state,
+            }
+        };
+
+        // Doc with outline opens sidebar on Contents in auto mode.
+        app.active_book = Some(make_flow_book(true, false));
+        app.sidebar_tab = SidebarTab::Recent;
+        app.sync_auto_sidebar(true);
+        assert!(app.sidebar_open);
+        assert_eq!(app.sidebar_tab, SidebarTab::Contents);
+
+        // Doc without outline but with annotations also opens sidebar on Contents.
+        app.active_book = Some(make_flow_book(false, true));
+        app.sidebar_tab = SidebarTab::Notes;
+        app.sync_auto_sidebar(true);
+        assert!(app.sidebar_open);
+        assert_eq!(app.sidebar_tab, SidebarTab::Contents);
+
+        // Doc without outline or annotations hides sidebar in auto mode.
+        app.active_book = Some(make_flow_book(false, false));
+        app.sync_auto_sidebar(true);
+        assert!(!app.sidebar_open);
+
+        // Pinning keeps sidebar open even without outline/annotations, and unpinning returns to auto hide.
+        app.sidebar_pinned = true;
+        app.sync_auto_sidebar(false);
+        assert!(app.sidebar_open);
+        app.sidebar_pinned = false;
+        app.sync_auto_sidebar(false);
+        assert!(!app.sidebar_open);
+    }
+
+    #[test]
+    fn tabs_bar_hover_does_not_set_text_cursor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_test_app(dir.path().to_path_buf());
+        let blocks = (0..60)
+            .map(|i| Block::Paragraph(vec![Inline::Text(format!("Line {i} sample body text"))]))
+            .collect();
+        app.tabs.push(TabEntry {
+            id: "t1".to_owned(),
+            title: "Sample Tab".to_owned(),
+            last_used: 1,
+        });
+        app.active_book = Some(OpenBook {
+            id: "t1".to_owned(),
+            title: "Sample Tab".to_owned(),
+            digest: "d".to_owned(),
+            kind: "txt",
+            source: LoadedSource::Flow(Arc::new(FlowDocument {
+                kind: "txt",
+                chapters: vec![crate::flow::FlowChapter {
+                    path: "body".to_owned(),
+                    title: "Body".to_owned(),
+                    blocks,
+                    anchors: HashMap::new(),
+                    raw_source: String::new(),
+                }],
+                outline: Vec::new(),
+                resources: HashMap::new(),
+            })),
+            state: BookState::default(),
+        });
+        app.pending_scroll_y = Some(120.0);
+
+        let ctx = Context::default();
+        install_system_fonts(&ctx);
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 720.0));
+        let hover_pos = Pos2::new(70.0, 60.0);
+        let mut last_cursor = CursorIcon::Default;
+        for t in [0.0_f64, 0.2_f64] {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(t),
+                events: vec![egui::Event::PointerMoved(hover_pos)],
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                app.draw_top_bar(ui);
+                app.draw_tabs_bar(ui);
+                app.draw_bottom_bar(ui);
+                let p = app.palette();
+                CentralPanel::default()
+                    .frame(Frame::new().fill(p.paper))
+                    .show(ui, |ui| app.draw_flow_viewer(ui));
+            });
+            last_cursor = out.platform_output.cursor_icon;
+            out.drop_without_applying_deltas();
+        }
+        assert_ne!(
+            last_cursor,
+            CursorIcon::Text,
+            "hovering tabs bar over a scrolled Flow document must not show Text cursor"
+        );
+    }
+
+    #[test]
+    fn drain_inbox_dir_reads_and_clears_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inbox = dir.path().join("inbox");
+        fs::create_dir_all(&inbox).expect("mkdir");
+        let p1 = dir.path().join("a.epub");
+        let p2 = dir.path().join("b.pdf");
+        storage::write_json(&inbox.join("1.json"), &vec![p1.clone()]).expect("write 1");
+        storage::write_json(&inbox.join("2.json"), &vec![p2.clone()]).expect("write 2");
+
+        let mut got = drain_inbox_dir(&inbox).expect("expected Some(paths)");
+        got.sort();
+        let mut expected = vec![p1, p2];
+        expected.sort();
+        assert_eq!(got, expected);
+        assert!(drain_inbox_dir(&inbox).is_none());
     }
 }

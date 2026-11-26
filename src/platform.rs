@@ -595,10 +595,76 @@ pub fn download_and_stage_update(
     result
 }
 
+pub fn allow_set_foreground_window() {
+    const ASFW_ANY: u32 = u32::MAX;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn AllowSetForegroundWindow(process_id: u32) -> i32;
+    }
+    unsafe {
+        AllowSetForegroundWindow(ASFW_ANY);
+    }
+}
+
+pub fn bring_current_process_window_to_front() {
+    type Hwnd = *mut core::ffi::c_void;
+    const SW_RESTORE: i32 = 9;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(
+            proc: unsafe extern "system" fn(Hwnd, isize) -> i32,
+            lparam: isize,
+        ) -> i32;
+        fn GetWindowThreadProcessId(hwnd: Hwnd, process_id: *mut u32) -> u32;
+        fn IsWindowVisible(hwnd: Hwnd) -> i32;
+        fn IsIconic(hwnd: Hwnd) -> i32;
+        fn ShowWindow(hwnd: Hwnd, cmd_show: i32) -> i32;
+        fn BringWindowToTop(hwnd: Hwnd) -> i32;
+        fn SetForegroundWindow(hwnd: Hwnd) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcessId() -> u32;
+    }
+
+    struct SearchState {
+        pid: u32,
+        found: Hwnd,
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: Hwnd, lparam: isize) -> i32 {
+        unsafe {
+            let state = &mut *(lparam as *mut SearchState);
+            let mut win_pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut win_pid);
+            if win_pid == state.pid && IsWindowVisible(hwnd) != 0 {
+                state.found = hwnd;
+                return 0;
+            }
+            1
+        }
+    }
+
+    let mut state = SearchState {
+        pid: unsafe { GetCurrentProcessId() },
+        found: std::ptr::null_mut(),
+    };
+    unsafe {
+        EnumWindows(enum_proc, (&mut state as *mut SearchState) as isize);
+        if !state.found.is_null() {
+            if IsIconic(state.found) != 0 {
+                ShowWindow(state.found, SW_RESTORE);
+            }
+            BringWindowToTop(state.found);
+            SetForegroundWindow(state.found);
+        }
+    }
+}
+
 pub fn restart(request: Restart) -> io::Result<()> {
     match request {
         Restart::Installed => {
-            Command::new(installed_path()?).spawn()?;
+            Command::new(installed_path()?).arg("--relaunch").spawn()?;
         }
         Restart::Update { executable } => {
             Command::new(executable)
