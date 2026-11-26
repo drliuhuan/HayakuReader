@@ -41,6 +41,7 @@ winreg = "0.55"
 
 [build-dependencies]
 cc = "1"
+flate2 = "1"
 
 [profile.release]
 lto = "thin"

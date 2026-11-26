@@ -1,14 +1,18 @@
 use crate::flow::OutlineEntry;
 use flate2::read::GzDecoder;
 use pdfium_render::prelude::*;
+#[cfg(not(embedded_pdfium))]
+use std::io::Read;
 use std::{
     fs,
-    io::{self, Cursor, Read},
+    io::{self, Cursor},
     path::{Path, PathBuf},
     sync::OnceLock,
 };
+#[cfg(not(embedded_pdfium))]
 use tar::Archive;
 
+#[cfg(not(embedded_pdfium))]
 const PDFIUM_WIN_X64_URL: &str =
     "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F8066/pdfium-win-x64.tgz";
 
@@ -40,6 +44,56 @@ pub struct PdfDoc {
     outline: Vec<OutlineEntry>,
 }
 
+#[cfg(embedded_pdfium)]
+const EMBEDDED_PDFIUM_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pdfium.dll.gz"));
+#[cfg(embedded_pdfium)]
+const EMBEDDED_PDFIUM_LEN: &str = include_str!(concat!(env!("OUT_DIR"), "/pdfium.len"));
+
+fn pdfium_cache_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("HayakuReader")
+        .join("pdfium")
+        .join("pdfium-8066")
+}
+
+#[cfg(embedded_pdfium)]
+fn ensure_embedded_pdfium_dll() -> Result<PathBuf, String> {
+    let lib_name = Pdfium::pdfium_platform_library_name();
+    let dir = pdfium_cache_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("无法创建内置 PDFium 缓存目录：{e}"))?;
+    let dest = dir.join(&lib_name);
+    let expected_len: u64 = EMBEDDED_PDFIUM_LEN.trim().parse().unwrap_or(0);
+    if dest.is_file()
+        && expected_len > 0
+        && fs::metadata(&dest).is_ok_and(|m| m.len() == expected_len)
+    {
+        return Ok(dest);
+    }
+    let tmp = dir.join(format!("{}.{}.tmp", lib_name.to_string_lossy(), std::process::id()));
+    {
+        let mut decoder = GzDecoder::new(Cursor::new(EMBEDDED_PDFIUM_GZ));
+        let mut out = fs::File::create(&tmp)
+            .map_err(|e| format!("写出内置 pdfium.dll 失败：{e}"))?;
+        io::copy(&mut decoder, &mut out)
+            .map_err(|e| format!("解压内置 pdfium.dll 失败：{e}"))?;
+    }
+    if dest.is_file() {
+        let _ = fs::remove_file(&dest);
+    }
+    if let Err(e) = fs::rename(&tmp, &dest) {
+        let _ = fs::remove_file(&tmp);
+        if dest.is_file() {
+            return Ok(dest);
+        }
+        return Err(format!("安装内置 pdfium.dll 失败：{e}"));
+    }
+    Ok(dest)
+}
+
+#[cfg(any(not(embedded_pdfium), test))]
 fn find_cached_pdfium_dll() -> Option<PathBuf> {
     let lib_name = Pdfium::pdfium_platform_library_name();
     let mut candidates = Vec::new();
@@ -51,10 +105,10 @@ fn find_cached_pdfium_dll() -> Option<PathBuf> {
     if let Some(env_path) = std::env::var_os("PDFIUM_LIB_PATH") {
         candidates.push(PathBuf::from(env_path));
     }
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        let local_root = PathBuf::from(local).join("HayakuReader").join("pdfium");
-        candidates.push(local_root.join("pdfium-8066").join(&lib_name));
-        candidates.push(local_root.join(&lib_name));
+    let local_root = pdfium_cache_dir();
+    candidates.push(local_root.join(&lib_name));
+    if let Some(parent) = local_root.parent() {
+        candidates.push(parent.join(&lib_name));
     }
     if let Some(profile) = std::env::var_os("USERPROFILE") {
         let cache_root = PathBuf::from(profile).join(".cache").join("pdfium-bundled");
@@ -68,15 +122,10 @@ fn find_cached_pdfium_dll() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+#[cfg(not(embedded_pdfium))]
 fn download_pdfium_dll() -> Result<PathBuf, String> {
     let lib_name = Pdfium::pdfium_platform_library_name();
-    let base_dir = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("HayakuReader")
-        .join("pdfium")
-        .join("pdfium-8066");
+    let base_dir = pdfium_cache_dir();
     fs::create_dir_all(&base_dir).map_err(|e| format!("无法创建 PDFium 缓存目录：{e}"))?;
     let dest = base_dir.join(&lib_name);
     if dest.is_file() {
@@ -124,10 +173,25 @@ fn download_pdfium_dll() -> Result<PathBuf, String> {
 fn pdfium_instance() -> Result<&'static Pdfium, String> {
     static PDFIUM: OnceLock<Result<Pdfium, String>> = OnceLock::new();
     let res = PDFIUM.get_or_init(|| {
-        let lib_path = if let Some(found) = find_cached_pdfium_dll() {
+        let exe_local = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join(Pdfium::pdfium_platform_library_name())))
+            .filter(|p| p.is_file());
+        let lib_path = if let Some(found) = exe_local {
             found
         } else {
-            download_pdfium_dll()?
+            #[cfg(embedded_pdfium)]
+            {
+                ensure_embedded_pdfium_dll()?
+            }
+            #[cfg(not(embedded_pdfium))]
+            {
+                if let Some(found) = find_cached_pdfium_dll() {
+                    found
+                } else {
+                    download_pdfium_dll()?
+                }
+            }
         };
         let bindings = Pdfium::bind_to_library(&lib_path)
             .or_else(|_| Pdfium::bind_to_system_library())

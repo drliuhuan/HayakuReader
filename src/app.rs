@@ -130,23 +130,21 @@ struct HitLinkBox {
 enum FlowVisual {
     Separator,
     FallbackBlock,
-    SingleGalley {
-        galley: Arc<egui::Galley>,
+    SingleJob {
+        job: LayoutJob,
         pad_top: f32,
-        links: Vec<HitLinkBox>,
+        link_spans: Vec<(usize, usize, LinkTarget)>,
         code_box: bool,
         quote_bar: bool,
     },
     CodeLine {
-        line_no_galley: Arc<egui::Galley>,
-        code_galley: Arc<egui::Galley>,
+        line_no_text: String,
+        code_job: LayoutJob,
+        font_size: f32,
     },
-    RichLines {
-        lines: Vec<MeasuredLine>,
-        char_boxes: Vec<Rect>,
+    RichSpec {
+        scale_mul: f32,
         pad_top: f32,
-        extra_gap: f32,
-        base_ascent: f32,
     },
 }
 
@@ -189,6 +187,7 @@ pub struct HayakuApp {
     active_book: Option<OpenBook>,
     sidebar_open: bool,
     sidebar_tab: SidebarTab,
+    active_outline_idx: Option<usize>,
     focus_mode: bool,
     show_settings: bool,
     show_search: bool,
@@ -286,6 +285,7 @@ impl HayakuApp {
             active_book: None,
             sidebar_open: false,
             sidebar_tab: SidebarTab::Contents,
+            active_outline_idx: None,
             focus_mode: false,
             show_settings: false,
             show_search: false,
@@ -364,6 +364,13 @@ impl HayakuApp {
 
     fn is_smart_invert(&self) -> bool {
         self.theme_mode() == ThemeMode::Dark && self.settings.smart_invert
+    }
+
+    fn is_modal_open(&self) -> bool {
+        self.link_warning.is_some()
+            || self.smart_invert_hint_open
+            || self.show_install_dialog
+            || self.show_update_dialog
     }
 
     fn set_status(&mut self, msg: impl Into<String>, secs: Option<u64>) {
@@ -548,6 +555,7 @@ impl HayakuApp {
         self.fixed_zoom = None;
         self.page_cache.clear();
         self.flow_cache = None;
+        self.active_outline_idx = None;
         self.flow_sel_anchor = None;
         self.flow_sel_head = None;
         self.flow_sel_dragging = false;
@@ -849,11 +857,7 @@ impl HayakuApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &Context) {
-        let modal_open = self.link_warning.is_some()
-            || self.smart_invert_hint_open
-            || self.show_install_dialog
-            || self.show_update_dialog;
-        if modal_open {
+        if self.is_modal_open() {
             return;
         }
         let typing = ctx.egui_wants_keyboard_input();
@@ -1033,93 +1037,49 @@ impl HayakuApp {
     }
 
     fn draw_resize_edges(&self, ctx: &Context) {
-        if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+        if self.is_modal_open() || ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
             return;
         }
         let rect = ctx.input(|i| i.viewport_rect());
+        let (pos, pressed) = ctx.input(|i| (i.pointer.latest_pos(), i.pointer.primary_pressed()));
+        let Some(pos) = pos else {
+            return;
+        };
         let edge = 5.0;
         let corner = 10.0;
-        let specs = [
-            (
-                "resize_nw",
-                Rect::from_min_max(rect.min, rect.min + Vec2::splat(corner)),
-                ResizeDirection::NorthWest,
-                CursorIcon::ResizeNwSe,
-            ),
-            (
-                "resize_ne",
-                Rect::from_min_max(
-                    Pos2::new(rect.max.x - corner, rect.min.y),
-                    Pos2::new(rect.max.x, rect.min.y + corner),
-                ),
-                ResizeDirection::NorthEast,
-                CursorIcon::ResizeNeSw,
-            ),
-            (
-                "resize_sw",
-                Rect::from_min_max(
-                    Pos2::new(rect.min.x, rect.max.y - corner),
-                    Pos2::new(rect.min.x + corner, rect.max.y),
-                ),
-                ResizeDirection::SouthWest,
-                CursorIcon::ResizeNeSw,
-            ),
-            (
-                "resize_se",
-                Rect::from_min_max(rect.max - Vec2::splat(corner), rect.max),
-                ResizeDirection::SouthEast,
-                CursorIcon::ResizeNwSe,
-            ),
-            (
-                "resize_n",
-                Rect::from_min_max(
-                    Pos2::new(rect.min.x + corner, rect.min.y),
-                    Pos2::new(rect.max.x - corner, rect.min.y + edge),
-                ),
-                ResizeDirection::North,
-                CursorIcon::ResizeVertical,
-            ),
-            (
-                "resize_s",
-                Rect::from_min_max(
-                    Pos2::new(rect.min.x + corner, rect.max.y - edge),
-                    Pos2::new(rect.max.x - corner, rect.max.y),
-                ),
-                ResizeDirection::South,
-                CursorIcon::ResizeVertical,
-            ),
-            (
-                "resize_w",
-                Rect::from_min_max(
-                    Pos2::new(rect.min.x, rect.min.y + corner),
-                    Pos2::new(rect.min.x + edge, rect.max.y - corner),
-                ),
-                ResizeDirection::West,
-                CursorIcon::ResizeHorizontal,
-            ),
-            (
-                "resize_e",
-                Rect::from_min_max(
-                    Pos2::new(rect.max.x - edge, rect.min.y + corner),
-                    Pos2::new(rect.max.x, rect.max.y - corner),
-                ),
-                ResizeDirection::East,
-                CursorIcon::ResizeHorizontal,
-            ),
-        ];
-        for (id, r, dir, cursor) in specs {
-            egui::Area::new(Id::unique(id))
-                .fixed_pos(r.min)
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    let resp = ui.allocate_rect(r, Sense::drag());
-                    if resp.hovered() {
-                        ui.ctx().set_cursor_icon(cursor);
-                    }
-                    if resp.drag_started_by(PointerButton::Primary) {
-                        ui.ctx().send_viewport_cmd(ViewportCommand::BeginResize(dir));
-                    }
-                });
+        let left = pos.x <= rect.min.x + edge;
+        let right = pos.x >= rect.max.x - edge;
+        let top = pos.y <= rect.min.y + edge;
+        let bottom = pos.y >= rect.max.y - edge;
+        let c_left = pos.x <= rect.min.x + corner;
+        let c_right = pos.x >= rect.max.x - corner;
+        let c_top = pos.y <= rect.min.y + corner;
+        let c_bottom = pos.y >= rect.max.y - corner;
+
+        let hit = if c_top && c_left && (top || left) {
+            Some((ResizeDirection::NorthWest, CursorIcon::ResizeNwSe))
+        } else if c_top && c_right && (top || right) {
+            Some((ResizeDirection::NorthEast, CursorIcon::ResizeNeSw))
+        } else if c_bottom && c_left && (bottom || left) {
+            Some((ResizeDirection::SouthWest, CursorIcon::ResizeNeSw))
+        } else if c_bottom && c_right && (bottom || right) {
+            Some((ResizeDirection::SouthEast, CursorIcon::ResizeNwSe))
+        } else if top {
+            Some((ResizeDirection::North, CursorIcon::ResizeVertical))
+        } else if bottom {
+            Some((ResizeDirection::South, CursorIcon::ResizeVertical))
+        } else if left {
+            Some((ResizeDirection::West, CursorIcon::ResizeHorizontal))
+        } else if right {
+            Some((ResizeDirection::East, CursorIcon::ResizeHorizontal))
+        } else {
+            None
+        };
+        if let Some((dir, cursor)) = hit {
+            ctx.set_cursor_icon(cursor);
+            if pressed {
+                ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
+            }
         }
     }
 
@@ -1501,8 +1461,15 @@ impl HayakuApp {
                         if entries.is_empty() {
                             ui.label(RichText::new("此文档没有目录").color(p.muted));
                         } else {
-                            for entry in entries {
-                                let active = entry.index == self.current_unit;
+                            let fallback_idx = entries.iter().position(|e| e.index == self.current_unit);
+                            for (oi, entry) in entries.iter().enumerate() {
+                                let active = if let Some(sel) = self.active_outline_idx
+                                    && entries.get(sel).is_some_and(|e| e.index == self.current_unit)
+                                {
+                                    sel == oi
+                                } else {
+                                    fallback_idx == Some(oi)
+                                };
                                 let text = if active {
                                     RichText::new(&entry.title).strong().color(p.accent)
                                 } else {
@@ -1511,10 +1478,11 @@ impl HayakuApp {
                                 if ui.selectable_label(active, text).clicked() {
                                     self.pending_jump = Some(PendingJump {
                                         chapter: entry.index,
-                                        fragment: entry.fragment,
+                                        fragment: entry.fragment.clone(),
                                         fraction: 0.0,
                                     });
                                     self.current_unit = entry.index;
+                                    self.active_outline_idx = Some(oi);
                                 }
                             }
                         }
@@ -1812,9 +1780,12 @@ impl HayakuApp {
         let mut clicked_page: Option<usize> = None;
         let mut requested_menu: Option<ImageContextMenu> = None;
 
-        let pointer_pos = ui.ctx().pointer_latest_pos();
-        let primary_pressed = ui.ctx().input(|i| i.pointer.primary_pressed());
-        let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
+        let modal_open = self.is_modal_open();
+        let pointer_pos = (!modal_open)
+            .then(|| ui.ctx().pointer_latest_pos())
+            .flatten();
+        let primary_pressed = !modal_open && ui.ctx().input(|i| i.pointer.primary_pressed());
+        let primary_down = !modal_open && ui.ctx().input(|i| i.pointer.primary_down());
         if !primary_down {
             self.fixed_sel_dragging = false;
         }
@@ -2075,48 +2046,21 @@ impl HayakuApp {
                     }
 
                     // Interactive links overlay
-                    for link in &cached.links {
-                        let lr = Rect::from_min_size(
-                            Pos2::new(
-                                page_rect.left() + link.rect_pt[0] * factor,
-                                page_rect.top() + link.rect_pt[1] * factor,
-                            ),
-                            Vec2::new(link.rect_pt[2] * factor, link.rect_pt[3] * factor),
-                        );
-                        let resp = ui.interact(
-                            lr,
-                            ui.scope_id()
-                                .with(("pdf-link", idx, lr.min.x as i32, lr.min.y as i32)),
-                            Sense::click(),
-                        );
-                        if resp.hovered() {
-                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                            ui.painter().rect_filled(
-                                lr,
-                                2.0,
-                                Color32::from_rgba_unmultiplied(0x28, 0x58, 0x47, 45),
-                            );
-                        }
-                        if resp.clicked() {
-                            if let Some(u) = &link.uri {
-                                clicked_external = Some(u.clone());
-                            } else if let Some(dest_p) = link.dest_page {
-                                clicked_page = Some(dest_p);
-                            }
-                        }
-                    }
-
-                    for (ri, run) in cached.word_runs.iter().enumerate() {
-                        if let Some(url) = &run.url {
+                    if !modal_open {
+                        for link in &cached.links {
                             let lr = Rect::from_min_size(
                                 Pos2::new(
-                                    page_rect.left() + run.left * factor,
-                                    page_rect.top() + run.top * factor,
+                                    page_rect.left() + link.rect_pt[0] * factor,
+                                    page_rect.top() + link.rect_pt[1] * factor,
                                 ),
-                                Vec2::new(run.width * factor, (run.size * 1.2) * factor),
+                                Vec2::new(link.rect_pt[2] * factor, link.rect_pt[3] * factor),
                             );
-                            let resp =
-                                ui.interact(lr, ui.scope_id().with(("wlink", idx, ri)), Sense::click());
+                            let resp = ui.interact(
+                                lr,
+                                ui.scope_id()
+                                    .with(("pdf-link", idx, lr.min.x as i32, lr.min.y as i32)),
+                                Sense::click(),
+                            );
                             if resp.hovered() {
                                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                                 ui.painter().rect_filled(
@@ -2126,18 +2070,55 @@ impl HayakuApp {
                                 );
                             }
                             if resp.clicked() {
-                                clicked_external = Some(url.clone());
+                                if let Some(u) = &link.uri {
+                                    clicked_external = Some(u.clone());
+                                } else if let Some(dest_p) = link.dest_page {
+                                    clicked_page = Some(dest_p);
+                                }
+                            }
+                        }
+
+                        for (ri, run) in cached.word_runs.iter().enumerate() {
+                            if let Some(url) = &run.url {
+                                let lr = Rect::from_min_size(
+                                    Pos2::new(
+                                        page_rect.left() + run.left * factor,
+                                        page_rect.top() + run.top * factor,
+                                    ),
+                                    Vec2::new(run.width * factor, (run.size * 1.2) * factor),
+                                );
+                                let resp = ui.interact(
+                                    lr,
+                                    ui.scope_id().with(("wlink", idx, ri)),
+                                    Sense::click(),
+                                );
+                                if resp.hovered() {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    ui.painter().rect_filled(
+                                        lr,
+                                        2.0,
+                                        Color32::from_rgba_unmultiplied(0x28, 0x58, 0x47, 45),
+                                    );
+                                }
+                                if resp.clicked() {
+                                    clicked_external = Some(url.clone());
+                                }
                             }
                         }
                     }
 
-                    let page_resp = ui.interact(
-                        page_rect,
-                        ui.scope_id().with(("fixed-page-ctx", idx)),
-                        Sense::click(),
-                    );
-                    if page_resp.secondary_clicked()
-                        && let Some(pointer) = ui.ctx().pointer_latest_pos()
+                    let page_resp = if modal_open {
+                        None
+                    } else {
+                        Some(ui.interact(
+                            page_rect,
+                            ui.scope_id().with(("fixed-page-ctx", idx)),
+                            Sense::click(),
+                        ))
+                    };
+                    if let Some(page_resp) = page_resp
+                        && page_resp.secondary_clicked()
+                        && let Some(pointer) = pointer_pos
                     {
                         let px_pt = (pointer.x - page_rect.left()) / factor;
                         let py_pt = (pointer.y - page_rect.top()) / factor;
@@ -2442,9 +2423,14 @@ impl HayakuApp {
         let mut clicked_link: Option<LinkTarget> = None;
         let mut requested_menu: Option<ImageContextMenu> = None;
 
-        let pointer_pos = ui.ctx().pointer_latest_pos();
-        let primary_pressed = ui.ctx().input(|i| i.pointer.primary_pressed());
-        let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
+        let modal_open = self.is_modal_open();
+        let pointer_pos = if modal_open {
+            None
+        } else {
+            ui.ctx().pointer_latest_pos()
+        };
+        let primary_pressed = !modal_open && ui.ctx().input(|i| i.pointer.primary_pressed());
+        let primary_down = !modal_open && ui.ctx().input(|i| i.pointer.primary_down());
         if !primary_down {
             self.flow_sel_dragging = false;
         }
@@ -2455,8 +2441,9 @@ impl HayakuApp {
         }
 
         let scroll_out = scroll.show_viewport(ui, |ui, viewport| {
+            let canvas_sense = if modal_open { Sense::hover() } else { Sense::click() };
             let (canvas_rect, canvas_resp) =
-                ui.allocate_exact_size(Vec2::new(avail_w.max(viewport.width()), total_h), Sense::click());
+                ui.allocate_exact_size(Vec2::new(avail_w.max(viewport.width()), total_h), canvas_sense);
             let col_left = canvas_rect.left() + ((canvas_rect.width() - measure) * 0.5).max(16.0);
             let vis_top = viewport.min.y;
             let vis_bot = viewport.max.y;
@@ -2495,7 +2482,7 @@ impl HayakuApp {
                     continue;
                 }
 
-                // Lazily build cached layout for visible item
+                // Lazily build cached LayoutJob / spec for visible item (never stores stale Galleys)
                 if cache.items[idx].visual.is_none() {
                     let mut ctx = FlowDrawCtx {
                         book_id: &book_id,
@@ -2511,10 +2498,10 @@ impl HayakuApp {
                         clicked_link: &mut clicked_link,
                         requested_menu: &mut requested_menu,
                     };
-                    let (visual, real_h) =
+                    let (visual, est_h) =
                         build_flow_item_visual(ui, &cache.items[idx].source, &flow, &mut ctx);
                     cache.items[idx].visual = Some(visual);
-                    cache.items[idx].height = real_h;
+                    cache.items[idx].height = est_h;
                 }
 
                 let actual_h = cache.items[idx].height;
@@ -2523,7 +2510,6 @@ impl HayakuApp {
                     Vec2::new(measure, actual_h),
                 );
 
-                // Selection highlight + paint
                 let item_sel = sel_range.and_then(|(s, e)| {
                     if idx < s.item_idx || idx > e.item_idx {
                         return None;
@@ -2542,6 +2528,9 @@ impl HayakuApp {
                     (c1 > c0).then_some((c0, c1))
                 });
 
+                let mut updated_h: Option<f32> = None;
+                let gap = font_size * 0.55;
+
                 if let Some(visual) = cache.items[idx].visual.as_ref() {
                     match visual {
                         FlowVisual::Separator => {
@@ -2554,13 +2543,23 @@ impl HayakuApp {
                                 Stroke::new(1.0, p.line),
                             );
                         }
-                        FlowVisual::SingleGalley {
-                            galley,
+                        FlowVisual::SingleJob {
+                            job,
                             pad_top,
-                            links,
+                            link_spans,
                             code_box,
                             quote_bar,
                         } => {
+                            let galley = ui.fonts_mut(|f| f.layout_job(job.clone()));
+                            let extra_pad = if *code_box {
+                                22.0
+                            } else if *pad_top > 0.0 {
+                                *pad_top + 2.0
+                            } else {
+                                0.0
+                            };
+                            updated_h = Some(galley.rect.height() + extra_pad + gap);
+
                             let content_pos = Pos2::new(
                                 item_rect.left()
                                     + if *code_box {
@@ -2600,23 +2599,25 @@ impl HayakuApp {
                                 );
                             }
                             if let Some((c0, c1)) = item_sel {
-                                paint_galley_selection(ui, galley, content_pos, c0, c1, p.selection);
+                                paint_galley_selection(ui, &galley, content_pos, c0, c1, p.selection);
                             }
                             ui.painter().galley(content_pos, galley.clone(), p.ink);
 
-                            for lb in links {
-                                let lr = lb.rel_rect.translate(content_pos.to_vec2());
-                                let resp = ui.interact(
-                                    lr,
-                                    ui.scope_id()
-                                        .with(("flow-link", idx, lr.min.x as i32, lr.min.y as i32)),
-                                    Sense::click(),
-                                );
-                                if resp.hovered() {
-                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                                }
-                                if resp.clicked() {
-                                    clicked_link = Some(lb.target.clone());
+                            if !modal_open {
+                                for lb in compute_galley_link_boxes(&galley, link_spans) {
+                                    let lr = lb.rel_rect.translate(content_pos.to_vec2());
+                                    let resp = ui.interact(
+                                        lr,
+                                        ui.scope_id()
+                                            .with(("flow-link", idx, lr.min.x as i32, lr.min.y as i32)),
+                                        Sense::click(),
+                                    );
+                                    if resp.hovered() {
+                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    }
+                                    if resp.clicked() {
+                                        clicked_link = Some(lb.target);
+                                    }
                                 }
                             }
 
@@ -2633,13 +2634,24 @@ impl HayakuApp {
                             }
                         }
                         FlowVisual::CodeLine {
-                            line_no_galley,
-                            code_galley,
+                            line_no_text,
+                            code_job,
+                            font_size: c_fsize,
                         } => {
+                            let line_no_galley = ui.fonts_mut(|f| {
+                                f.layout_no_wrap(
+                                    line_no_text.clone(),
+                                    FontId::monospace(*c_fsize),
+                                    p.muted,
+                                )
+                            });
+                            let code_galley = ui.fonts_mut(|f| f.layout_job(code_job.clone()));
+                            updated_h = Some((code_galley.rect.height() + 6.0).max(*c_fsize * 1.48));
+
                             let num_w = 52.0;
                             ui.painter().galley(
                                 Pos2::new(item_rect.left(), item_rect.top() + 2.0),
-                                line_no_galley.clone(),
+                                line_no_galley,
                                 p.muted,
                             );
                             let code_pos =
@@ -2647,7 +2659,7 @@ impl HayakuApp {
                             if let Some((c0, c1)) = item_sel {
                                 paint_galley_selection(
                                     ui,
-                                    code_galley,
+                                    &code_galley,
                                     code_pos,
                                     c0,
                                     c1,
@@ -2666,57 +2678,90 @@ impl HayakuApp {
                                 });
                             }
                         }
-                        FlowVisual::RichLines {
-                            lines,
-                            char_boxes,
-                            pad_top,
-                            extra_gap,
-                            base_ascent,
-                        } => {
-                            if let Some((c0, c1)) = item_sel {
-                                for r in &char_boxes[c0..c1.min(char_boxes.len())] {
-                                    ui.painter().rect_filled(
-                                        r.translate(item_rect.min.to_vec2() + Vec2::new(0.0, *pad_top)),
-                                        1.0,
-                                        p.selection,
-                                    );
-                                }
-                            }
-                            let mut click_hit_boxes = Vec::new();
-                            paint_measured_lines(
-                                ui,
-                                lines,
-                                Pos2::new(item_rect.left(), item_rect.top() + *pad_top),
-                                *base_ascent,
-                                *extra_gap,
-                                p,
-                                &mut click_hit_boxes,
-                            );
-                            for (lr, target) in click_hit_boxes {
-                                let resp = ui.interact(
-                                    lr,
-                                    ui.scope_id()
-                                        .with(("rich-link", idx, lr.min.x as i32, lr.min.y as i32)),
-                                    Sense::click(),
-                                );
-                                if resp.hovered() {
-                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                                }
-                                if resp.clicked() {
-                                    clicked_link = Some(target);
-                                }
-                            }
-                            if let Some(pos) = pointer_pos
-                                && item_rect.contains(pos)
+                        FlowVisual::RichSpec { scale_mul, pad_top } => {
+                            if let FlowSourceRef::Block {
+                                chapter_idx,
+                                block_idx,
+                            } = &cache.items[idx].source
                             {
-                                hover_text_cursor = true;
-                                let origin = item_rect.min + Vec2::new(0.0, *pad_top);
-                                let rel = pos - origin;
-                                let ci = hit_test_char_boxes(rel, char_boxes);
-                                new_hit_pos = Some(FlowTextPos {
-                                    item_idx: idx,
-                                    char_idx: ci,
-                                });
+                                let inlines = match &flow.chapters[*chapter_idx].blocks[*block_idx] {
+                                    Block::Heading { inlines, .. }
+                                    | Block::Paragraph(inlines) => Some(inlines.as_slice()),
+                                    _ => None,
+                                };
+                                if let Some(inlines) = inlines {
+                                    let mut ctx = FlowDrawCtx {
+                                        book_id: &book_id,
+                                        palette: p,
+                                        mode,
+                                        font_size,
+                                        line_height,
+                                        max_width: measure,
+                                        resources: &flow.resources,
+                                        math_cache: &mut self.math_cache,
+                                        math_textures: &mut self.math_textures,
+                                        image_textures: &mut self.image_textures,
+                                        clicked_link: &mut clicked_link,
+                                        requested_menu: &mut requested_menu,
+                                    };
+                                    let (lines, _, char_boxes, extra_gap, base_ascent, total_h) =
+                                        measure_rich_lines(ui, inlines, *scale_mul, &mut ctx);
+                                    updated_h = Some(total_h + *pad_top + gap);
+                                    if let Some((c0, c1)) = item_sel {
+                                        for r in &char_boxes[c0..c1.min(char_boxes.len())] {
+                                            ui.painter().rect_filled(
+                                                r.translate(
+                                                    item_rect.min.to_vec2()
+                                                        + Vec2::new(0.0, *pad_top),
+                                                ),
+                                                1.0,
+                                                p.selection,
+                                            );
+                                        }
+                                    }
+                                    let mut click_hit_boxes = Vec::new();
+                                    paint_measured_lines(
+                                        ui,
+                                        &lines,
+                                        Pos2::new(item_rect.left(), item_rect.top() + *pad_top),
+                                        base_ascent,
+                                        extra_gap,
+                                        p,
+                                        &mut click_hit_boxes,
+                                    );
+                                    if !modal_open {
+                                        for (lr, target) in click_hit_boxes {
+                                            let resp = ui.interact(
+                                                lr,
+                                                ui.scope_id().with((
+                                                    "rich-link",
+                                                    idx,
+                                                    lr.min.x as i32,
+                                                    lr.min.y as i32,
+                                                )),
+                                                Sense::click(),
+                                            );
+                                            if resp.hovered() {
+                                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                            }
+                                            if resp.clicked() {
+                                                clicked_link = Some(target);
+                                            }
+                                        }
+                                    }
+                                    if let Some(pos) = pointer_pos
+                                        && item_rect.contains(pos)
+                                    {
+                                        hover_text_cursor = true;
+                                        let origin = item_rect.min + Vec2::new(0.0, *pad_top);
+                                        let rel = pos - origin;
+                                        let ci = hit_test_char_boxes(rel, &char_boxes);
+                                        new_hit_pos = Some(FlowTextPos {
+                                            item_idx: idx,
+                                            char_idx: ci,
+                                        });
+                                    }
+                                }
                             }
                         }
                         FlowVisual::FallbackBlock => {
@@ -2748,43 +2793,50 @@ impl HayakuApp {
                                     ui.scope_builder(UiBuilder::new().max_rect(unclipped), |ui| {
                                         draw_flow_block_fallback(ui, block, &mut ctx);
                                     });
-                                let real_h =
-                                    (scoped.response.rect.height() + font_size * 0.55).max(20.0);
-                                cache.items[idx].height = real_h;
+                                let real_h = (scoped.response.rect.height() + gap).max(20.0);
+                                updated_h = Some(real_h);
                             }
                         }
                     }
                 }
+                if let Some(nh) = updated_h
+                    && (nh - cache.items[idx].height).abs() > 0.5
+                {
+                    cache.items[idx].height = nh;
+                    ui.ctx().request_repaint();
+                }
             }
 
-            if hover_text_cursor {
-                ui.ctx().set_cursor_icon(CursorIcon::Text);
-            }
-            if primary_pressed && canvas_resp.hovered() {
-                if let Some(pos) = new_hit_pos {
-                    self.flow_sel_anchor = Some(pos);
-                    self.flow_sel_head = Some(pos);
-                    self.flow_sel_dragging = true;
-                } else {
-                    self.flow_sel_anchor = None;
-                    self.flow_sel_head = None;
+            if !modal_open {
+                if hover_text_cursor {
+                    ui.ctx().set_cursor_icon(CursorIcon::Text);
                 }
-            } else if self.flow_sel_dragging && primary_down && let Some(pos) = new_hit_pos {
-                self.flow_sel_head = Some(pos);
-            }
-            if canvas_resp.secondary_clicked()
-                && let Some(pointer) = pointer_pos
-            {
-                let sel = self.selected_flow_text();
-                if !sel.is_empty() {
-                    requested_menu = Some(ImageContextMenu {
-                        pos: pointer,
-                        label: String::new(),
-                        filename: String::new(),
-                        png_bytes: None,
-                        selected_text: Some(sel),
-                        extra_text: None,
-                    });
+                if primary_pressed && canvas_resp.hovered() {
+                    if let Some(pos) = new_hit_pos {
+                        self.flow_sel_anchor = Some(pos);
+                        self.flow_sel_head = Some(pos);
+                        self.flow_sel_dragging = true;
+                    } else {
+                        self.flow_sel_anchor = None;
+                        self.flow_sel_head = None;
+                    }
+                } else if self.flow_sel_dragging && primary_down && let Some(pos) = new_hit_pos {
+                    self.flow_sel_head = Some(pos);
+                }
+                if canvas_resp.secondary_clicked()
+                    && let Some(pointer) = pointer_pos
+                {
+                    let sel = self.selected_flow_text();
+                    if !sel.is_empty() {
+                        requested_menu = Some(ImageContextMenu {
+                            pos: pointer,
+                            label: String::new(),
+                            filename: String::new(),
+                            png_bytes: None,
+                            selected_text: Some(sel),
+                            extra_text: None,
+                        });
+                    }
                 }
             }
 
@@ -2908,14 +2960,20 @@ impl HayakuApp {
             }
         }
 
+        let modal_frame = Frame::new()
+            .fill(p.surface)
+            .stroke(Stroke::new(1.0, p.line))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(16));
+
         if let Some(modal) = self.link_warning.take() {
             let mut keep = true;
-            egui::Window::new("外部链接风险提示")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .fixed_size(Vec2::new(440.0, 210.0))
+            egui::Modal::new(Id::unique("link_warning_modal"))
+                .frame(modal_frame)
                 .show(ctx, |ui| {
+                    ui.set_max_width(440.0);
+                    ui.heading("外部链接风险提示");
+                    ui.separator();
                     let msg = if modal.can_open {
                         "即将离开阅读器并在外部浏览器中打开以下链接。外部页面不受 HayakuReader 控制，可能存在钓鱼、恶意软件或隐私风险，请确认来源可信后再继续："
                     } else {
@@ -2963,12 +3021,12 @@ impl HayakuApp {
         }
 
         if self.smart_invert_hint_open {
-            egui::Window::new("智能反色提示")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(0.0, -56.0))
-                .fixed_size(Vec2::new(360.0, 140.0))
+            egui::Modal::new(Id::unique("smart_invert_hint_modal"))
+                .frame(modal_frame)
                 .show(ctx, |ui| {
+                    ui.set_max_width(380.0);
+                    ui.heading("智能反色提示");
+                    ui.separator();
                     ui.label("已自动启用智能反色以适配深色阅读（保留鲜亮色彩与插图，扫描 PDF 整页反色）。如需查看文档原始色彩，可随时点击下方状态栏的「已启用智能反色」切换关闭。");
                     ui.add_space(8.0);
                     if ui
@@ -3140,47 +3198,50 @@ impl HayakuApp {
         {
             let mut close = false;
             let mut apply = false;
-            egui::Window::new(if st.installed {
-                "文件关联"
-            } else {
-                "安装 HayakuReader"
-            })
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label(st.path.display().to_string());
-                ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    for ext in EXTENSIONS {
-                        let checked = self.install_selected.entry((*ext).to_owned()).or_insert(false);
-                        ui.checkbox(checked, format!(".{ext}"));
+            egui::Modal::new(Id::unique("install_modal"))
+                .frame(modal_frame)
+                .show(ctx, |ui| {
+                    ui.set_max_width(440.0);
+                    ui.heading(if st.installed {
+                        "文件关联"
+                    } else {
+                        "安装 HayakuReader"
+                    });
+                    ui.separator();
+                    ui.label(st.path.display().to_string());
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        for ext in EXTENSIONS {
+                            let checked =
+                                self.install_selected.entry((*ext).to_owned()).or_insert(false);
+                            ui.checkbox(checked, format!(".{ext}"));
+                        }
+                    });
+                    ui.label(
+                        RichText::new("Windows 已设置过默认应用的格式，仍由系统默认应用设置决定。")
+                            .color(p.muted),
+                    );
+                    if st.installed && ui.button("打开 Windows 默认应用").clicked() {
+                        let _ = platform::open_windows_defaults();
                     }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("取消").clicked() {
+                            self.settings.install_dismissed = true;
+                            self.save_settings();
+                            close = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("确定").color(p.accent_ink))
+                                    .fill(p.accent),
+                            )
+                            .clicked()
+                        {
+                            apply = true;
+                        }
+                    });
                 });
-                ui.label(
-                    RichText::new("Windows 已设置过默认应用的格式，仍由系统默认应用设置决定。")
-                        .color(p.muted),
-                );
-                if st.installed && ui.button("打开 Windows 默认应用").clicked() {
-                    let _ = platform::open_windows_defaults();
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("取消").clicked() {
-                        self.settings.install_dismissed = true;
-                        self.save_settings();
-                        close = true;
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("确定").color(p.accent_ink))
-                                .fill(p.accent),
-                        )
-                        .clicked()
-                    {
-                        apply = true;
-                    }
-                });
-            });
             if apply {
                 let selected: Vec<String> = EXTENSIONS
                     .iter()
@@ -3191,7 +3252,10 @@ impl HayakuApp {
                     Ok(Some(restart_req)) => {
                         self.save_active_book();
                         self.save_workspace();
-                        if platform::restart(restart_req).is_ok() {
+                        if let Err(e) = platform::restart(restart_req) {
+                            self.set_status(format!("重启失败：{e}"), None);
+                            self.show_install_dialog = false;
+                        } else {
                             ctx.send_viewport_cmd(ViewportCommand::Close);
                         }
                     }
@@ -3213,11 +3277,12 @@ impl HayakuApp {
             && let Some(rel) = self.pending_release.clone()
         {
             let mut close = false;
-            egui::Window::new(format!("发现新版本 {}", rel.tag_name))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            egui::Modal::new(Id::unique("update_modal"))
+                .frame(modal_frame)
                 .show(ctx, |ui| {
+                    ui.set_max_width(440.0);
+                    ui.heading(format!("发现新版本 {}", rel.tag_name));
+                    ui.separator();
                     if !platform::installed() {
                         ui.label("当前为便携运行版。如需应用内更新，请先通过「阅读设置 -> 安装」安装到本机，或前往 GitHub 手动下载。");
                         ui.horizontal(|ui| {
@@ -3529,13 +3594,12 @@ fn estimate_block_height(
     }
 }
 
-fn build_single_galley_inlines(
-    ui: &Ui,
+fn build_single_job_inlines(
     inlines: &[Inline],
     fsize: f32,
     palette: Palette,
     max_w: f32,
-) -> (Arc<egui::Galley>, String, Vec<HitLinkBox>) {
+) -> (LayoutJob, Vec<(usize, usize, LinkTarget)>) {
     let mut job = LayoutJob::default();
     job.wrap.max_width = max_w;
     let mut plain = String::new();
@@ -3552,15 +3616,21 @@ fn build_single_galley_inlines(
         &mut plain,
         &mut link_spans,
     );
-    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    (job, link_spans)
+}
+
+fn compute_galley_link_boxes(
+    galley: &egui::Galley,
+    link_spans: &[(usize, usize, LinkTarget)],
+) -> Vec<HitLinkBox> {
     let mut hit_links = Vec::new();
     for (c0, c1, target) in link_spans {
-        if c1 > c0 {
+        if *c1 > *c0 {
             let mut offset = 0usize;
             for row in &galley.rows {
                 let len = row.row.glyphs.len();
                 let end = offset + len + usize::from(row.ends_with_newline);
-                if c1 > offset && c0 < offset + len {
+                if *c1 > offset && *c0 < offset + len {
                     let s0 = c0.saturating_sub(offset).min(len);
                     let s1 = c1.saturating_sub(offset).min(len);
                     if s1 > s0 {
@@ -3581,7 +3651,7 @@ fn build_single_galley_inlines(
             }
         }
     }
-    (galley, plain, hit_links)
+    hit_links
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3692,17 +3762,15 @@ fn build_flow_item_visual(
             lang,
         } => {
             let fsize = (ctx.font_size * 0.88).max(12.0);
-            let num_galley = ui.fonts_mut(|f| {
-                f.layout_no_wrap(format!("{line_no:>5}"), FontId::monospace(fsize), ctx.palette.muted)
-            });
-            let mut job = highlight::highlight_line(text, *lang, ctx.mode, fsize);
-            job.wrap.max_width = (ctx.max_width - 56.0).max(120.0);
-            let code_galley = ui.fonts_mut(|f| f.layout_job(job));
-            let h = (code_galley.rect.height() + 6.0).max(fsize * 1.48);
+            let mut code_job = highlight::highlight_line(text, *lang, ctx.mode, fsize);
+            code_job.wrap.max_width = (ctx.max_width - 56.0).max(120.0);
+            let galley = ui.fonts_mut(|f| f.layout_job(code_job.clone()));
+            let h = (galley.rect.height() + 6.0).max(fsize * 1.48);
             (
                 FlowVisual::CodeLine {
-                    line_no_galley: num_galley,
-                    code_galley,
+                    line_no_text: format!("{line_no:>5}"),
+                    code_job,
+                    font_size: fsize,
                 },
                 h,
             )
@@ -3721,32 +3789,29 @@ fn build_flow_item_visual(
                         _ => 1.08,
                     };
                     if contains_ruby_or_math(inlines) {
-                        let (lines, _, char_boxes, extra_gap, base_ascent, total_h) =
+                        let (_, _, _, _, _, total_h) =
                             measure_rich_lines(ui, inlines, mul, ctx);
                         (
-                            FlowVisual::RichLines {
-                                lines,
-                                char_boxes,
+                            FlowVisual::RichSpec {
+                                scale_mul: mul,
                                 pad_top: 6.0,
-                                extra_gap,
-                                base_ascent,
                             },
                             total_h + 6.0 + gap,
                         )
                     } else {
-                        let (galley, _, links) = build_single_galley_inlines(
-                            ui,
+                        let (job, link_spans) = build_single_job_inlines(
                             inlines,
                             ctx.font_size * mul,
                             ctx.palette,
                             ctx.max_width,
                         );
+                        let galley = ui.fonts_mut(|f| f.layout_job(job.clone()));
                         let h = galley.rect.height() + 8.0 + gap;
                         (
-                            FlowVisual::SingleGalley {
-                                galley,
+                            FlowVisual::SingleJob {
+                                job,
                                 pad_top: 6.0,
-                                links,
+                                link_spans,
                                 code_box: false,
                                 quote_bar: false,
                             },
@@ -3756,32 +3821,29 @@ fn build_flow_item_visual(
                 }
                 Block::Paragraph(inlines) => {
                     if contains_ruby_or_math(inlines) {
-                        let (lines, _, char_boxes, extra_gap, base_ascent, total_h) =
+                        let (_, _, _, _, _, total_h) =
                             measure_rich_lines(ui, inlines, 1.0, ctx);
                         (
-                            FlowVisual::RichLines {
-                                lines,
-                                char_boxes,
+                            FlowVisual::RichSpec {
+                                scale_mul: 1.0,
                                 pad_top: 0.0,
-                                extra_gap,
-                                base_ascent,
                             },
                             total_h + gap,
                         )
                     } else {
-                        let (galley, _, links) = build_single_galley_inlines(
-                            ui,
+                        let (job, link_spans) = build_single_job_inlines(
                             inlines,
                             ctx.font_size,
                             ctx.palette,
                             ctx.max_width,
                         );
+                        let galley = ui.fonts_mut(|f| f.layout_job(job.clone()));
                         let h = galley.rect.height() + gap;
                         (
-                            FlowVisual::SingleGalley {
-                                galley,
+                            FlowVisual::SingleJob {
+                                job,
                                 pad_top: 0.0,
-                                links,
+                                link_spans,
                                 code_box: false,
                                 quote_bar: false,
                             },
@@ -3794,13 +3856,13 @@ fn build_flow_item_visual(
                     let detected = highlight::detect_lang(lang);
                     let mut job = highlight::highlight_block(code, detected, ctx.mode, fsize);
                     job.wrap.max_width = (ctx.max_width - 24.0).max(120.0);
-                    let galley = ui.fonts_mut(|f| f.layout_job(job));
+                    let galley = ui.fonts_mut(|f| f.layout_job(job.clone()));
                     let h = galley.rect.height() + 22.0 + gap;
                     (
-                        FlowVisual::SingleGalley {
-                            galley,
+                        FlowVisual::SingleJob {
+                            job,
                             pad_top: 10.0,
-                            links: Vec::new(),
+                            link_spans: Vec::new(),
                             code_box: true,
                             quote_bar: false,
                         },
@@ -4804,5 +4866,185 @@ fn unpremultiply_rgba(rgba: &mut [u8]) {
             px[1] = ((u16::from(px[1]) * 255) / a).min(255) as u8;
             px[2] = ((u16::from(px[2]) * 255) / a).min(255) as u8;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn find_text_rect_in_shape(shape: &egui::epaint::Shape, needle: &str) -> Option<Rect> {
+        match shape {
+            egui::epaint::Shape::Vec(v) => v
+                .iter()
+                .find_map(|s| find_text_rect_in_shape(s, needle)),
+            egui::epaint::Shape::Text(t) => {
+                if t.galley.text() == needle {
+                    Some(Rect::from_min_size(t.pos, t.galley.size()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn collect_texts_in_shape(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::epaint::Shape::Vec(v) => {
+                for s in v {
+                    collect_texts_in_shape(s, out);
+                }
+            }
+            egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn install_modal_cancel_button_responds_to_click() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (bg_tx, bg_rx) = mpsc::channel();
+        let mut app = HayakuApp {
+            data: dir.path().to_path_buf(),
+            settings: Settings::default(),
+            recent: Vec::new(),
+            workspace: Workspace::default(),
+            tabs: Vec::new(),
+            active_book: None,
+            sidebar_open: false,
+            sidebar_tab: SidebarTab::Contents,
+            active_outline_idx: None,
+            focus_mode: false,
+            show_settings: false,
+            show_search: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_cursor: 0,
+            fixed_zoom: None,
+            page_cache: HashMap::new(),
+            use_tick: 0,
+            pending_jump: None,
+            pending_scroll_y: None,
+            last_scroll_y: 0.0,
+            last_viewport_h: 600.0,
+            last_content_h: 600.0,
+            flow_cache: None,
+            flow_sel_anchor: None,
+            flow_sel_head: None,
+            flow_sel_dragging: false,
+            fixed_sel_anchor: None,
+            fixed_sel_head: None,
+            fixed_sel_dragging: false,
+            fixed_all_selected: false,
+            math_cache: MathCache::default(),
+            math_textures: HashMap::new(),
+            image_textures: HashMap::new(),
+            logo_texture: None,
+            status_msg: None,
+            context_menu: None,
+            link_warning: None,
+            smart_invert_hint_open: false,
+            install_status: Some(platform::InstallationStatus {
+                installed: false,
+                installation_exists: false,
+                path: dir.path().join("HayakuReader.exe"),
+                associations: vec![".pdf".to_owned()],
+            }),
+            show_install_dialog: true,
+            install_selected: HashMap::new(),
+            pending_release: None,
+            show_update_dialog: false,
+            update_progress: Arc::new(Mutex::new(None)),
+            update_downloading: false,
+            bg_rx,
+            bg_tx,
+            last_inbox_poll: Instant::now(),
+            scroll_fraction: 0.0,
+            current_unit: 0,
+        };
+
+        let ctx = Context::default();
+        install_system_fonts(&ctx);
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 720.0));
+
+        // Warmup frames so anchored Modal finishes sizing and fade-in before reading shapes.
+        let mut shapes = Vec::new();
+        for t in [0.0_f64, 0.5_f64] {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(t),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |_ui| {});
+                app.draw_resize_edges(ui.ctx());
+                app.draw_popups(ui.ctx());
+            });
+            shapes = std::mem::take(&mut out.shapes);
+            out.drop_without_applying_deltas();
+        }
+
+        let cancel_rect = shapes
+            .iter()
+            .find_map(|cs| find_text_rect_in_shape(&cs.shape, "取消"))
+            .unwrap_or_else(|| {
+                let mut seen = Vec::new();
+                for cs in &shapes {
+                    collect_texts_in_shape(&cs.shape, &mut seen);
+                }
+                panic!("expected '取消' button text in rendered shapes; rendered: {seen:?}");
+            });
+        let click_pos = cancel_rect.center();
+
+        // Press left mouse button on "取消".
+        let raw_down = egui::RawInput {
+            screen_rect: Some(screen_rect),
+            time: Some(0.6),
+            events: vec![
+                egui::Event::PointerMoved(click_pos),
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let out_down = ctx.run_ui(raw_down, |ui| {
+            egui::CentralPanel::default().show(ui, |_ui| {});
+            app.draw_resize_edges(ui.ctx());
+            app.draw_popups(ui.ctx());
+        });
+        out_down.drop_without_applying_deltas();
+
+        // Release left mouse button on "取消".
+        let raw_up = egui::RawInput {
+            screen_rect: Some(screen_rect),
+            time: Some(0.7),
+            events: vec![egui::Event::PointerButton {
+                pos: click_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let out_up = ctx.run_ui(raw_up, |ui| {
+            egui::CentralPanel::default().show(ui, |_ui| {});
+            app.draw_resize_edges(ui.ctx());
+            app.draw_popups(ui.ctx());
+        });
+        out_up.drop_without_applying_deltas();
+
+        assert!(
+            !app.show_install_dialog,
+            "clicking '取消' on install modal should close show_install_dialog"
+        );
+        assert!(
+            app.settings.install_dismissed,
+            "clicking '取消' on install modal should persist install_dismissed"
+        );
     }
 }
