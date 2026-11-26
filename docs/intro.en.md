@@ -10,7 +10,9 @@ Starting with v0.2.1, HTM and HTML are unchecked by default. You can still selec
 
 v0.2.2 shows update download progress and speed, offers a manual GitHub download after a failure, and asks you to close the previous process if it blocks an update.
 
-Complex Word layouts may differ from the originals. Kindle files protected by DRM or compressed with HUFF/CDIC are currently unsupported. OCR, Markdown editing, and annotation export are planned for later releases.
+v0.2.4 creates Start Menu and Desktop shortcuts on installation and dismisses the splash screen immediately once an associated file finishes loading. It adds global shortcuts (`Ctrl+O/F/B/W/Tab`, `Ctrl+wheel` zoom, `F11` focus mode), floating settings and search panels with match navigation, 4-color quick highlights and in-page annotation editing, dark-mode page inversion, Markdown annotation export, start-page recent history with delete/clear, HTTP Range loading for large PDFs, and nested EPUB/Kindle outlines with fragment anchors.
+
+Complex Word layouts may differ from the originals. Kindle files protected by DRM or compressed with HUFF/CDIC are currently unsupported. OCR and Markdown editing are planned for later releases.
 
 GitHub repository [github.com/drliuhuan/HayakuReader](https://github.com/drliuhuan/HayakuReader)
 

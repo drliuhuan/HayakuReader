@@ -10,7 +10,9 @@ v0.2.1 将 HTM 和 HTML 改为默认不关联。你仍可在安装时或安装�
 
 v0.2.2 显示更新下载进度和速度。更新失败时可转到 GitHub 手动下载。旧进程阻止更新时，应用会提示关闭旧版后重试。
 
-复杂的 Word 排版可能存在显示差异。受 DRM 保护或采用 HUFF/CDIC 压缩的 Kindle 文件暂不可读。OCR、Markdown 编辑和批注导出暂列后续版本。
+v0.2.4 安装时会在开始菜单和桌面自动创建快捷方式；通过关联文件启动时，启动画面在文件加载完成后即刻消失。新增全局快捷键（`Ctrl+O/F/B/W/Tab`、`Ctrl+滚轮` 缩放、`F11` 专注模式）、悬浮设置与搜索条（支持上下匹配跳转与计数）、四色一键高亮与正文点击编辑、深色模式页面护眼反色、批注导出为 Markdown、起始页最近阅读直达与记录删除/清空、大 PDF 分块加载，以及 EPUB/Kindle 多级目录与页内锚点支持。
+
+复杂的 Word 排版可能存在显示差异。受 DRM 保护或采用 HUFF/CDIC 压缩的 Kindle 文件暂不可读。OCR 与 Markdown 编辑暂列后续版本。
 
 GitHub 仓库 [github.com/drliuhuan/HayakuReader](https://github.com/drliuhuan/HayakuReader)
 

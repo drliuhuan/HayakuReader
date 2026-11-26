@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, Read, Write},
+    os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -191,6 +192,57 @@ fn register(app: &App, selected: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+fn run_shortcut_script(target: &Path, explicit_links: Option<&[&Path]>) -> io::Result<()> {
+    let workdir = target.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$shell = New-Object -ComObject WScript.Shell
+$paths = if ($env:HAYAKU_LINKS) {
+    $env:HAYAKU_LINKS -split "`n" | Where-Object { $_ }
+} else {
+    $folders = @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs'))
+    foreach ($folder in $folders) {
+        if ($folder) { Join-Path $folder 'HayakuReader.lnk' }
+    }
+}
+foreach ($linkPath in $paths) {
+    $parent = Split-Path -Parent $linkPath
+    if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+    $shortcut = $shell.CreateShortcut($linkPath)
+    $shortcut.TargetPath = $env:HAYAKU_EXE
+    $shortcut.WorkingDirectory = $env:HAYAKU_WORKDIR
+    $shortcut.IconLocation = "$env:HAYAKU_EXE,0"
+    $shortcut.Description = 'HayakuReader'
+    $shortcut.Save()
+}
+"#;
+    let mut command = Command::new("powershell.exe");
+    command
+        .creation_flags(0x08000000)
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .env("HAYAKU_EXE", target)
+        .env("HAYAKU_WORKDIR", workdir);
+    if let Some(links) = explicit_links {
+        let joined = links
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        command.env("HAYAKU_LINKS", joined);
+    } else {
+        command.env_remove("HAYAKU_LINKS");
+    }
+    let status = command.status()?;
+    if !status.success() {
+        return Err(io::Error::other("Could not create Windows shortcuts"));
+    }
+    Ok(())
+}
+
+pub fn create_shortcuts(target: &Path) -> io::Result<()> {
+    run_shortcut_script(target, None)
+}
+
 fn register_associations(
     root: &RegKey,
     data: &Path,
@@ -350,6 +402,7 @@ pub async fn install(
             copy_binary(&std::env::current_exe().map_err(internal)?, &target).map_err(internal)?;
             write_json(&app.data.join("installed-version.json"), &VERSION).map_err(internal)?;
             register(&app, &config.extensions).map_err(internal)?;
+            create_shortcuts(&target).map_err(internal)?;
             *app.restart.lock().map_err(internal)? = Some(Restart::Installed);
             return Ok(Json(json!({"restart": true})));
         }
@@ -720,6 +773,19 @@ mod tests {
         assert!(!stale.exists());
         assert!(keep_json.exists());
         assert!(keep_other.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn creates_windows_shortcut_files() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let exe = dir.path().join("HayakuReader.exe");
+        fs::write(&exe, b"MZ")?;
+        let desktop_lnk = dir.path().join("Desktop").join("HayakuReader.lnk");
+        let start_lnk = dir.path().join("Programs").join("HayakuReader.lnk");
+        run_shortcut_script(&exe, Some(&[&desktop_lnk, &start_lnk]))?;
+        assert!(fs::metadata(&desktop_lnk)?.len() > 0);
+        assert!(fs::metadata(&start_lnk)?.len() > 0);
         Ok(())
     }
 }
