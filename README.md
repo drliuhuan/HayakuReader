@@ -1,5 +1,7 @@
 # HayakuReader
 
+**简体中文** | [English](README.en.md)
+
 Windows 本地阅读器，使用 Rust 构建。作者为 **drliuhuan**。
 
 - [项目介绍](docs/intro.zh.md)
@@ -9,7 +11,7 @@ Windows 本地阅读器，使用 Rust 构建。作者为 **drliuhuan**。
 
 ## 安装和使用
 
-下载 `HayakuReader.exe` 后双击启动。首次运行可安装到 `%LOCALAPPDATA%\Programs\HayakuReader`。确认后程序会设置所选关联并启动已安装副本。已安装用户可以在阅读设置中调整文件关联和自动更新。Windows 已为某个格式保存默认应用选择时，可在系统的「默认应用」中改选 HayakuReader。
+下载 `HayakuReader.exe` 后双击启动。首次运行可安装到 `%LOCALAPPDATA%\Programs\HayakuReader`。确认后程序会设置所选关联、在开始菜单和桌面创建快捷方式并启动已安装副本。已安装用户可以在阅读设置中调整文件关联和自动更新。Windows 已为某个格式保存默认应用选择时，可在系统的「默认应用」中改选 HayakuReader。
 
 标签页和阅读进度默认在下次启动时恢复，可以在设置中关闭此功能。后台标签页闲置五分钟，或移出最近五个标签页后会休眠。阅读进度、批注和设置保存在 `%LOCALAPPDATA%\HayakuReader`。
 
