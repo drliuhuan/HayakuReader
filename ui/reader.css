@@ -20,7 +20,8 @@
   --tok-quote: #a4b5ab; --tok-entity: #f0a875; --tok-meta: #b1a3eb;
 }
 [hidden] { display: none !important; }
-body { margin: 0; color: var(--ink); background: var(--paper); display: flex; height: 100vh; height: 100dvh; }
+body { margin: 0; color: var(--ink); background: var(--paper); display: flex; height: 100vh; height: 100dvh; user-select: none; }
+#reader.flow, #reader.flow *, .textLayer, .textLayer *, .word-text, .word-text *, #project-intro, dialog blockquote, input, textarea { user-select: text; }
 button, input, select, textarea { font: inherit; color: inherit; }
 button, select, input[type="search"], input[type="number"], textarea {
   border: 1px solid var(--line); border-radius: 7px; background: var(--surface); padding: .55rem .75rem;
@@ -152,6 +153,10 @@ dialog blockquote { margin-inline: 0; color: var(--muted); white-space: pre-wrap
 dialog textarea { width: 100%; resize: vertical; margin: 6px 0; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .danger { margin-right: auto; color: #b54735; }
+#select-all-dialog { width: min(360px, 88vw); }
+#select-all-dialog p { margin: 0 0 10px; }
+#select-all-dialog progress { width: 100%; }
+#select-all-count { margin-right: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
 ::highlight(hayaku-yellow) { background-color: #efc64386; }
 ::highlight(hayaku-green) { background-color: #72c68180; }
 ::highlight(hayaku-blue) { background-color: #72b7ea80; }

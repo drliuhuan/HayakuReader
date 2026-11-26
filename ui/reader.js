@@ -784,7 +784,58 @@ function selectionToolbar() {
   const tools = $("selection-tools");
   tools.hidden = false;
   tools.style.left = Math.max(6, Math.min(bounds.left, innerWidth - tools.offsetWidth - 6)) + "px";
-  tools.style.top = Math.max(6, bounds.top - tools.offsetHeight - 6) + "px";
+  tools.style.top = Math.max(70, Math.min(innerHeight - tools.offsetHeight - 12, bounds.top - tools.offsetHeight - 6)) + "px";
+}
+
+function selectReaderBody() {
+  if (!book || reader.hidden) return;
+  const selection = getSelection();
+  if (!selection) return;
+  const range = document.createRange();
+  range.selectNodeContents(reader);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  selectionToolbar();
+}
+
+async function selectAllDocument() {
+  if (!book || reader.hidden) return;
+  const missing = pdf?.missingTextCount?.() ?? 0;
+  if (!pdf || !missing) {
+    selectReaderBody();
+    return;
+  }
+  const activeBook = book;
+  const dialog = $("select-all-dialog");
+  const progress = $("select-all-progress");
+  const count = $("select-all-count");
+  const controller = new AbortController();
+  const cancel = () => {
+    controller.abort();
+    if (dialog.open) dialog.close();
+  };
+  const onCancel = event => {
+    event.preventDefault();
+    cancel();
+  };
+  $("select-all-cancel").onclick = cancel;
+  dialog.addEventListener("cancel", onCancel);
+  progress.value = 0;
+  count.textContent = "0 / " + missing;
+  dialog.showModal();
+  try {
+    await pdf.ensureAllTextLayers((done, total) => {
+      progress.value = total ? Math.round((100 * done) / total) : 100;
+      count.textContent = done + " / " + total;
+    }, controller.signal);
+    if (!controller.signal.aborted && book === activeBook) {
+      if (dialog.open) dialog.close();
+      selectReaderBody();
+    }
+  } finally {
+    dialog.removeEventListener("cancel", onCancel);
+    if (dialog.open) dialog.close();
+  }
 }
 
 function addAnnotation(annotation) {
@@ -1282,6 +1333,12 @@ document.addEventListener("keydown", event => {
   if (document.querySelector("dialog[open]")) return;
   const ctrl = event.ctrlKey || event.metaKey;
   const inInput = event.target.matches("input, textarea, select") || event.target.isContentEditable;
+  if (ctrl && event.key.toLowerCase() === "a") {
+    if (inInput) return;
+    event.preventDefault();
+    if (book && !reader.hidden) selectAllDocument().catch(report);
+    return;
+  }
   if (ctrl && event.key.toLowerCase() === "o") {
     event.preventDefault();
     openDocument().then(opened => { if (opened) drainDropped().catch(report); });
@@ -1478,6 +1535,8 @@ function localizeStaticUi() {
   updateSmartInvertToggle();
   $("smart-invert-hint-text").textContent = "Smart inversion is enabled for dark mode (vivid colors and inserted images are preserved; scanned PDFs are inverted cleanly). Click \"Smart invert: ON\" in the bottom bar anytime to view original colors.";
   $("smart-invert-ack").textContent = "Got it";
+  $("select-all-label").textContent = "Loading remaining pages…";
+  $("select-all-cancel").textContent = "Cancel";
   updateViewModeButton();
   labelText("note-text", "Note ");
   labelText("color", "Color ");

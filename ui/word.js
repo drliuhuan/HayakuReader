@@ -89,6 +89,28 @@ export function openWord(metadata, contentRoute, request, reader, scroll, onRend
     }
   }
 
+  function buildTextLayer(index, runs) {
+    const [width, height] = metadata.pages[index];
+    const layer = document.createElement("div");
+    layer.className = "word-text";
+    layer.style.width = width + "px";
+    layer.style.height = height + "px";
+    layer.style.transform = "scale(" + scale() + ")";
+    for (const run of runs) {
+      if (run.line_break) layer.append(document.createTextNode("\n"));
+      const span = document.createElement("span");
+      span.textContent = run.text;
+      span.style.left = run.left + "px";
+      span.style.top = run.top + "px";
+      span.style.fontSize = run.size + "px";
+      measure.font = run.size + "px sans-serif";
+      const measured = measure.measureText(run.text).width;
+      if (measured > 0) span.style.transform = "scaleX(" + run.width / measured + ")";
+      layer.append(span);
+    }
+    return layer;
+  }
+
   function render(index) {
     const entry = entries[index];
     if (!entry || closed) return Promise.resolve();
@@ -108,24 +130,7 @@ export function openWord(metadata, contentRoute, request, reader, scroll, onRend
       entry.bitmap = bitmap;
       entry.canvas = canvas;
       paintCanvas(entry, index);
-      const [width, height] = metadata.pages[index];
-      const layer = document.createElement("div");
-      layer.className = "word-text";
-      layer.style.width = width + "px";
-      layer.style.height = height + "px";
-      layer.style.transform = "scale(" + scale() + ")";
-      for (const run of runs) {
-        if (run.line_break) layer.append(document.createTextNode("\n"));
-        const span = document.createElement("span");
-        span.textContent = run.text;
-        span.style.left = run.left + "px";
-        span.style.top = run.top + "px";
-        span.style.fontSize = run.size + "px";
-        measure.font = run.size + "px sans-serif";
-        const measured = measure.measureText(run.text).width;
-        if (measured > 0) span.style.transform = "scaleX(" + run.width / measured + ")";
-        layer.append(span);
-      }
+      const layer = buildTextLayer(index, runs);
       entry.layer = layer;
       entry.element.replaceChildren(canvas, layer);
       evictPages();
@@ -157,6 +162,37 @@ export function openWord(metadata, contentRoute, request, reader, scroll, onRend
       for (const [index, entry] of entries.entries()) {
         if (entry.bitmap && entry.canvas) paintCanvas(entry, index);
       }
+    },
+    missingTextCount() {
+      return entries.filter(entry => !entry.layer).length;
+    },
+    async ensureAllTextLayers(onProgress, signal) {
+      const missing = [];
+      for (let i = 0; i < entries.length; i++) {
+        if (!entries[i].layer) missing.push(i);
+      }
+      const total = missing.length;
+      if (!total) return;
+      let cursor = 0;
+      let done = 0;
+      await Promise.all(Array.from({ length: Math.min(4, total) }, async () => {
+        while (cursor < missing.length && !signal?.aborted && !closed) {
+          const index = missing[cursor++];
+          const entry = entries[index];
+          if (!entry || entry.layer) {
+            onProgress?.(++done, total);
+            continue;
+          }
+          const runs = await getText(index);
+          if (signal?.aborted || closed) return;
+          if (!entry.layer) {
+            const layer = buildTextLayer(index, runs);
+            entry.layer = layer;
+            entry.element.append(layer);
+          }
+          onProgress?.(++done, total);
+        }
+      }));
     },
     async text(index) {
       const runs = await getText(index);

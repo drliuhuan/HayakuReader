@@ -125,6 +125,7 @@ export async function openPdf(url, headers, reader, scroll, onRender, shouldSmar
       entry.cancel?.();
       entry.pending = null;
       entry.cancel = null;
+      entry.hasText = false;
       if (entry.canvas) {
         entry.canvas.width = 0;
         entry.canvas.height = 0;
@@ -177,12 +178,14 @@ export async function openPdf(url, headers, reader, scroll, onRender, shouldSmar
       entry.cancel = () => { raster.cancel(); text.cancel(); };
       const [, , preserveRects] = await Promise.all([raster.promise, text.render(), opsPromise]);
       if (closed || version !== revision) return;
+      entry.hasText = true;
       if (shouldSmartInvert()) applySmartInvertToCanvas(canvas, preserveRects);
       evictPages();
       onRender();
     })().catch(error => {
       if (!closed && version === revision) {
         entry.pending = null;
+        entry.hasText = false;
         if (entry.canvas) {
           entry.canvas.width = 0;
           entry.canvas.height = 0;
@@ -201,6 +204,7 @@ export async function openPdf(url, headers, reader, scroll, onRender, shouldSmar
       entry.cancel?.();
       entry.pending = null;
       entry.cancel = null;
+      entry.hasText = false;
       if (entry.canvas) {
         entry.canvas.width = 0;
         entry.canvas.height = 0;
@@ -224,7 +228,7 @@ export async function openPdf(url, headers, reader, scroll, onRender, shouldSmar
     element.setAttribute("aria-label", "第 " + (i + 1) + " 页");
     dimensions(element, first.getViewport({ scale: scale() }));
     reader.append(element);
-    entries.push({ element, baseViewport: sample, pending: null, cancel: null, canvas: null, visible: false, lastUsed: 0 });
+    entries.push({ element, baseViewport: sample, pending: null, cancel: null, canvas: null, hasText: false, visible: false, lastUsed: 0 });
     observer.observe(element);
   }
 
@@ -254,6 +258,45 @@ export async function openPdf(url, headers, reader, scroll, onRender, shouldSmar
     zoom(by) { zoom = Math.max(.25, Math.min(5, scale() * by)); reset(); },
     resize() { if (zoom === null) reset(); },
     refreshTheme() { reset(); },
+    missingTextCount() {
+      return entries.filter(entry => !entry.hasText).length;
+    },
+    async ensureAllTextLayers(onProgress, signal) {
+      const missing = [];
+      for (let i = 0; i < entries.length; i++) {
+        if (!entries[i].hasText) missing.push(i);
+      }
+      const total = missing.length;
+      if (!total) return;
+      let cursor = 0;
+      let done = 0;
+      const version = revision;
+      await Promise.all(Array.from({ length: Math.min(4, total) }, async () => {
+        while (cursor < missing.length && !signal?.aborted && !closed && version === revision) {
+          const index = missing[cursor++];
+          const entry = entries[index];
+          if (!entry || entry.hasText) {
+            onProgress?.(++done, total);
+            continue;
+          }
+          const page = await document.getPage(index + 1);
+          if (signal?.aborted || closed || version !== revision) return;
+          const viewport = page.getViewport({ scale: scale() });
+          entry.baseViewport = page.getViewport({ scale: 1 });
+          dimensions(entry.element, viewport);
+          const layer = window.document.createElement("div");
+          layer.className = "textLayer";
+          const text = new pdfjs.TextLayer({ textContentSource: page.streamTextContent(), container: layer, viewport });
+          await text.render();
+          if (signal?.aborted || closed || version !== revision) return;
+          if (!entry.pending && !entry.hasText) {
+            entry.element.replaceChildren(layer);
+            entry.hasText = true;
+          }
+          onProgress?.(++done, total);
+        }
+      }));
+    },
     async text(index) {
       const page = await document.getPage(index + 1);
       const data = await page.getTextContent();
