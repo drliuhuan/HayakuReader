@@ -104,6 +104,7 @@ pub struct FlowDocument {
 }
 
 impl FlowChapter {
+    #[allow(dead_code)]
     pub fn plain_text(&self) -> String {
         let mut out = String::new();
         for block in &self.blocks {
@@ -127,6 +128,7 @@ fn collect_inline_plain(inlines: &[Inline], out: &mut String) {
     }
 }
 
+#[allow(dead_code)]
 fn collect_block_plain(block: &Block, out: &mut String) {
     match block {
         Block::Heading { inlines, .. } | Block::Paragraph(inlines) => {

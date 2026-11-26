@@ -2297,19 +2297,15 @@ impl HayakuApp {
                                                             dark,
                                                         );
                                                     }
-                                                    let text_color = if is_hovered && !sleeping {
+                                                    let text_color = if is_hovered || !sleeping {
                                                         p.ink
-                                                    } else if is_hovered && sleeping {
-                                                        p.ink
-                                                    } else if sleeping {
+                                                    } else {
                                                         Color32::from_rgba_unmultiplied(
                                                             p.muted.r(),
                                                             p.muted.g(),
                                                             p.muted.b(),
                                                             195,
                                                         )
-                                                    } else {
-                                                        p.ink
                                                     };
                                                     let label_text =
                                                         RichText::new(truncate_str(&tab.title, 22))
@@ -7347,6 +7343,12 @@ fn push_flattened_flow_block(
     }
 }
 
+type BuiltFlowItems = (
+    Vec<FlowItemEntry>,
+    Vec<usize>,
+    HashMap<(usize, String), usize>,
+);
+
 fn build_flow_items_list(
     flow: &FlowDocument,
     book_kind: &str,
@@ -7354,11 +7356,7 @@ fn build_flow_items_list(
     measure: f32,
     font_size: f32,
     line_height: f32,
-) -> (
-    Vec<FlowItemEntry>,
-    Vec<usize>,
-    HashMap<(usize, String), usize>,
-) {
+) -> BuiltFlowItems {
     let mut items = Vec::new();
     let mut chapter_first_item = Vec::with_capacity(flow.chapters.len());
     let mut anchor_to_item = HashMap::new();
