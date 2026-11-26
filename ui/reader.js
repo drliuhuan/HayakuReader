@@ -1537,6 +1537,11 @@ function localizeStaticUi() {
   $("smart-invert-ack").textContent = "Got it";
   $("select-all-label").textContent = "Loading remaining pages…";
   $("select-all-cancel").textContent = "Cancel";
+  $("win-minimize").setAttribute("aria-label", "Minimize");
+  $("win-minimize").title = "Minimize";
+  $("win-close").setAttribute("aria-label", "Close");
+  $("win-close").title = "Close";
+  updateWindowMaximizeUi(document.body.classList.contains("maximized"));
   updateViewModeButton();
   labelText("note-text", "Note ");
   labelText("color", "Color ");
@@ -1809,6 +1814,55 @@ async function drainDropped() {
   }
 }
 
+function updateWindowMaximizeUi(maximized) {
+  const isMax = Boolean(maximized);
+  document.body.classList.toggle("maximized", isMax);
+  const btn = $("win-maximize");
+  if (!btn) return;
+  const label = isMax ? translate("还原", "Restore") : translate("最大化", "Maximize");
+  btn.setAttribute("aria-label", label);
+  btn.title = label;
+}
+
+function initWindowChrome() {
+  if (!isDesktop) return;
+  document.body.classList.add("desktop");
+  $("window-controls").hidden = false;
+  $("win-minimize").addEventListener("click", () => window.ipc?.postMessage("minimize"));
+  $("win-maximize").addEventListener("click", () => window.ipc?.postMessage("maximize"));
+  $("win-close").addEventListener("click", () => window.ipc?.postMessage("close"));
+  for (const edge of document.querySelectorAll(".win-resize")) {
+    edge.addEventListener("mousedown", event => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      window.ipc?.postMessage("resize:" + edge.dataset.resize);
+    });
+  }
+  let lastDragTap = null;
+  for (const region of document.querySelectorAll(".toolbar, #sidebar .identity")) {
+    region.addEventListener("mousedown", event => {
+      if (event.button !== 0) return;
+      if (event.target.closest("button, input, select, a, [role='tab'], #window-controls")) return;
+      event.preventDefault();
+      const now = Date.now();
+      const isDoubleTap = event.detail === 2 || (
+        lastDragTap &&
+        now - lastDragTap.time < 400 &&
+        Math.hypot(event.screenX - lastDragTap.x, event.screenY - lastDragTap.y) <= 6
+      );
+      if (isDoubleTap) {
+        lastDragTap = null;
+        window.ipc?.postMessage("maximize");
+      } else {
+        lastDragTap = { time: now, x: event.screenX, y: event.screenY };
+        window.ipc?.postMessage("drag");
+      }
+    });
+  }
+}
+
+window.hayakuMaximized = updateWindowMaximizeUi;
+
 window.hayakuOpenDrop = () => {
   drainDropped().catch(report);
 };
@@ -1817,4 +1871,5 @@ window.hayakuFlush = async () => {
   finally { window.ipc?.postMessage("saved"); }
 };
 
+initWindowChrome();
 start().catch(report);

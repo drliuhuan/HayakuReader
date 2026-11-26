@@ -10,7 +10,7 @@ use tao::{
     event_loop::{ControlFlow, EventLoopBuilder},
     platform::run_return::EventLoopExtRunReturn,
     platform::windows::{IconExtWindows, WindowBuilderExtWindows},
-    window::{Icon, WindowBuilder},
+    window::{Icon, ResizeDirection, WindowBuilder},
 };
 use wry::{DragDropEvent, WebContext, WebViewBuilder};
 
@@ -18,6 +18,11 @@ enum DesktopEvent {
     Dropped(PathBuf),
     Saved,
     Restart,
+    Drag,
+    Resize(ResizeDirection),
+    Minimize,
+    ToggleMaximize,
+    Close,
     Poll,
 }
 
@@ -28,11 +33,13 @@ pub fn run(url: &str, app: Shared) -> Result<(), Box<dyn Error>> {
         .with_title("HayakuReader")
         .with_window_icon(icon.clone())
         .with_taskbar_icon(icon)
+        .with_decorations(false)
+        .with_undecorated_shadow(true)
         .with_inner_size(LogicalSize::new(1150.0, 820.0))
         .with_min_inner_size(LogicalSize::new(560.0, 430.0))
         .build(&events)?;
     let dropped = events.create_proxy();
-    let saved = events.create_proxy();
+    let ipc = events.create_proxy();
     let local = url
         .split('#')
         .next()
@@ -51,10 +58,20 @@ pub fn run(url: &str, app: Shared) -> Result<(), Box<dyn Error>> {
                 || url.starts_with(&(local.clone() + "#"))
         })
         .with_ipc_handler(move |request| {
-            if request.body() == "saved" {
-                let _ = saved.send_event(DesktopEvent::Saved);
-            } else if request.body() == "restart" {
-                let _ = saved.send_event(DesktopEvent::Restart);
+            let cmd = match request.body().as_str() {
+                "saved" => Some(DesktopEvent::Saved),
+                "restart" => Some(DesktopEvent::Restart),
+                "drag" => Some(DesktopEvent::Drag),
+                "minimize" => Some(DesktopEvent::Minimize),
+                "maximize" => Some(DesktopEvent::ToggleMaximize),
+                "close" => Some(DesktopEvent::Close),
+                "resize:n" => Some(DesktopEvent::Resize(ResizeDirection::North)),
+                "resize:nw" => Some(DesktopEvent::Resize(ResizeDirection::NorthWest)),
+                "resize:ne" => Some(DesktopEvent::Resize(ResizeDirection::NorthEast)),
+                _ => None,
+            };
+            if let Some(event) = cmd {
+                let _ = ipc.send_event(event);
             }
         })
         .with_drag_drop_handler(move |event| {
@@ -67,6 +84,7 @@ pub fn run(url: &str, app: Shared) -> Result<(), Box<dyn Error>> {
         })
         .build(&window)?;
     let mut closing = None;
+    let mut last_maximized = window.is_maximized();
     // A proxy tick wakes the native message loop even while WebView2 is idle.
     let poll = events.create_proxy();
     let (stop_poll, stopped) = std::sync::mpsc::channel::<()>();
@@ -86,11 +104,43 @@ pub fn run(url: &str, app: Shared) -> Result<(), Box<dyn Error>> {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
-            } if closing.is_none() => {
+            }
+            | Event::UserEvent(DesktopEvent::Close)
+                if closing.is_none() =>
+            {
                 let _ = webview.evaluate_script("window.hayakuFlush?.()");
                 let deadline = Instant::now() + Duration::from_secs(2);
                 closing = Some(deadline);
                 *flow = ControlFlow::WaitUntil(deadline);
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Resized(_),
+                ..
+            } => {
+                let maximized = window.is_maximized();
+                if maximized != last_maximized {
+                    last_maximized = maximized;
+                    let script = if maximized {
+                        "window.hayakuMaximized?.(true)"
+                    } else {
+                        "window.hayakuMaximized?.(false)"
+                    };
+                    let _ = webview.evaluate_script(script);
+                }
+            }
+            Event::UserEvent(DesktopEvent::Drag) if closing.is_none() => {
+                let _ = window.drag_window();
+            }
+            Event::UserEvent(DesktopEvent::Resize(direction))
+                if closing.is_none() && !window.is_maximized() =>
+            {
+                let _ = window.drag_resize_window(direction);
+            }
+            Event::UserEvent(DesktopEvent::Minimize) if closing.is_none() => {
+                window.set_minimized(true);
+            }
+            Event::UserEvent(DesktopEvent::ToggleMaximize) if closing.is_none() => {
+                window.set_maximized(!window.is_maximized());
             }
             Event::UserEvent(DesktopEvent::Saved) if closing.is_some() => *flow = ControlFlow::Exit,
             Event::UserEvent(DesktopEvent::Restart)
