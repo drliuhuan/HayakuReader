@@ -1,0 +1,8 @@
+{
+  "name": "hayaku-reader-assets",
+  "private": true,
+  "dependencies": {
+    "dompurify": "3.5.0",
+    "pdfjs-dist": "6.5.438"
+  }
+}

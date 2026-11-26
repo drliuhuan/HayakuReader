@@ -1,0 +1,29 @@
+[package]
+name = "hayaku-reader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+encoding_rs = "0.8"
+docboss-core = { git = "https://github.com/4thel00z/docboss.git", rev = "2bf47d5a96286e412424f4b2eb7d2eff41855418" }
+docboss-font = { git = "https://github.com/4thel00z/docboss.git", rev = "2bf47d5a96286e412424f4b2eb7d2eff41855418" }
+docboss-layout = { git = "https://github.com/4thel00z/docboss.git", rev = "2bf47d5a96286e412424f4b2eb7d2eff41855418" }
+docboss-render = { git = "https://github.com/4thel00z/docboss.git", rev = "2bf47d5a96286e412424f4b2eb7d2eff41855418" }
+ebook-rs = { version = "0.19.4", default-features = false }
+include_dir = "0.7"
+pulldown-cmark = "0.13"
+rfd = "0.15"
+roxmltree = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+tao = "0.38"
+wry = "0.58"

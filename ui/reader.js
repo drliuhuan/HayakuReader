@@ -1,0 +1,793 @@
+import purify from "/vendor/purify.mjs";
+
+const $ = id => document.getElementById(id);
+const reader = $("reader");
+const scroll = $("scroll");
+const key = location.hash.slice(1);
+const headers = { "x-hayaku-key": key };
+const colors = ["yellow", "green", "blue", "pink"];
+let book = null;
+let pdf = null;
+let contents = [];
+let currentTab = "recent";
+let openBusy = false;
+let sideRevision = 0;
+let searchRevision = 0;
+let saveTimer;
+let saveQueue = Promise.resolve();
+let picked = null;
+let editing = null;
+let restoring = false;
+let progressFrame;
+let results = [];
+
+async function request(url, options = {}) {
+  const response = await fetch(url, { ...options, headers: { ...headers, ...options.headers } });
+  if (!response.ok) throw new Error(await response.text());
+  return response;
+}
+
+function post(url, payload, keepalive = false) {
+  return request(url, {
+    method: "POST", keepalive, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
+  });
+}
+
+function message(text = "") {
+  $("status").textContent = text;
+}
+
+function report(error) {
+  message(error.name === "PasswordException" ? "此 PDF 受密码保护。" : error.message || String(error));
+}
+
+function sessionUrl(action, target = book) {
+  return "/api/" + action + "/" + target.session;
+}
+
+function getState() {
+  return book?.saved;
+}
+
+function save(keepalive = false) {
+  clearTimeout(saveTimer);
+  if (!book) return Promise.resolve();
+  if (!restoring && !reader.hidden && reader.childElementCount) {
+    getState().position = activePosition();
+    getState().digest = book.digest;
+  }
+  const url = sessionUrl("save");
+  const value = structuredClone(getState());
+  saveQueue = saveQueue.catch(() => {}).then(() => post(url, value, keepalive));
+  saveQueue.catch(report);
+  return saveQueue;
+}
+
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(save, 250);
+}
+
+function unit(index) {
+  return reader.querySelector('[data-unit="' + index + '"]');
+}
+
+function units() {
+  return Array.from(reader.querySelectorAll("#reader > [data-unit]"));
+}
+
+function contentRoute(index, encoding = "") {
+  const query = new URLSearchParams({ chapter: index });
+  if (encoding) query.set("encoding", encoding);
+  return sessionUrl("content") + "?" + query;
+}
+
+function stripRemote(reference, base) {
+  if (!reference || /^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(reference) || reference.includes("\\")) return null;
+  try {
+    const origin = "https://hayaku.invalid/";
+    const resolved = new URL(reference, new URL(base.split("/").map(encodeURIComponent).join("/"), origin));
+    if (resolved.origin !== new URL(origin).origin) return null;
+    return { path: decodeURIComponent(resolved.pathname.slice(1)), fragment: decodeURIComponent(resolved.hash.slice(1)) };
+  } catch { return null; }
+}
+
+const safeStyle = new Set([
+  "font-style", "font-weight", "text-decoration", "text-align", "vertical-align",
+  "font-size", "line-height", "text-indent", "color", "background-color",
+  "margin-top", "margin-bottom", "margin-left", "margin-right", "padding-left", "padding-right"
+]);
+
+function resourceUrl(path) {
+  return "/resource/" + key + "/" + book.session + "?" + new URLSearchParams({ path });
+}
+
+function safeDeclarations(style) {
+  const declarations = [];
+  for (const property of safeStyle) {
+    const value = style.getPropertyValue(property);
+    if (value && /^[a-z0-9 #.,()%+-]+$/i.test(value) && !/(?:url|var|attr)\s*\(/i.test(value)) {
+      declarations.push(property + ":" + value);
+    }
+  }
+  return declarations;
+}
+
+async function readStyles(markup, base, index) {
+  const template = document.createElement("template");
+  template.innerHTML = markup;
+  const rules = [];
+  const scope = '#reader > [data-unit="' + index + '"]';
+  for (const element of template.content.querySelectorAll('style,link[rel~="stylesheet"][href]')) {
+    let css = element.textContent;
+    if (element.tagName === "LINK") {
+      const resolved = stripRemote(element.getAttribute("href"), base);
+      if (!resolved?.path || !/\.css$/i.test(resolved.path)) continue;
+      try { css = await (await request(resourceUrl(resolved.path))).text(); }
+      catch { continue; }
+    }
+    const parsed = new CSSStyleSheet();
+    parsed.replaceSync(css);
+    for (const rule of parsed.cssRules) {
+      if (!(rule instanceof CSSStyleRule)) continue;
+      const declarations = safeDeclarations(rule.style);
+      if (!declarations.length) continue;
+      const selector = rule.selectorText.replace(/#([\w-]+)/g, "#user-content-$1");
+      const scoped = /^(?:body|html|:root)$/i.test(selector) ? scope : scope + " :is(" + selector + ")";
+      rules.push(scoped + "{" + declarations.join(";") + "}");
+    }
+  }
+  return rules;
+}
+
+const bookStyles = new CSSStyleSheet();
+document.adoptedStyleSheets = [...document.adoptedStyleSheets, bookStyles];
+
+function addMarkup(target, markup, base, kind, index) {
+  const parsed = purify.sanitize(markup, {
+    RETURN_DOM_FRAGMENT: true, USE_PROFILES: { html: true },
+    FORBID_TAGS: ["style", "link", "meta", "input", "button", "audio", "video", "source", "picture", "form", "iframe", "object", "embed"],
+    FORBID_ATTR: ["srcset", "ping", "target", "autofocus", "contenteditable", "tabindex", "data-unit"],
+    ALLOW_DATA_ATTR: false, SANITIZE_NAMED_PROPS: true
+  });
+  for (const element of parsed.querySelectorAll("[style]")) {
+    const declarations = safeDeclarations(element.style);
+    element.removeAttribute("style");
+    if (declarations.length) element.setAttribute("style", declarations.join(";"));
+  }
+  for (const image of parsed.querySelectorAll("img")) {
+    const source = image.getAttribute("src");
+    const resolved = stripRemote(source, base);
+    if (resolved?.path) {
+      image.src = resourceUrl(resolved.path);
+      image.loading = "lazy";
+    } else if (!/^data:image\/(?:png|jpeg|gif|webp);base64,/i.test(source || "")) {
+      image.removeAttribute("src");
+    }
+  }
+  for (const link of parsed.querySelectorAll("a[href]")) {
+    const original = link.getAttribute("href");
+    const resolved = stripRemote(original, base);
+    link.removeAttribute("href");
+    if (!resolved) continue;
+    const isEbook = kind === "epub" || kind === "kindle";
+    const chapter = isEbook ? book.chapters.findIndex(item => item.path === resolved.path) : index;
+    if (chapter === -1 || (!isEbook && !original.startsWith("#"))) continue;
+    link.href = "#";
+    link.addEventListener("click", event => {
+      event.preventDefault();
+      jump(chapter, null, resolved.fragment);
+    });
+  }
+  target.append(parsed);
+}
+
+function chapterHeading(title, index, fragment) {
+  return { title, index, fragment };
+}
+
+function addHeadings(target, index) {
+  const used = new Set();
+  for (const heading of target.querySelectorAll("h1,h2,h3,h4,h5,h6")) {
+    const title = heading.textContent.trim();
+    if (!title) continue;
+    const slug = title.toLowerCase().replace(/[^\p{L}\p{N}\s_-]/gu, "").trim().replace(/\s+/g, "-") || "heading";
+    let id = heading.id || "user-content-" + slug;
+    for (let count = 1; used.has(id); count++) id = "user-content-" + slug + "-" + count;
+    used.add(id);
+    heading.id = id;
+    contents.push(chapterHeading("　".repeat(Number(heading.tagName[1]) - 1) + title, index, id));
+  }
+}
+
+async function loadFlow() {
+  reader.className = "flow";
+  if (book.kind === "text") {
+    const pre = document.createElement("pre");
+    pre.className = "plain-text";
+    pre.dataset.unit = 0;
+    pre.textContent = await (await request(contentRoute(0, getState().encoding))).text();
+    reader.replaceChildren(pre);
+    return;
+  }
+  const chapters = book.chapters.length ? book.chapters : [{ path: "", title: book.title }];
+  const fragment = document.createDocumentFragment();
+  const rules = [];
+  for (const [index, chapter] of chapters.entries()) {
+    const part = document.createElement("section");
+    part.dataset.unit = index;
+    const markup = await (await request(contentRoute(index))).text();
+    rules.push(...await readStyles(markup, chapter.path, index));
+    addMarkup(part, markup, chapter.path, book.kind, index);
+    if (book.chapters.length) contents.push(chapterHeading(chapter.title, index, ""));
+    if (book.kind !== "epub") addHeadings(part, index);
+    fragment.append(part);
+  }
+  reader.replaceChildren(fragment);
+  bookStyles.replaceSync(rules.join("\n"));
+}
+
+async function present(next) {
+  const previous = book;
+  if (previous) await save().catch(() => {});
+  if (previous?.id === next.id) next.saved = previous.saved;
+  pdf?.close();
+  pdf = null;
+  if (previous) post(sessionUrl("close", previous), {}).catch(() => {});
+  book = next;
+  book.saved = { annotations: [], ...book.saved };
+  contents = [];
+  results = [];
+  CSS.highlights?.delete("hayaku-search");
+  searchRevision++;
+  picked = null;
+  $("selection-tools").hidden = true;
+  $("reader").replaceChildren();
+  bookStyles.replaceSync("");
+  $("reader").hidden = false;
+  $("welcome").hidden = true;
+  $("file-name").textContent = book.title;
+  document.title = book.title + " · HayakuReader";
+  $("progress").hidden = false;
+  $("pdf-tools").hidden = !["pdf", "word"].includes(book.kind);
+  $("encoding-label").hidden = book.kind !== "text";
+  $("encoding").value = getState().encoding || "";
+  for (const id of ["search-toggle", "bookmark", "page-note"]) $(id).disabled = true;
+  restoring = true;
+  try {
+    if (book.kind === "pdf") {
+      reader.className = "fixed";
+      const { openPdf } = await import("/ui/pdf.js");
+      pdf = await openPdf(contentRoute(0), headers, reader, scroll, refreshHighlights);
+      contents = await pdf.outline().catch(() => []);
+      $("page-number").max = pdf.count;
+    } else if (book.kind === "word") {
+      reader.className = "fixed";
+      const { openWord } = await import("/ui/word.js");
+      pdf = openWord(book.word, contentRoute, request, reader, scroll, refreshHighlights);
+      contents = book.word.outline;
+      $("page-number").max = pdf.count;
+    } else {
+      await loadFlow();
+    }
+    const location = getState().position;
+    if (location) await restorePosition(location);
+    else scroll.scrollTop = 0;
+    for (const id of ["search-toggle", "bookmark", "page-note"]) $(id).disabled = false;
+    refreshHighlights();
+    updateProgress();
+    await renderSidebar();
+  } catch (error) {
+    reader.hidden = true;
+    $("progress").hidden = true;
+    $("welcome").hidden = false;
+    reader.replaceChildren();
+    pdf?.close();
+    pdf = null;
+    post(sessionUrl("close"), {}).catch(() => {});
+    book = null;
+    $("file-name").textContent = "";
+    document.title = "HayakuReader";
+    throw error;
+  } finally {
+    restoring = false;
+  }
+}
+
+async function openDocument(payload = {}, file = null) {
+  if (openBusy) return;
+  openBusy = true;
+  for (const id of ["open-file", "welcome-open"]) $(id).disabled = true;
+  message("正在打开文件…");
+  try {
+    const response = file
+      ? await request("/api/import?" + new URLSearchParams({ name: file.name }), { method: "POST", body: file })
+      : await post("/api/open", payload);
+    const next = await response.json();
+    if (next) await present(next);
+    message();
+  } catch (error) {
+    report(error);
+  } finally {
+    for (const id of ["open-file", "welcome-open"]) $(id).disabled = false;
+    openBusy = false;
+  }
+}
+
+function activePosition() {
+  const top = scroll.getBoundingClientRect().top + 12;
+  const candidates = units();
+  let low = 0;
+  let high = candidates.length - 1;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (candidates[middle].getBoundingClientRect().bottom < top) low = middle + 1;
+    else high = middle;
+  }
+  const element = candidates[low];
+  if (!element) return { index: 0, fraction: 0 };
+  const box = element.getBoundingClientRect();
+  const position = {
+    index: Number(element.dataset.unit),
+    fraction: Math.max(0, Math.min(1, (top - box.top) / Math.max(box.height, 1)))
+  };
+  if (!pdf && position.fraction > 0) {
+    const y = Math.min(top, box.bottom - 1);
+    const caret = document.caretRangeFromPoint(Math.max(box.left + 28, 1), y);
+    if (caret && element.contains(caret.startContainer)) {
+      const prefix = document.createRange();
+      prefix.selectNodeContents(element);
+      prefix.setEnd(caret.startContainer, caret.startOffset);
+      const start = prefix.toString().length;
+      const text = element.textContent;
+      const quote = text.slice(start, start + 32);
+      if (quote.trim()) position.anchor = {
+        index: position.index, start, quote, digest: book.digest,
+        before: text.slice(Math.max(0, start - 24), start),
+        after: text.slice(start + quote.length, start + quote.length + 24)
+      };
+    }
+  }
+  return position;
+}
+
+function updateProgress() {
+  if (!book) return;
+  const position = activePosition();
+  const available = scroll.scrollHeight - scroll.clientHeight;
+  const percent = available > 0 ? Math.round(100 * scroll.scrollTop / available) : 100;
+  if (pdf) {
+    $("location").textContent = "第 " + (position.index + 1) + " 页 / 共 " + pdf.count + " 页";
+    if (document.activeElement !== $("page-number")) $("page-number").value = position.index + 1;
+  } else {
+    const chapter = book.chapters[position.index]?.title;
+    $("location").textContent = [chapter, percent + "%"].filter(Boolean).join(" · ");
+  }
+  if (!restoring && reader.childElementCount) {
+    scheduleSave();
+  }
+}
+
+async function jump(index, part = null, fragment = "", fraction = 0) {
+  const element = unit(index);
+  if (!element) return false;
+  if (pdf) await pdf.render(index);
+  const range = part ? locate(part) : null;
+  if (part && !range) return false;
+  const anchor = fragment
+    ? Array.from(element.querySelectorAll("[id]")).find(node => node.id === fragment || node.id === "user-content-" + fragment)
+    : null;
+  const box = element.getBoundingClientRect();
+  const top = range?.getBoundingClientRect().top ?? anchor?.getBoundingClientRect().top ?? box.top + fraction * box.height;
+  scroll.scrollTop += top - scroll.getBoundingClientRect().top - 12;
+  return true;
+}
+
+async function restorePosition(position, allowFraction = true) {
+  if (position.anchor && await jump(position.index, position.anchor)) return true;
+  return allowFraction && await jump(position.index, null, "", position.fraction);
+}
+
+function changeZoom(update) {
+  if (!pdf) return;
+  const { index, fraction } = activePosition();
+  update();
+  jump(index, null, "", fraction).catch(report);
+}
+
+function textRoot(element) {
+  return pdf ? element.querySelector(".textLayer, .word-text") : element;
+}
+
+function rangeAt(root, start, end) {
+  if (start < 0 || end <= start) return null;
+  const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let from = null;
+  let offset = 0;
+  while (walk.nextNode()) {
+    const node = walk.currentNode;
+    const after = offset + node.length;
+    if (!from && start < after) from = [node, start - offset];
+    if (from && end <= after) {
+      const range = document.createRange();
+      range.setStart(...from);
+      range.setEnd(node, end - offset);
+      return range;
+    }
+    offset = after;
+  }
+  return null;
+}
+
+function locate(part) {
+  const element = unit(part.index);
+  const root = element && textRoot(element);
+  if (!root) return null;
+  const text = root.textContent;
+  let start = part.start;
+  if (text.slice(start, start + part.quote.length) !== part.quote || (part.digest && part.digest !== book.digest)) {
+    const candidates = [];
+    for (let index = text.indexOf(part.quote); index >= 0; index = text.indexOf(part.quote, index + part.quote.length)) {
+      const before = text.slice(Math.max(0, index - part.before.length), index);
+      const after = text.slice(index + part.quote.length, index + part.quote.length + part.after.length);
+      const context = Number(Boolean(part.before) && before.endsWith(part.before)) + Number(Boolean(part.after) && after.startsWith(part.after));
+      candidates.push({ index, context });
+      if (candidates.length > 1000) return null;
+    }
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => b.context - a.context);
+    if (candidates.length > 1 && candidates[0].context === candidates[1].context) return null;
+    start = candidates[0].index;
+  }
+  return rangeAt(root, start, start + part.quote.length);
+}
+
+function selectionParts(selection) {
+  if (!book || !selection.rangeCount || selection.isCollapsed || !reader.contains(selection.anchorNode) || !reader.contains(selection.focusNode)) return [];
+  const range = selection.getRangeAt(0);
+  const parts = [];
+  for (const element of units()) {
+    const root = textRoot(element);
+    if (!root || !range.intersectsNode(root)) continue;
+    const prefix = document.createRange();
+    prefix.selectNodeContents(root);
+    const selected = prefix.cloneRange();
+    if (root.contains(range.startContainer)) {
+      prefix.setEnd(range.startContainer, range.startOffset);
+      selected.setStart(range.startContainer, range.startOffset);
+    } else {
+      prefix.collapse(true);
+    }
+    if (root.contains(range.endContainer)) selected.setEnd(range.endContainer, range.endOffset);
+    const quote = selected.toString();
+    if (!quote.trim()) continue;
+    const text = root.textContent;
+    const start = prefix.toString().length;
+    parts.push({
+      index: Number(element.dataset.unit), start, quote, digest: book.digest,
+      before: text.slice(Math.max(0, start - 24), start),
+      after: text.slice(start + quote.length, start + quote.length + 24)
+    });
+  }
+  return parts;
+}
+
+function refreshHighlights() {
+  if (!CSS.highlights || !book) return;
+  const groups = new Map(colors.map(color => [color, new Highlight()]));
+  for (const annotation of getState().annotations) {
+    const group = groups.get(annotation.color || "yellow");
+    if (!group) continue;
+    for (const part of annotation.parts ?? []) {
+      const range = locate(part);
+      if (range) group.add(range);
+    }
+  }
+  for (const [color, ranges] of groups) CSS.highlights.set("hayaku-" + color, ranges);
+}
+
+function selectionToolbar() {
+  const selection = getSelection();
+  const parts = selectionParts(selection);
+  if (!parts.length) {
+    $("selection-tools").hidden = true;
+    return;
+  }
+  const bounds = selection.getRangeAt(0).getBoundingClientRect();
+  picked = { parts, text: book.kind === "word" ? parts.map(part => part.quote).join("\n") : selection.toString() };
+  const tools = $("selection-tools");
+  tools.hidden = false;
+  tools.style.left = Math.max(6, Math.min(bounds.left, innerWidth - tools.offsetWidth - 6)) + "px";
+  tools.style.top = Math.max(6, bounds.top - tools.offsetHeight - 6) + "px";
+}
+
+function addAnnotation(annotation) {
+  getState().annotations.push({ id: crypto.randomUUID(), ...annotation });
+  document.getSelection()?.removeAllRanges();
+  refreshHighlights();
+  save();
+  renderSidebar().catch(report);
+}
+
+function showEditor(annotation, existing = false) {
+  editing = { annotation, existing };
+  const dialog = $("editor");
+  const kind = annotation.kind;
+  $("editor-title").textContent = { highlight: "高亮颜色", note: "笔记", bookmark: "书签名称" }[kind];
+  $("excerpt").textContent = annotation.parts?.map(part => part.quote).join("\n") || "";
+  $("excerpt").hidden = !$("excerpt").textContent;
+  $("note-field").hidden = kind === "highlight";
+  $("color-field").hidden = kind === "bookmark";
+  $("note-text").value = annotation.text || "";
+  $("color").value = annotation.color || "yellow";
+  $("delete-note").hidden = !existing;
+  dialog.returnValue = "cancel";
+  dialog.showModal();
+}
+
+function bookmarkTitle(position) {
+  if (pdf) return "第 " + (position.index + 1) + " 页";
+  const title = book.chapters[position.index]?.title;
+  return title || "书签";
+}
+
+async function goAnnotation(annotation) {
+  let located;
+  if (annotation.parts?.length) {
+    for (const part of annotation.parts) {
+      if (await jump(part.index, part)) { located = true; break; }
+    }
+  } else {
+    located = await restorePosition(annotation.position, !annotation.digest || annotation.digest === book.digest);
+  }
+  if (!located) {
+    annotation.missing = true;
+    save();
+    await renderSidebar();
+    message("原文位置已失效，摘录和笔记仍保留。");
+  } else if (annotation.missing) {
+    delete annotation.missing;
+    save();
+    await renderSidebar();
+  }
+}
+
+function sideRow(title, action, secondaryLabel, secondaryAction) {
+  const row = document.createElement("div");
+  row.className = "side-row";
+  const button = document.createElement("button");
+  button.textContent = title;
+  button.title = title;
+  button.addEventListener("click", () => Promise.resolve(action()).catch(report));
+  row.append(button);
+  if (secondaryLabel) {
+    const secondary = document.createElement("button");
+    secondary.textContent = secondaryLabel;
+    secondary.addEventListener("click", secondaryAction);
+    row.append(secondary);
+  }
+  $("side-list").append(row);
+}
+
+function sideMessage(text) {
+  const item = document.createElement("p");
+  item.className = "side-message";
+  item.textContent = text;
+  $("side-list").append(item);
+}
+
+async function renderSidebar() {
+  const revision = ++sideRevision;
+  $("side-list").replaceChildren();
+  for (const control of document.querySelectorAll("[data-tab]")) {
+    control.setAttribute("aria-pressed", String(control.dataset.tab === currentTab));
+  }
+  if (currentTab === "recent") {
+    const items = await (await request("/api/recent")).json();
+    if (revision !== sideRevision) return;
+    if (!items.length) sideMessage("暂无阅读记录");
+    for (const item of items) {
+      const label = item.path.split(/[\\/]/).at(-1);
+      sideRow(label, () => openDocument({ id: item.id }), "重新关联", () => openDocument({ relocate: item.id }));
+    }
+  } else if (currentTab === "contents") {
+    if (!contents.length) sideMessage("暂无目录");
+    for (const item of contents) sideRow(item.title, () => jump(item.index, null, item.fragment));
+  } else if (currentTab === "notes") {
+    if (!book?.saved.annotations.length) sideMessage("暂无高亮、笔记或书签");
+    for (const item of book?.saved.annotations ?? []) {
+      const prefix = { bookmark: "书签", note: "笔记", highlight: "高亮" }[item.kind];
+      const title = item.text || item.parts?.[0]?.quote || prefix;
+      sideRow(prefix + " · " + (item.missing ? "位置已失效 · " : "") + title, () => goAnnotation(item), "编辑", () => showEditor(item, true));
+    }
+  } else {
+    if (!results.length) sideMessage("没有匹配结果");
+    for (const result of results) {
+      sideRow(result.label, async () => {
+        await jump(result.index, result);
+        const range = locate(result);
+        if (range && CSS.highlights) CSS.highlights.set("hayaku-search", new Highlight(range));
+      });
+    }
+  }
+}
+
+async function find(query) {
+  query = query.trim();
+  if (!book || !query) return;
+  const revision = ++searchRevision;
+  const activeBook = book;
+  const found = [];
+  const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const expression = new RegExp(escaped, "giu");
+  message("正在搜索…");
+  for (const element of units()) {
+    const index = Number(element.dataset.unit);
+    const text = pdf ? await pdf.text(index) : element.textContent;
+    if (revision !== searchRevision || book !== activeBook) return;
+    for (const match of text.matchAll(expression)) {
+      const start = match.index;
+      const quote = match[0];
+      found.push({
+        index, start, quote, before: "", after: "",
+        label: (pdf ? "第 " + (index + 1) + " 页 · " : "") + text.slice(Math.max(0, start - 18), start + quote.length + 35)
+      });
+      if (found.length >= 300) break;
+    }
+    if (found.length >= 300) break;
+  }
+  results = found;
+  currentTab = "search";
+  $("sidebar").hidden = false;
+  $("toggle-sidebar").setAttribute("aria-expanded", "true");
+  await renderSidebar();
+  message(found.length === 300 ? "显示前 300 条结果。" : "找到 " + found.length + " 条结果。");
+}
+
+function settingsValues() {
+  return Object.fromEntries(["theme", "font-size", "line-height", "text-width"].map(id => [id, $(id).value]));
+}
+
+function applySettings(values) {
+  for (const id of ["theme", "font-size", "line-height", "text-width"]) {
+    if (values?.[id] != null) $(id).value = values[id];
+  }
+  const root = document.documentElement;
+  root.dataset.theme = $("theme").value;
+  root.style.setProperty("--size", $("font-size").value + "px");
+  root.style.setProperty("--leading", $("line-height").value);
+  root.style.setProperty("--measure", $("text-width").value + "px");
+}
+
+for (const id of ["open-file", "welcome-open"]) $(id).addEventListener("click", () => openDocument());
+for (const tab of document.querySelectorAll("[data-tab]")) tab.addEventListener("click", () => {
+  currentTab = tab.dataset.tab;
+  renderSidebar().catch(report);
+});
+$("toggle-sidebar").addEventListener("click", () => {
+  $("sidebar").hidden = !$("sidebar").hidden;
+  $("toggle-sidebar").setAttribute("aria-expanded", String(!$("sidebar").hidden));
+});
+$("settings-toggle").addEventListener("click", () => {
+  $("settings").hidden = !$("settings").hidden;
+  $("settings-toggle").setAttribute("aria-expanded", String(!$("settings").hidden));
+});
+$("search-toggle").addEventListener("click", () => {
+  $("search-form").hidden = !$("search-form").hidden;
+  if (!$("search-form").hidden) $("query").focus();
+});
+$("search-close").addEventListener("click", () => {
+  $("search-form").hidden = true;
+  CSS.highlights?.delete("hayaku-search");
+});
+$("search-form").addEventListener("submit", event => {
+  event.preventDefault();
+  find($("query").value).catch(report);
+});
+$("bookmark").addEventListener("click", () => {
+  const position = activePosition();
+  showEditor({ kind: "bookmark", text: bookmarkTitle(position), position, digest: book.digest });
+});
+$("page-note").addEventListener("click", () => {
+  showEditor({ kind: "note", position: activePosition(), digest: book.digest });
+});
+$("selection-tools").addEventListener("pointerdown", event => event.preventDefault());
+$("copy").addEventListener("click", () => {
+  if (picked) navigator.clipboard.writeText(picked.text).then(() => message("已复制选中文字。")).catch(report);
+});
+$("highlight").addEventListener("click", () => {
+  if (picked) addAnnotation({ kind: "highlight", color: "yellow", parts: picked.parts });
+});
+$("selection-note").addEventListener("click", () => {
+  if (picked) showEditor({ kind: "note", parts: picked.parts, color: "yellow" });
+});
+$("editor").addEventListener("close", () => {
+  if (!editing || !book) return;
+  const { annotation, existing } = editing;
+  editing = null;
+  const action = $("editor").returnValue;
+  if (action === "save") {
+    const change = { ...annotation, text: $("note-text").value.trim(), color: $("color").value };
+    if (change.kind === "note" && !change.text) { message("笔记内容为空。"); return; }
+    if (change.kind === "bookmark" && !change.text) change.text = bookmarkTitle(change.position);
+    if (!existing) { addAnnotation(change); return; }
+    Object.assign(annotation, change);
+  } else if (action === "delete" && existing) {
+    getState().annotations = getState().annotations.filter(item => item.id !== annotation.id);
+  } else return;
+  refreshHighlights();
+  save();
+  renderSidebar().catch(report);
+});
+
+for (const id of ["theme", "font-size", "line-height", "text-width"]) {
+  $(id).addEventListener("input", () => applySettings());
+  $(id).addEventListener("change", () => post("/api/settings", settingsValues()).catch(report));
+}
+$("encoding").addEventListener("change", async () => {
+  if (book?.kind !== "text") return;
+  getState().encoding = $("encoding").value;
+  try {
+    const position = activePosition();
+    await loadFlow();
+    await jump(position.index, null, "", position.fraction);
+    refreshHighlights();
+    save();
+  } catch (error) { report(error); }
+});
+$("page-number").addEventListener("change", () => {
+  if (pdf) jump(Math.max(0, Math.min(pdf.count - 1, Number($("page-number").value) - 1))).catch(report);
+});
+$("previous").addEventListener("click", () => jump(Math.max(0, activePosition().index - 1)).catch(report));
+$("next").addEventListener("click", () => jump(Math.min(pdf.count - 1, activePosition().index + 1)).catch(report));
+$("zoom-out").addEventListener("click", () => changeZoom(() => pdf.zoom(1 / 1.2)));
+$("zoom-in").addEventListener("click", () => changeZoom(() => pdf.zoom(1.2)));
+$("fit").addEventListener("click", () => changeZoom(() => pdf.fit()));
+let width = scroll.clientWidth;
+new ResizeObserver(() => {
+  if (width === scroll.clientWidth) return;
+  width = scroll.clientWidth;
+  changeZoom(() => pdf.resize());
+}).observe(scroll);
+
+scroll.addEventListener("scroll", () => {
+  if (progressFrame) return;
+  progressFrame = requestAnimationFrame(() => { progressFrame = null; updateProgress(); });
+}, { passive: true });
+document.addEventListener("selectionchange", selectionToolbar);
+document.addEventListener("copy", event => {
+  if (book?.kind !== "word" || !event.clipboardData) return;
+  const parts = selectionParts(getSelection());
+  if (!parts.length) return;
+  event.preventDefault();
+  event.clipboardData.setData("text/plain", parts.map(part => part.quote).join("\n"));
+});
+document.addEventListener("visibilitychange", () => { if (document.hidden && saveTimer) save(true); });
+window.addEventListener("pagehide", () => { if (saveTimer) save(true); });
+window.addEventListener("dragover", event => {
+  if (!event.dataTransfer.types.includes("Files")) return;
+  event.preventDefault();
+  document.body.classList.add("dragging");
+});
+window.addEventListener("dragleave", event => { if (!event.relatedTarget) document.body.classList.remove("dragging"); });
+window.addEventListener("drop", event => {
+  event.preventDefault();
+  document.body.classList.remove("dragging");
+  const file = event.dataTransfer.files[0];
+  if (file) openDocument({}, file);
+});
+
+async function start() {
+  if (!key) { message("请从 HayakuReader 启动阅读窗口。"); return; }
+  applySettings(await (await request("/api/settings")).json());
+  await renderSidebar();
+  if (new URLSearchParams(location.search).has("open")) await openDocument({ initial: true });
+}
+
+window.hayakuOpenDrop = () => openDocument({ dropped: true });
+window.hayakuFlush = async () => {
+  try { await save(true); }
+  finally { window.ipc?.postMessage("saved"); }
+};
+
+start().catch(report);
