@@ -29,6 +29,8 @@ let updateInProgress = false;
 let workspaceQueue = Promise.resolve();
 let started = false;
 let installDismissed = false;
+let drainingDrops = false;
+const textEncoder = new TextEncoder();
 
 async function request(url, options = {}) {
   const response = await fetch(url, { ...options, headers: { ...headers, ...options.headers } });
@@ -37,8 +39,12 @@ async function request(url, options = {}) {
 }
 
 function post(url, payload, keepalive = false) {
+  const body = JSON.stringify(payload);
   return request(url, {
-    method: "POST", keepalive, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
+    method: "POST",
+    keepalive: keepalive && textEncoder.encode(body).length < 60000,
+    headers: { "Content-Type": "application/json" },
+    body
   });
 }
 
@@ -136,12 +142,15 @@ async function readStyles(markup, base, index) {
       catch { continue; }
     }
     const parsed = new CSSStyleSheet();
-    parsed.replaceSync(css);
+    try {
+      parsed.replaceSync(css.replace(/@import[^;]*;/gi, ""));
+    } catch { continue; }
     for (const rule of parsed.cssRules) {
       if (!(rule instanceof CSSStyleRule)) continue;
+      if (/[{}@;]/.test(rule.selectorText)) continue;
       const declarations = safeDeclarations(rule.style);
       if (!declarations.length) continue;
-      const selector = rule.selectorText.replace(/#([\w-]+)/g, "#user-content-$1");
+      const selector = rule.selectorText.replace(/#([^\s.#,:[\]>+~()]+)/g, "#user-content-$1");
       const scoped = /^(?:body|html|:root)$/i.test(selector) ? scope : scope + " :is(" + selector + ")";
       rules.push(scoped + "{" + declarations.join(";") + "}");
     }
@@ -220,20 +229,32 @@ async function loadFlow() {
     return;
   }
   const chapters = book.chapters.length ? book.chapters : [{ path: "", title: book.title }];
+  const markups = new Array(chapters.length);
+  let nextChapter = 0;
+  await Promise.all(Array.from({ length: Math.min(8, chapters.length) }, async () => {
+    while (nextChapter < chapters.length) {
+      const index = nextChapter++;
+      markups[index] = await (await request(contentRoute(index))).text();
+    }
+  }));
   const fragment = document.createDocumentFragment();
   const rules = [];
+  if (book.outline?.length) contents.push(...book.outline);
   for (const [index, chapter] of chapters.entries()) {
     const part = document.createElement("section");
     part.dataset.unit = index;
-    const markup = await (await request(contentRoute(index))).text();
+    const markup = markups[index];
     rules.push(...await readStyles(markup, chapter.path, index));
     addMarkup(part, markup, chapter.path, book.kind, index);
-    if (book.chapters.length) contents.push(chapterHeading(chapter.title, index, ""));
-    if (book.kind !== "epub") addHeadings(part, index);
+    if (!book.outline?.length && book.chapters.length) contents.push(chapterHeading(chapter.title, index, ""));
+    if (book.kind !== "epub" && !book.outline?.length) addHeadings(part, index);
     fragment.append(part);
   }
   reader.replaceChildren(fragment);
-  bookStyles.replaceSync(rules.join("\n"));
+  bookStyles.replaceSync("");
+  for (const rule of rules) {
+    try { bookStyles.insertRule(rule, bookStyles.cssRules.length); } catch { /* Skip malformed or unsupported rules. */ }
+  }
 }
 
 async function present(next) {
@@ -292,6 +313,10 @@ async function present(next) {
     const side = contents.length ? "contents" : getState().annotations.length ? "notes" : null;
     setSidebar(Boolean(side));
     currentTab = side || "contents";
+    const existingTab = documentTabs.get(book.id);
+    if (existingTab?.document && existingTab.document.session !== book.session) {
+      post(sessionUrl("close", existingTab.document), {}).catch(() => {});
+    }
     documentTabs.set(book.id, { id: book.id, title: book.title, document: book, lastUsed: Date.now() });
     sleepTabs();
     renderDocumentTabs();
@@ -438,11 +463,26 @@ function activePosition() {
   };
   if (!pdf && position.fraction > 0) {
     const y = Math.min(top, box.bottom - 1);
-    const caret = document.caretRangeFromPoint(Math.max(box.left + 28, 1), y);
-    if (caret && element.contains(caret.startContainer)) {
+    const x = Math.max(box.left + 28, 1);
+    let caretContainer = null;
+    let caretOffset = 0;
+    if (document.caretRangeFromPoint) {
+      const caret = document.caretRangeFromPoint(x, y);
+      if (caret) {
+        caretContainer = caret.startContainer;
+        caretOffset = caret.startOffset;
+      }
+    } else if (document.caretPositionFromPoint) {
+      const pos = document.caretPositionFromPoint(x, y);
+      if (pos) {
+        caretContainer = pos.offsetNode;
+        caretOffset = pos.offset;
+      }
+    }
+    if (caretContainer && element.contains(caretContainer)) {
       const prefix = document.createRange();
       prefix.selectNodeContents(element);
-      prefix.setEnd(caret.startContainer, caret.startOffset);
+      prefix.setEnd(caretContainer, caretOffset);
       const start = prefix.toString().length;
       const text = element.textContent;
       const quote = text.slice(start, start + 32);
@@ -774,7 +814,11 @@ function applySettings(values) {
   root.style.setProperty("--measure", $("text-width").value + "px");
 }
 
-for (const id of ["open-file", "welcome-open"]) $(id).addEventListener("click", () => openDocument());
+for (const id of ["open-file", "welcome-open"]) {
+  $(id).addEventListener("click", () => {
+    openDocument().then(opened => { if (opened) drainDropped().catch(report); });
+  });
+}
 for (const tab of document.querySelectorAll("[data-tab]")) tab.addEventListener("click", () => {
   currentTab = tab.dataset.tab;
   renderSidebar().catch(report);
@@ -862,10 +906,12 @@ $("zoom-out").addEventListener("click", () => changeZoom(() => pdf.zoom(1 / 1.2)
 $("zoom-in").addEventListener("click", () => changeZoom(() => pdf.zoom(1.2)));
 $("fit").addEventListener("click", () => changeZoom(() => pdf.fit()));
 let width = scroll.clientWidth;
+let resizeTimer;
 new ResizeObserver(() => {
   if (width === scroll.clientWidth) return;
   width = scroll.clientWidth;
-  changeZoom(() => pdf.resize());
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => changeZoom(() => pdf?.resize()), 150);
 }).observe(scroll);
 
 scroll.addEventListener("scroll", () => {
@@ -888,16 +934,80 @@ window.addEventListener("dragover", event => {
   document.body.classList.add("dragging");
 });
 window.addEventListener("dragleave", event => { if (!event.relatedTarget) document.body.classList.remove("dragging"); });
-window.addEventListener("drop", event => {
+window.addEventListener("drop", async event => {
   event.preventDefault();
   document.body.classList.remove("dragging");
-  const file = event.dataTransfer.files[0];
-  if (file) openDocument({}, file);
+  for (const file of Array.from(event.dataTransfer.files)) {
+    await openDocument({}, file);
+  }
 });
+
+function localizeStaticUi() {
+  if (!english) return;
+  const text = (selector, value) => {
+    const element = document.querySelector(selector);
+    if (element) element.textContent = value;
+  };
+  const labelText = (controlId, value) => {
+    const label = $(controlId)?.closest("label");
+    if (!label) return;
+    for (const node of label.childNodes) {
+      if (node.nodeType === Node.TEXT_NODE && node.textContent.trim()) {
+        node.textContent = value;
+        break;
+      }
+    }
+  };
+  text('[data-tab="recent"]', "Recent");
+  text('[data-tab="contents"]', "Contents");
+  text('[data-tab="notes"]', "Annotations");
+  $("toggle-sidebar").setAttribute("aria-label", "Toggle sidebar");
+  $("toggle-sidebar").title = "Toggle sidebar";
+  $("open-file").textContent = "Open file";
+  $("welcome-open").textContent = "Open file";
+  $("search-toggle").textContent = "Search";
+  $("bookmark").textContent = "Bookmark";
+  $("page-note").textContent = "Note";
+  $("settings-toggle").textContent = "Settings";
+  $("query").placeholder = "Search text";
+  $("query").setAttribute("aria-label", "Search text");
+  text('#search-form button[type="submit"]', "Find");
+  $("search-close").textContent = "Close";
+  $("previous").setAttribute("aria-label", "Previous page");
+  $("page-number").setAttribute("aria-label", "Go to page");
+  $("next").setAttribute("aria-label", "Next page");
+  $("zoom-out").setAttribute("aria-label", "Zoom out");
+  $("fit").textContent = "Fit width";
+  $("zoom-in").setAttribute("aria-label", "Zoom in");
+  $("copy").textContent = "Copy";
+  $("highlight").textContent = "Highlight";
+  $("selection-note").textContent = "Note";
+  $("delete-note").textContent = "Delete";
+  text('#editor button[value="cancel"]', "Cancel");
+  text('#editor button[value="save"]', "Save");
+  $("check-updates").textContent = "Check for updates";
+  labelText("theme", "Theme ");
+  text('#theme option[value="light"]', "Light");
+  text('#theme option[value="dark"]', "Dark");
+  labelText("font-size", "Font size ");
+  labelText("line-height", "Line height ");
+  labelText("text-width", "Text width ");
+  labelText("encoding", "TXT encoding ");
+  text('#encoding option[value=""]', "Auto");
+  labelText("restore-session", "Restore tabs on startup");
+  labelText("auto-update", "Install updates automatically");
+  labelText("note-text", "Note ");
+  labelText("color", "Color ");
+  text('#color option[value="yellow"]', "Yellow");
+  text('#color option[value="green"]', "Green");
+  text('#color option[value="blue"]', "Blue");
+  text('#color option[value="pink"]', "Pink");
+}
 
 async function start() {
   if (!key) { message("请从 HayakuReader 启动阅读窗口。"); return; }
   document.documentElement.lang = english ? "en" : "zh-CN";
+  localizeStaticUi();
   const language = english ? "en" : "zh";
   const project = isDesktop
     ? request("/api/project?lang=" + language).then(response => response.json()).then(value => value.html).catch(() => "")
@@ -911,8 +1021,26 @@ async function start() {
   const remoteIntro = await Promise.race([project, splash.then(() => "")]);
   const intro = remoteIntro || await local;
   $("project-intro").replaceChildren(purify.sanitize(intro, {
-    RETURN_DOM_FRAGMENT: true, ALLOWED_TAGS: ["h1", "h2", "p", "ul", "ol", "li", "strong", "em", "code"], ALLOWED_ATTR: []
+    RETURN_DOM_FRAGMENT: true,
+    ALLOWED_TAGS: ["h1", "h2", "p", "ul", "ol", "li", "strong", "em", "code", "a"],
+    ALLOWED_ATTR: ["href"]
   }));
+  for (const link of $("project-intro").querySelectorAll("a[href]")) {
+    const href = link.getAttribute("href") || "";
+    if (href === "https://github.com/drliuhuan/HayakuReader" || href.startsWith("https://github.com/drliuhuan/HayakuReader/")) {
+      if (isDesktop) {
+        link.addEventListener("click", event => {
+          event.preventDefault();
+          post("/api/project/open", {}).catch(report);
+        });
+      } else {
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+      }
+    } else {
+      link.removeAttribute("href");
+    }
+  }
   await splash;
   $("splash").hidden = true;
   const settings = await preferences;
@@ -939,7 +1067,10 @@ async function start() {
   }
   started = true;
   if (installation && !installation.installationExists && !installDismissed) showInstallation();
-  else release.then(info => showRelease(info)).catch(report);
+  else {
+    release.then(info => showRelease(info)).catch(report);
+    drainDropped().catch(report);
+  }
 }
 
 function showInstallation() {
@@ -972,7 +1103,7 @@ function showInstallation() {
 }
 
 async function restart() {
-  await Promise.all([save(true).catch(() => {}), persistWorkspace(true)]);
+  await Promise.all([save(false).catch(() => {}), persistWorkspace(false)]);
   window.ipc?.postMessage("restart");
 }
 
@@ -1069,11 +1200,23 @@ $("update-dialog").addEventListener("close", () => {
   if ($("update-dialog").returnValue === "update") installUpdate();
 });
 
+async function drainDropped() {
+  if (drainingDrops) return;
+  drainingDrops = true;
+  try {
+    while (started && !openBusy && !$("installation").open) {
+      if (!await openDocument({ dropped: true })) break;
+    }
+  } finally {
+    drainingDrops = false;
+  }
+}
+
 window.hayakuOpenDrop = () => {
-  if (started && !openBusy && !$("installation").open) openDocument({ dropped: true });
+  drainDropped().catch(report);
 };
 window.hayakuFlush = async () => {
-  try { await Promise.all([save(true), persistWorkspace(true)]); }
+  try { await Promise.all([save(false), persistWorkspace(false)]); }
   finally { window.ipc?.postMessage("saved"); }
 };
 

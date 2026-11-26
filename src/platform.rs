@@ -77,6 +77,23 @@ pub fn record_version(app_data: &Path) -> io::Result<()> {
     Ok(())
 }
 
+pub fn cleanup_updates(data: &Path) {
+    let Ok(entries) = fs::read_dir(data) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("update-") && name.ends_with(".exe")
+            })
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 pub fn check_manual_update(data: &Path) -> io::Result<bool> {
     if installed() {
         return Ok(false);
@@ -245,6 +262,14 @@ pub async fn open_releases(
     shell_open(&format!("{REPO}/releases/latest"))
 }
 
+pub async fn open_repo(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+) -> Result<axum::http::StatusCode> {
+    authorize(&headers, &app)?;
+    shell_open(REPO)
+}
+
 pub fn report_replace_failure(error: &dyn std::error::Error) {
     let answer = rfd::MessageDialog::new()
         .set_title("HayakuReader")
@@ -387,21 +412,6 @@ pub async fn project(
     .filter(|text| !text.trim().is_empty());
     Ok(Json(
         json!({"html": crate::formats::render_markdown(response.as_deref().unwrap_or(local))}),
-    ))
-}
-
-pub async fn local_project(
-    State(app): State<Shared>,
-    headers: HeaderMap,
-    Query(language): Query<Language>,
-) -> Result<String> {
-    authorize(&headers, &app)?;
-    Ok(crate::formats::render_markdown(
-        if language.lang.as_deref() == Some("en") {
-            include_str!("../docs/intro.en.md")
-        } else {
-            include_str!("../docs/intro.zh.md")
-        },
     ))
 }
 
@@ -685,5 +695,31 @@ mod tests {
         })();
         let cleanup = profile.delete_subkey_all(&path);
         result.and(cleanup)
+    }
+
+    #[test]
+    fn parses_and_orders_semver_versions() {
+        assert_eq!(version_tuple("0.2.3"), Some([0, 2, 3]));
+        assert_eq!(version_tuple("v1.10.2"), Some([1, 10, 2]));
+        assert!(version_tuple("0.2.10") > version_tuple("0.2.3"));
+        assert_eq!(version_tuple("0.2"), None);
+        assert_eq!(version_tuple("0.2.3-beta"), None);
+        assert_eq!(version_tuple("0.2.3.1"), None);
+    }
+
+    #[test]
+    fn cleanup_updates_removes_only_update_executables() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stale = dir.path().join("update-1234.exe");
+        let keep_json = dir.path().join("recent.json");
+        let keep_other = dir.path().join("update-notes.txt");
+        fs::write(&stale, b"MZ")?;
+        fs::write(&keep_json, b"[]")?;
+        fs::write(&keep_other, b"notes")?;
+        cleanup_updates(dir.path());
+        assert!(!stale.exists());
+        assert!(keep_json.exists());
+        assert!(keep_other.exists());
+        Ok(())
     }
 }

@@ -1,5 +1,5 @@
 export function openWord(metadata, contentRoute, request, reader, scroll, onRender) {
-  const firstWidth = metadata.pages[0][0];
+  const firstWidth = Math.max(1, metadata.pages[0]?.[0] || 1);
   const entries = [];
   const measure = document.createElement("canvas").getContext("2d");
   let zoom = null;

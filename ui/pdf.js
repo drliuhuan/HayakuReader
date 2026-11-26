@@ -4,7 +4,7 @@ pdfjs.GlobalWorkerOptions.workerSrc = "/vendor/pdf.worker.mjs";
 
 export async function openPdf(url, headers, reader, scroll, onRender) {
   const task = pdfjs.getDocument({
-    url, httpHeaders: headers, cMapUrl: "/vendor/cmaps/", cMapPacked: true,
+    url, httpHeaders: headers, rangeChunkSize: 65536, cMapUrl: "/vendor/cmaps/", cMapPacked: true,
     standardFontDataUrl: "/vendor/standard_fonts/", wasmUrl: "/vendor/wasm/", iccUrl: "/vendor/iccs/",
     isEvalSupported: false, enableXfa: false
   });
@@ -28,7 +28,7 @@ export async function openPdf(url, headers, reader, scroll, onRender) {
   }, { root: scroll, rootMargin: "480px" });
 
   function scale() {
-    return zoom ?? Math.max(.2, (scroll.clientWidth - 36) / sample.width);
+    return zoom ?? Math.max(.2, (scroll.clientWidth - 36) / Math.max(1, sample.width));
   }
 
   function dimensions(element, viewport) {
@@ -47,10 +47,11 @@ export async function openPdf(url, headers, reader, scroll, onRender) {
     entry.pending = (async () => {
       const page = await document.getPage(index + 1);
       if (closed || version !== revision) return;
+      entry.baseViewport = page.getViewport({ scale: 1 });
       const viewport = page.getViewport({ scale: scale() });
       dimensions(target, viewport);
       const canvas = window.document.createElement("canvas");
-      const pixelRatio = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(12000000 / (viewport.width * viewport.height)));
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(12000000 / Math.max(1, viewport.width * viewport.height)));
       canvas.width = Math.ceil(viewport.width * pixelRatio);
       canvas.height = Math.ceil(viewport.height * pixelRatio);
       canvas.style.width = viewport.width + "px";
@@ -74,12 +75,17 @@ export async function openPdf(url, headers, reader, scroll, onRender) {
 
   function reset() {
     revision++;
+    const factor = scale();
     for (const entry of entries) {
       entry.cancel?.();
       entry.pending = null;
       entry.cancel = null;
       entry.element.replaceChildren();
-      dimensions(entry.element, first.getViewport({ scale: scale() }));
+      dimensions(entry.element, {
+        width: entry.baseViewport.width * factor,
+        height: entry.baseViewport.height * factor,
+        scale: factor
+      });
       observer.unobserve(entry.element);
       observer.observe(entry.element);
     }
@@ -92,7 +98,7 @@ export async function openPdf(url, headers, reader, scroll, onRender) {
     element.setAttribute("aria-label", "第 " + (i + 1) + " 页");
     dimensions(element, first.getViewport({ scale: scale() }));
     reader.append(element);
-    entries.push({ element, pending: null, cancel: null });
+    entries.push({ element, baseViewport: sample, pending: null, cancel: null });
     observer.observe(element);
   }
 

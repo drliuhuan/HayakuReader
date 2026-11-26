@@ -11,17 +11,17 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path as RoutePath, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use formats::{Chapter, Source};
+use formats::{Chapter, OutlineEntry, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -42,6 +42,7 @@ struct Document {
     title: String,
     kind: &'static str,
     chapters: Vec<Chapter>,
+    outline: Vec<OutlineEntry>,
     word: Option<word::Metadata>,
     saved: Value,
 }
@@ -148,14 +149,16 @@ fn open(app: &App, path: PathBuf, relocate: Option<String>) -> Result<Document> 
         .map(|item| item.id.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let saved = read_json(&app.data.join(format!("{id}.json"))).map_err(internal)?;
-    let (kind, chapters, word) = match &source {
-        Source::Pdf(_) => ("pdf", vec![], None),
-        Source::Word(document) => ("word", vec![], Some(document.metadata.clone())),
-        Source::Text(_) => ("text", vec![], None),
-        Source::Html(_) => ("html", vec![], None),
-        Source::Markdown(_) => ("markdown", vec![], None),
-        Source::Epub(_, chapters) => ("epub", chapters.clone(), None),
-        Source::Kindle(_, chapters) => ("kindle", chapters.clone(), None),
+    let (kind, chapters, outline, word) = match &source {
+        Source::Pdf(_) => ("pdf", vec![], vec![], None),
+        Source::Word(document) => ("word", vec![], vec![], Some(document.metadata.clone())),
+        Source::Text(_) => ("text", vec![], vec![], None),
+        Source::Html(_) => ("html", vec![], vec![], None),
+        Source::Markdown(_) => ("markdown", vec![], vec![], None),
+        Source::Epub(_, chapters, outline) => ("epub", chapters.clone(), outline.clone(), None),
+        Source::Kindle(_, chapters, outline) => {
+            ("kindle", chapters.clone(), outline.clone(), None)
+        }
     };
     let session = Uuid::new_v4().to_string();
     let mut books = app.books.lock().map_err(internal)?;
@@ -169,6 +172,7 @@ fn open(app: &App, path: PathBuf, relocate: Option<String>) -> Result<Document> 
             digest: digest.clone(),
         },
     );
+    next.truncate(200);
     write_json(&app.data.join("recent.json"), &next).map_err(internal)?;
     *recent = next;
     books.insert(
@@ -185,6 +189,7 @@ fn open(app: &App, path: PathBuf, relocate: Option<String>) -> Result<Document> 
         title,
         kind,
         chapters,
+        outline,
         word,
         saved,
     })
@@ -395,7 +400,108 @@ struct ContentQuery {
     raster: Option<bool>,
 }
 
+fn parse_range(header: &str, len: u64) -> Option<std::result::Result<(u64, u64), ()>> {
+    let (unit, spec) = header.trim().split_once('=')?;
+    if !unit.eq_ignore_ascii_case("bytes") || spec.contains(',') {
+        return None;
+    }
+    let (start_str, end_str) = spec.trim().split_once('-')?;
+    if start_str.is_empty() && end_str.is_empty() {
+        return None;
+    }
+    if len == 0 {
+        return Some(Err(()));
+    }
+    if start_str.is_empty() {
+        let suffix: u64 = end_str.parse().ok()?;
+        if suffix == 0 {
+            return Some(Err(()));
+        }
+        return Some(Ok((len.saturating_sub(suffix), len - 1)));
+    }
+    let start: u64 = start_str.parse().ok()?;
+    if start >= len {
+        return Some(Err(()));
+    }
+    if end_str.is_empty() {
+        return Some(Ok((start, len - 1)));
+    }
+    let end: u64 = end_str.parse().ok()?;
+    if end < start {
+        return Some(Err(()));
+    }
+    Some(Ok((start, end.min(len - 1))))
+}
+
+fn pdf_response(method: Method, headers: &HeaderMap, path: &Path) -> Result<Response> {
+    let mut file = fs::File::open(path).map_err(bad)?;
+    let len = file.metadata().map_err(bad)?.len();
+    if method == Method::HEAD {
+        return Ok((
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/pdf".to_owned()),
+                (header::ACCEPT_RANGES, "bytes".to_owned()),
+                (header::CONTENT_LENGTH, len.to_string()),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+                (header::CACHE_CONTROL, "no-store".to_owned()),
+            ],
+            Vec::<u8>::new(),
+        )
+            .into_response());
+    }
+    if let Some(range) = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+    {
+        match parse_range(range, len) {
+            Some(Err(())) => {
+                return Ok((
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    [(header::CONTENT_RANGE, format!("bytes */{len}"))],
+                    Vec::<u8>::new(),
+                )
+                    .into_response());
+            }
+            Some(Ok((start, end))) => {
+                let count = usize::try_from(end - start + 1).map_err(bad)?;
+                file.seek(SeekFrom::Start(start)).map_err(bad)?;
+                let mut buffer = vec![0u8; count];
+                file.read_exact(&mut buffer).map_err(bad)?;
+                return Ok((
+                    StatusCode::PARTIAL_CONTENT,
+                    [
+                        (header::CONTENT_TYPE, "application/pdf".to_owned()),
+                        (header::ACCEPT_RANGES, "bytes".to_owned()),
+                        (header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}")),
+                        (header::CONTENT_LENGTH, count.to_string()),
+                        (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+                        (header::CACHE_CONTROL, "no-store".to_owned()),
+                    ],
+                    buffer,
+                )
+                    .into_response());
+            }
+            None => {}
+        }
+    }
+    let data = fs::read(path).map_err(bad)?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/pdf".to_owned()),
+            (header::ACCEPT_RANGES, "bytes".to_owned()),
+            (header::CONTENT_LENGTH, data.len().to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        data,
+    )
+        .into_response())
+}
+
 async fn content(
+    method: Method,
     State(app): State<Shared>,
     RoutePath(session): RoutePath<String>,
     headers: HeaderMap,
@@ -405,7 +511,7 @@ async fn content(
     let book = book(&app, &session)?;
     tokio::task::spawn_blocking(move || {
         let response = match &book.source {
-            Source::Pdf(path) => bytes("application/pdf", formats::read_bytes(path).map_err(bad)?),
+            Source::Pdf(path) => pdf_response(method, &headers, path)?,
             Source::Word(word) => {
                 let index = query.chapter.unwrap_or(0);
                 if query.raster.unwrap_or(false) {
@@ -431,15 +537,16 @@ async fn content(
                 "text/plain; charset=utf-8",
                 formats::markdown(path).map_err(bad)?.into_bytes(),
             ),
-            Source::Epub(path, chapters) => {
+            Source::Epub(zip, chapters, _) => {
                 let chapter = chapters
                     .get(query.chapter.unwrap_or(0))
                     .ok_or_else(|| bad("章节不存在"))?;
-                let data = formats::archive_entry(path, &chapter.path).map_err(bad)?;
+                let mut archive = zip.lock().map_err(internal)?;
+                let data = formats::zip_entry(&mut archive, &chapter.path).map_err(bad)?;
                 let text = formats::decode(&data, None).map_err(bad)?;
                 bytes("text/plain; charset=utf-8", text.into_bytes())
             }
-            Source::Kindle(book, _) => {
+            Source::Kindle(book, _, _) => {
                 let section = book
                     .get_section_raw(query.chapter.unwrap_or(0))
                     .ok_or_else(|| bad("章节不存在"))?;
@@ -489,8 +596,11 @@ async fn resource(
             _ => return Err(bad("不支持此资源类型")),
         };
         let data = match &book.source {
-            Source::Epub(path, _) => formats::archive_entry(path, &name).map_err(bad)?,
-            Source::Kindle(book, _) => {
+            Source::Epub(zip, _, _) => {
+                let mut archive = zip.lock().map_err(internal)?;
+                formats::zip_entry(&mut archive, &name).map_err(bad)?
+            }
+            Source::Kindle(book, _, _) => {
                 book.get_resource_bytes(&name)
                     .or_else(|_| book.get_resource_bytes(&format!("OEBPS/{name}")))
                     .map_err(bad)?
@@ -723,6 +833,7 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     };
     #[cfg(windows)]
     if !manual {
+        platform::cleanup_updates(&data);
         platform::record_version(&data)?;
     }
     let initial = launch_paths.pop_front();
@@ -763,6 +874,7 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .route("/api/content/{session}", get(content))
         .route("/api/save/{session}", post(save))
         .route("/api/close/{session}", post(close))
+        .route("/api/project/local", get(local_project))
         .route("/resource/{key}/{session}", get(resource));
     #[cfg(windows)]
     let router = router
@@ -775,9 +887,9 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             post(platform::windows_defaults),
         )
         .route("/api/project", get(platform::project))
+        .route("/api/project/open", post(platform::open_repo))
         .route("/api/release/progress", get(platform::progress))
         .route("/api/release/open", post(platform::open_releases))
-        .route("/api/project/local", get(platform::local_project))
         .route(
             "/api/release",
             get(platform::releases).post(platform::update),
@@ -810,4 +922,95 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     return Err("当前桌面窗口适用于 Windows，可用 --no-browser 启动开发服务".into());
     #[cfg(windows)]
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct Language {
+    lang: Option<String>,
+}
+
+async fn local_project(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Query(language): Query<Language>,
+) -> Result<String> {
+    authorize(&headers, &app)?;
+    Ok(formats::render_markdown(
+        if language.lang.as_deref() == Some("en") {
+            include_str!("../docs/intro.en.md")
+        } else {
+            include_str!("../docs/intro.zh.md")
+        },
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app(data: PathBuf) -> App {
+        App {
+            secret: "test-secret".into(),
+            data,
+            recent: Mutex::new(Vec::new()),
+            books: Mutex::new(std::collections::HashMap::new()),
+            initial: Mutex::new(None),
+            dropped: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(windows)]
+            restart: Mutex::new(None),
+            #[cfg(windows)]
+            updater: platform::Updater::default(),
+        }
+    }
+
+    #[test]
+    fn authorize_checks_session_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_app(dir.path().to_path_buf());
+        let mut headers = HeaderMap::new();
+        assert!(authorize(&headers, &app).is_err());
+        headers.insert("x-hayaku-key", "wrong".parse().unwrap());
+        assert!(authorize(&headers, &app).is_err());
+        headers.insert("x-hayaku-key", "test-secret".parse().unwrap());
+        assert!(authorize(&headers, &app).is_ok());
+    }
+
+    #[test]
+    fn parse_range_handles_valid_and_invalid_ranges() {
+        assert_eq!(parse_range("bytes=0-9", 100), Some(Ok((0, 9))));
+        assert_eq!(parse_range("bytes=50-999", 100), Some(Ok((50, 99))));
+        assert_eq!(parse_range("bytes=80-", 100), Some(Ok((80, 99))));
+        assert_eq!(parse_range("bytes=-10", 100), Some(Ok((90, 99))));
+        assert_eq!(parse_range("bytes=-200", 100), Some(Ok((0, 99))));
+        assert_eq!(parse_range("bytes=100-105", 100), Some(Err(())));
+        assert_eq!(parse_range("bytes=10-5", 100), Some(Err(())));
+        assert_eq!(parse_range("bytes=-0", 100), Some(Err(())));
+        assert_eq!(parse_range("bytes=0-0", 0), Some(Err(())));
+        assert_eq!(parse_range("bytes=0-1, 2-3", 100), None);
+        assert_eq!(parse_range("items=0-5", 100), None);
+    }
+
+    #[test]
+    fn read_and_write_json_roundtrip_and_default() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state.json");
+        let missing: Vec<String> = read_json(&path)?;
+        assert!(missing.is_empty());
+        let sample = vec!["alpha".to_owned(), "beta".to_owned()];
+        write_json(&path, &sample)?;
+        let loaded: Vec<String> = read_json(&path)?;
+        assert_eq!(loaded, sample);
+        Ok(())
+    }
+
+    #[test]
+    fn dunce_path_strips_windows_verbatim_prefix() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("book.txt");
+        fs::write(&file, b"hello")?;
+        let normalized = dunce_path(&file)?;
+        assert!(!normalized.to_string_lossy().starts_with(r"\\?\"));
+        assert!(normalized.is_file());
+        Ok(())
+    }
 }
