@@ -382,7 +382,7 @@ pub fn set_clipboard_text(text: &str) -> Result<(), String> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GlobalAlloc(flags: u32, bytes: usize) -> *mut core::ffi::c_void;
-        fn GlobalLock(mem: *mut core::ffi::c_void) -> *mut u16;
+        fn GlobalLock(mem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
         fn GlobalUnlock(mem: *mut core::ffi::c_void) -> i32;
         fn GlobalFree(mem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
     }
@@ -408,7 +408,7 @@ pub fn set_clipboard_text(text: &str) -> Result<(), String> {
             if hmem.is_null() {
                 return Err("无法分配剪贴板内存".to_owned());
             }
-            let ptr = GlobalLock(hmem);
+            let ptr = GlobalLock(hmem).cast::<u16>();
             if ptr.is_null() {
                 GlobalFree(hmem);
                 return Err("无法锁定剪贴板内存".to_owned());
@@ -446,7 +446,7 @@ pub fn set_clipboard_png(png: &[u8]) -> Result<(), String> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GlobalAlloc(flags: u32, bytes: usize) -> *mut core::ffi::c_void;
-        fn GlobalLock(mem: *mut core::ffi::c_void) -> *mut u8;
+        fn GlobalLock(mem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
         fn GlobalUnlock(mem: *mut core::ffi::c_void) -> i32;
         fn GlobalFree(mem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
     }
@@ -467,7 +467,7 @@ pub fn set_clipboard_png(png: &[u8]) -> Result<(), String> {
             if hmem.is_null() {
                 return Err("无法分配剪贴板内存".to_owned());
             }
-            let ptr = GlobalLock(hmem);
+            let ptr = GlobalLock(hmem).cast::<u8>();
             if ptr.is_null() {
                 GlobalFree(hmem);
                 return Err("无法锁定剪贴板内存".to_owned());

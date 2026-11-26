@@ -356,7 +356,7 @@ impl HayakuApp {
             }
         };
 
-        let mut app = Self {
+        let app = Self {
             data,
             settings,
             recent,
@@ -7719,6 +7719,9 @@ mod tests {
         fs::write(&f1, "hello one").expect("write f1");
         fs::write(&f2, "hello two").expect("write f2");
         fs::write(&f3, "hello three").expect("write f3");
+        let f1 = storage::dunce_path(&f1).expect("dunce f1");
+        let f2 = storage::dunce_path(&f2).expect("dunce f2");
+        let f3 = storage::dunce_path(&f3).expect("dunce f3");
 
         let mut app = make_test_app(dir.path().to_path_buf());
         app.recent = vec![
