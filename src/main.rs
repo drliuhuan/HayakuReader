@@ -196,7 +196,16 @@ fn open(app: &App, path: PathBuf, relocate: Option<String>) -> Result<Document> 
 }
 
 fn dunce_path(path: &Path) -> io::Result<PathBuf> {
-    let canonical = path.canonicalize()?;
+    let canonical = match path.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let abs = std::path::absolute(path)?;
+            if fs::metadata(&abs).is_ok() {
+                return Ok(abs);
+            }
+            return Err(error);
+        }
+    };
     #[cfg(windows)]
     if let Some(path) = canonical
         .to_str()
@@ -771,15 +780,15 @@ async fn vendor(RoutePath(file): RoutePath<String>) -> Result<Response> {
             "text/javascript",
         ),
         "pdf.css" => (
-            include_bytes!("../node_modules/pdfjs-dist/web/pdf_viewer.css"),
+            include_bytes!("../node_modules/pdfjs-dist/legacy/web/pdf_viewer.css"),
             "text/css",
         ),
         "pdf.mjs" => (
-            include_bytes!("../node_modules/pdfjs-dist/build/pdf.min.mjs"),
+            include_bytes!("../node_modules/pdfjs-dist/legacy/build/pdf.min.mjs"),
             "text/javascript",
         ),
         "pdf.worker.mjs" => (
-            include_bytes!("../node_modules/pdfjs-dist/build/pdf.worker.min.mjs"),
+            include_bytes!("../node_modules/pdfjs-dist/legacy/build/pdf.worker.min.mjs"),
             "text/javascript",
         ),
         _ => {

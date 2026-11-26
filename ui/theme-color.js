@@ -101,25 +101,37 @@ export function mapRgbDark(r, g, b, isBackground = false) {
   const cosH = a / C;
   const sinH = b_ / C;
   let chromatic;
-
-  if (L > 0.84 && C < 0.14) {
-    // Light tinted backgrounds / highlights become soft dark tints preserving hue.
-    const targetL = 0.25 + (1 - L) * 0.85;
-    chromatic = oklchToSrgb(targetL, Math.min(C, 0.11), cosH, sinH);
-  } else if (isBackground) {
-    chromatic = L > 0.52
-      ? oklchToSrgb(Math.max(0.24, 0.52 - (L - 0.52) * 0.5), Math.min(C, 0.14), cosH, sinH)
-      : [r, g, b];
+  if (isBackground) {
+    if (L > 0.84 && C < 0.14) {
+      const targetL = 0.25 + (1 - L) * 0.85;
+      chromatic = oklchToSrgb(targetL, Math.min(C, 0.11), cosH, sinH);
+    } else if (L > 0.52) {
+      chromatic = oklchToSrgb(Math.max(0.24, 0.52 - (L - 0.52) * 0.5), Math.min(C, 0.14), cosH, sinH);
+    } else {
+      chromatic = [r, g, b];
+    }
   } else {
     const contrast = contrastOnDark(relLum(r, g, b));
-    if (contrast >= 4.5 || (L >= 0.55 && C >= 0.14 && contrast >= 3.2)) {
-      chromatic = [r, g, b];
+    const base = (contrast >= 4.5 || (L >= 0.55 && C >= 0.14 && contrast >= 3.2))
+      ? [r, g, b]
+      : liftColor(L, C, cosH, sinH, 4.5);
+    const tLight = L > 0.72 && C < 0.15
+      ? smoothstep(0.72, 0.90, L) * (1 - smoothstep(0.10, 0.15, C))
+      : 0;
+    if (tLight > 0) {
+      const targetL = 0.25 + (1 - L) * 0.85;
+      const softTint = oklchToSrgb(targetL, Math.min(C, 0.11), cosH, sinH);
+      chromatic = [
+        Math.round(base[0] * (1 - tLight) + softTint[0] * tLight),
+        Math.round(base[1] * (1 - tLight) + softTint[1] * tLight),
+        Math.round(base[2] * (1 - tLight) + softTint[2] * tLight)
+      ];
     } else {
-      chromatic = liftColor(L, Math.max(C, 0.08), cosH, sinH, 4.5);
+      chromatic = base;
     }
   }
 
-  const wNeutral = 1 - smoothstep(0.025, 0.065, C);
+  const wNeutral = 1 - smoothstep(0.065, 0.13, C);
   if (wNeutral <= 0) return chromatic;
   if (wNeutral >= 1) return neutral;
   return [
@@ -129,7 +141,7 @@ export function mapRgbDark(r, g, b, isBackground = false) {
   ];
 }
 
-const LUT_SIZE = 33;
+const LUT_SIZE = 65;
 let lutData = null;
 const WHITE_MAPPED = mapRgbDark(255, 255, 255, false);
 const BLACK_MAPPED = mapRgbDark(0, 0, 0, false);

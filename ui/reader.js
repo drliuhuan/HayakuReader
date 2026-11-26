@@ -68,8 +68,10 @@ function message(text = "", duration = 3200) {
 }
 
 function report(error) {
-  message(error.name === "PasswordException" ? "此 PDF 受密码保护。" : error.message || String(error));
+  console.error(error);
+  message(error.name === "PasswordException" ? "此 PDF 受密码保护。" : error.message || String(error), 0);
 }
+$("status").addEventListener("click", () => message(""));
 
 function sessionUrl(action, target = book) {
   return "/api/" + action + "/" + target.session;

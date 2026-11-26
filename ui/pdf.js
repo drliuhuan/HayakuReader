@@ -160,7 +160,7 @@ export async function openPdf(url, headers, reader, scroll, onRender, shouldSmar
       const viewport = page.getViewport({ scale: scale() });
       dimensions(target, viewport);
       const canvas = window.document.createElement("canvas");
-      const pixelRatio = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(8000000 / Math.max(1, viewport.width * viewport.height)));
+      const pixelRatio = Math.min(Math.max(window.devicePixelRatio || 1, 2), 2.5, Math.sqrt(12000000 / Math.max(1, viewport.width * viewport.height)));
       canvas.width = Math.ceil(viewport.width * pixelRatio);
       canvas.height = Math.ceil(viewport.height * pixelRatio);
       canvas.style.width = viewport.width + "px";
