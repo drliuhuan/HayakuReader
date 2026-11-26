@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -234,6 +234,30 @@ pub async fn windows_defaults(
     if !installed() {
         return Err(bad("Install HayakuReader first."));
     }
+    shell_open("ms-settings:defaultapps?registeredAppUser=HayakuReader")
+}
+
+pub async fn open_releases(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+) -> Result<axum::http::StatusCode> {
+    authorize(&headers, &app)?;
+    shell_open(&format!("{REPO}/releases/latest"))
+}
+
+pub fn report_replace_failure(error: &dyn std::error::Error) {
+    let answer = rfd::MessageDialog::new()
+        .set_title("HayakuReader")
+        .set_level(rfd::MessageLevel::Error)
+        .set_description(format!("更新失败 / Update failed\n{error}\n\n打开 GitHub Release 手动下载？ / Open GitHub Releases to download manually?\n{REPO}/releases/latest"))
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show();
+    if answer == rfd::MessageDialogResult::Yes {
+        let _ = shell_open(&format!("{REPO}/releases/latest"));
+    }
+}
+
+fn shell_open(address: &str) -> Result<axum::http::StatusCode> {
     #[link(name = "shell32")]
     unsafe extern "system" {
         fn ShellExecuteW(
@@ -245,10 +269,8 @@ pub async fn windows_defaults(
             show: i32,
         ) -> isize;
     }
-    let uri: Vec<u16> = "ms-settings:defaultapps?registeredAppUser=HayakuReader\0"
-        .encode_utf16()
-        .collect();
-    // The fixed URI opens the Windows default app picker.
+    let uri: Vec<u16> = address.encode_utf16().chain(std::iter::once(0)).collect();
+    // Callers provide fixed system and GitHub URLs.
     let result = unsafe {
         ShellExecuteW(
             std::ptr::null(),
@@ -260,7 +282,7 @@ pub async fn windows_defaults(
         )
     };
     if result <= 32 {
-        return Err(internal("Could not open Windows Default apps"));
+        return Err(internal("Could not open the link"));
     }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -393,9 +415,28 @@ struct Asset {
     name: String,
     browser_download_url: String,
     digest: Option<String>,
+    size: u64,
 }
 
-fn latest() -> std::result::Result<Option<Release>, String> {
+#[derive(Default)]
+pub struct Updater {
+    release: std::sync::Mutex<Option<Release>>,
+    download: std::sync::Mutex<Option<Download>>,
+}
+
+#[derive(Clone, Serialize)]
+struct Download {
+    downloaded: u64,
+    total: u64,
+    bytes_per_second: u64,
+}
+
+pub async fn progress(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<Value>> {
+    authorize(&headers, &app)?;
+    Ok(Json(json!(*app.updater.download.lock().map_err(internal)?)))
+}
+
+fn latest_once() -> std::result::Result<Option<Release>, String> {
     let mut response = match http(Duration::from_secs(8)).get(RELEASE_API).call() {
         Ok(response) => response,
         Err(ureq::Error::StatusCode(404)) => return Ok(None),
@@ -411,12 +452,17 @@ fn latest() -> std::result::Result<Option<Release>, String> {
         .then_some(release))
 }
 
+fn latest() -> std::result::Result<Option<Release>, String> {
+    latest_once().or_else(|_| latest_once())
+}
+
 pub async fn releases(State(app): State<Shared>, headers: HeaderMap) -> Result<Json<Value>> {
     authorize(&headers, &app)?;
     let release = tokio::task::spawn_blocking(latest)
         .await
         .map_err(internal)?
         .map_err(bad)?;
+    *app.updater.release.lock().map_err(internal)? = release.clone();
     Ok(Json(
         json!({"version": release.map(|release| release.tag_name), "installed": installed()}),
     ))
@@ -428,9 +474,13 @@ pub async fn update(State(app): State<Shared>, headers: HeaderMap) -> Result<Jso
         return Err(bad("Install HayakuReader before applying an update."));
     }
     tokio::task::spawn_blocking(move || {
-        let release = latest()
-            .map_err(bad)?
-            .ok_or_else(|| bad("No newer release"))?;
+        let cached = app.updater.release.lock().map_err(internal)?.clone();
+        let release = match cached {
+            Some(release) => release,
+            None => latest()
+                .map_err(bad)?
+                .ok_or_else(|| bad("No newer release"))?,
+        };
         let asset = release
             .assets
             .iter()
@@ -448,32 +498,73 @@ pub async fn update(State(app): State<Shared>, headers: HeaderMap) -> Result<Jso
             .as_deref()
             .and_then(|digest| digest.strip_prefix("sha256:"))
             .ok_or_else(|| bad("The release has no SHA-256 digest"))?;
-        let mut response = http(Duration::from_secs(180))
-            .get(expected)
-            .call()
-            .map_err(bad)?;
-        let data = response
-            .body_mut()
-            .with_config()
-            .limit(128 * 1024 * 1024)
-            .read_to_vec()
-            .map_err(bad)?;
-        if !data.starts_with(b"MZ") || format!("{:x}", Sha256::digest(&data)) != hash {
-            return Err(bad("The update file failed verification"));
+        let mut progress = app.updater.download.lock().map_err(internal)?;
+        if progress.is_some() {
+            return Err(bad("An update is already downloading"));
         }
-        let exe = app.data.join(format!("update-{}.exe", Uuid::new_v4()));
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&exe)
-            .map_err(internal)?;
-        file.write_all(&data).map_err(internal)?;
-        file.sync_all().map_err(internal)?;
-        *app.restart.lock().map_err(internal)? = Some(Restart::Update {
-            executable: exe,
-            version: release.tag_name,
+        *progress = Some(Download {
+            downloaded: 0,
+            total: asset.size,
+            bytes_per_second: 0,
         });
-        Ok(Json(json!({"restart": true})))
+        drop(progress);
+        let result = (|| {
+            let mut response = http(Duration::from_secs(180))
+                .get(expected)
+                .call()
+                .map_err(bad)?;
+            let mut reader = response
+                .body_mut()
+                .with_config()
+                .limit(128 * 1024 * 1024)
+                .reader();
+            let mut file = tempfile::NamedTempFile::new_in(&app.data).map_err(internal)?;
+            let mut checksum = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            let mut downloaded = 0u64;
+            let mut sampled_bytes = 0u64;
+            let mut sampled_at = std::time::Instant::now();
+            let mut signature = Vec::<u8>::with_capacity(2);
+            loop {
+                let count = reader.read(&mut buffer).map_err(bad)?;
+                if count == 0 {
+                    break;
+                }
+                if signature.len() < 2 {
+                    signature.extend_from_slice(&buffer[..count.min(2 - signature.len())]);
+                }
+                checksum.update(&buffer[..count]);
+                file.write_all(&buffer[..count]).map_err(internal)?;
+                downloaded += count as u64;
+                let elapsed = sampled_at.elapsed();
+                let mut progress = app.updater.download.lock().map_err(internal)?;
+                if let Some(progress) = progress.as_mut() {
+                    progress.downloaded = downloaded;
+                    if elapsed >= Duration::from_millis(400) {
+                        progress.bytes_per_second =
+                            ((downloaded - sampled_bytes) as f64 / elapsed.as_secs_f64()) as u64;
+                        sampled_bytes = downloaded;
+                        sampled_at = std::time::Instant::now();
+                    }
+                }
+            }
+            if signature != b"MZ"
+                || downloaded != asset.size
+                || format!("{:x}", checksum.finalize()) != hash
+            {
+                return Err(bad("The update file failed verification"));
+            }
+            let exe = app.data.join(format!("update-{}.exe", Uuid::new_v4()));
+            file.as_file().sync_all().map_err(internal)?;
+            file.persist(&exe).map_err(internal)?;
+            *app.restart.lock().map_err(internal)? = Some(Restart::Update {
+                executable: exe,
+                version: release.tag_name,
+            });
+            Ok(Json(json!({"restart": true})))
+        })();
+        *app.updater.download.lock().map_err(internal)? = None;
+        result
     })
     .await
     .map_err(internal)?
@@ -517,13 +608,38 @@ pub fn apply_update(
         ));
     }
     let target = installed_path()?;
-    for attempt in 0..60 {
-        match copy_binary(&source, &target) {
-            Ok(()) => break,
-            Err(error) if attempt == 59 => return Err(error),
-            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(data.join("instance.lock"))?;
+    'replace: loop {
+        for _ in 0..20 {
+            match lock.try_lock() {
+                Ok(()) => match copy_binary(&source, &target) {
+                    Ok(()) => break 'replace,
+                    Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33)) => {
+                        lock.unlock()?
+                    }
+                    Err(error) => return Err(error),
+                },
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(error) => return Err(error.into()),
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let answer = rfd::MessageDialog::new()
+            .set_title("HayakuReader")
+            .set_level(rfd::MessageLevel::Warning)
+            .set_description("更新尚未能替换旧版本。请关闭旧版 HayakuReader。如果它仍在运行，可在任务管理器中结束旧进程，再点「确定」重试。\n\nClose the previous HayakuReader instance, or end it in Task Manager if it is stuck, then choose OK to retry.")
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .show();
+        if answer != rfd::MessageDialogResult::Ok {
+            return Ok(());
         }
     }
+    drop(lock);
     Command::new(target).args(paths).spawn()?;
     Ok(())
 }

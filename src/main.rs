@@ -60,6 +60,8 @@ struct App {
     dropped: Mutex<std::collections::VecDeque<PathBuf>>,
     #[cfg(windows)]
     restart: Mutex<Option<platform::Restart>>,
+    #[cfg(windows)]
+    updater: platform::Updater,
 }
 
 type Shared = Arc<App>;
@@ -657,7 +659,9 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("HayakuReader：{error}");
         #[cfg(windows)]
-        if !std::env::args_os().any(|argument| argument == "--no-browser") {
+        if std::env::args_os().any(|argument| argument == "--apply-update") {
+            platform::report_replace_failure(error.as_ref());
+        } else if !std::env::args_os().any(|argument| argument == "--no-browser") {
             rfd::MessageDialog::new()
                 .set_level(rfd::MessageLevel::Error)
                 .set_title("HayakuReader")
@@ -732,6 +736,8 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         dropped: Mutex::new(launch_paths),
         #[cfg(windows)]
         restart: Mutex::new(None),
+        #[cfg(windows)]
+        updater: platform::Updater::default(),
     });
     let runtime = tokio::runtime::Runtime::new()?;
     let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
@@ -769,6 +775,8 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             post(platform::windows_defaults),
         )
         .route("/api/project", get(platform::project))
+        .route("/api/release/progress", get(platform::progress))
+        .route("/api/release/open", post(platform::open_releases))
         .route("/api/project/local", get(platform::local_project))
         .route(
             "/api/release",

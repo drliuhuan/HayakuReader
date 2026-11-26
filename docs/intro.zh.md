@@ -8,4 +8,6 @@ HayakuReader 是 **drliuhuan** 用 Rust 构建的 Windows 本地阅读器。可�
 
 v0.2.1 将 HTM 和 HTML 改为默认不关联。你仍可在安装时或安装后的设置中选择关联这两种格式。
 
+v0.2.2 显示更新下载进度和速度。更新失败时可转到 GitHub 手动下载。旧进程阻止更新时，应用会提示关闭旧版后重试。
+
 复杂的 Word 排版可能存在显示差异。受 DRM 保护或采用 HUFF/CDIC 压缩的 Kindle 文件暂不可读。OCR、Markdown 编辑和批注导出暂列后续版本。

@@ -998,13 +998,48 @@ $("installation").addEventListener("close", async () => {
 async function installUpdate() {
   if (updateInProgress) return;
   updateInProgress = true;
+  $("update-transfer").hidden = false;
+  $("update-progress").hidden = false;
+  $("update-progress").value = 0;
+  $("update-speed").textContent = "0% · 0 B/s";
+  $("manual-download").hidden = true;
   message(translate("正在下载并验证更新…", "Downloading and verifying update…"));
+  const poll = setInterval(async () => {
+    try {
+      const progress = await (await request("/api/release/progress")).json();
+      if (!progress || !updateInProgress) return;
+      const percent = progress.total ? Math.min(100, 100 * progress.downloaded / progress.total) : 0;
+      $("update-progress").value = percent;
+      const speed = progress.bytes_per_second;
+      const unit = speed >= 1048576 ? [1048576, "MiB/s"] : speed >= 1024 ? [1024, "KiB/s"] : [1, "B/s"];
+      $("update-speed").textContent = Math.floor(percent) + "% · " + (speed / unit[0]).toFixed(unit[0] === 1 ? 0 : 1) + " " + unit[1];
+    } catch { /* The download request reports any failure. */ }
+  }, 250);
   try {
     const result = await (await post("/api/release", {})).json();
-    if (result.restart) await restart();
-  } catch (error) { report(error); }
-  finally { updateInProgress = false; }
+    if (result.restart) {
+      $("update-progress").value = 100;
+      $("update-speed").textContent = "100%";
+      message(translate("更新已下载，正在重新启动…", "Update verified. Restarting…"));
+      await restart();
+    }
+  } catch (error) { showUpdateFailure(error); }
+  finally { clearInterval(poll); updateInProgress = false; }
 }
+
+function showUpdateFailure(error) {
+  message(translate("更新失败：", "Update failed: ") + error.message);
+  $("update-transfer").hidden = false;
+  $("update-progress").hidden = true;
+  $("update-speed").textContent = "";
+  $("manual-download").hidden = false;
+  $("manual-download").textContent = translate("前往 GitHub Release 手动下载", "Download manually from GitHub Releases");
+}
+
+$("manual-download").onclick = event => {
+  event.preventDefault();
+  post("/api/release/open", {}).catch(showUpdateFailure);
+};
 
 function showRelease(info, manual = false) {
   if (!info?.version) {
@@ -1029,7 +1064,7 @@ function showRelease(info, manual = false) {
 }
 
 $("check-updates").onclick = () => request("/api/release").then(response => response.json())
-  .then(info => showRelease(info, true)).catch(report);
+  .then(info => showRelease(info, true)).catch(showUpdateFailure);
 $("update-dialog").addEventListener("close", () => {
   if ($("update-dialog").returnValue === "update") installUpdate();
 });
