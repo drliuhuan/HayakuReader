@@ -238,12 +238,12 @@ fn highlight_md_line(line: &str, c: &SyntaxColors, fsize: f32, job: &mut LayoutJ
             push_span(job, &line[i..total_end], c.attr, fsize, false);
             i = total_end;
         } else {
-            let next = line[i + 1..]
+            let char_len = line[i..].chars().next().map_or(1, char::len_utf8);
+            let next = line[i + char_len..]
                 .find(['`', '$', '['])
-                .map_or(line.len(), |n| i + 1 + n);
-            let step = next.max(i + line[i..].chars().next().map_or(1, char::len_utf8));
-            push_span(job, &line[i..step], c.plain, fsize, false);
-            i = step;
+                .map_or(line.len(), |n| i + char_len + n);
+            push_span(job, &line[i..next], c.plain, fsize, false);
+            i = next;
         }
     }
 }
@@ -258,7 +258,8 @@ fn highlight_json_line(line: &str, c: &SyntaxColors, fsize: f32, job: &mut Layou
             i += 1;
             while i < bytes.len() {
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 2;
+                    let esc_len = line[i + 1..].chars().next().map_or(1, char::len_utf8);
+                    i += 1 + esc_len;
                     continue;
                 }
                 if bytes[i] == b'"' {
@@ -326,7 +327,8 @@ fn highlight_code_line(line: &str, c: &SyntaxColors, fsize: f32, job: &mut Layou
             i += 1;
             while i < bytes.len() {
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 2;
+                    let esc_len = line[i + 1..].chars().next().map_or(1, char::len_utf8);
+                    i += 1 + esc_len;
                     continue;
                 }
                 if bytes[i] == q {
@@ -457,5 +459,32 @@ mod tests {
         );
         assert!(code_job.sections.len() >= 6);
         assert!(md_job.sections.len() == 1);
+    }
+
+    #[test]
+    fn highlights_multibyte_utf8_markdown_json_and_code_without_panicking() {
+        let md_job = highlight_line(
+            "先说结论：`code` 与 $x^2$ 和 [链接](https://example.com)",
+            CodeLang::Markdown,
+            ThemeMode::Light,
+            15.0,
+        );
+        assert!(md_job.sections.len() >= 5);
+
+        let json_job = highlight_line(
+            r#"{"key": "先\中\"后"}"#,
+            CodeLang::Json,
+            ThemeMode::Dark,
+            14.0,
+        );
+        assert!(json_job.sections.len() >= 3);
+
+        let code_job = highlight_line(
+            r#"let s = "中文\测试";"#,
+            CodeLang::Code,
+            ThemeMode::Light,
+            14.0,
+        );
+        assert!(code_job.sections.len() >= 4);
     }
 }
