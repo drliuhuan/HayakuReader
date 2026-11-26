@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, v2-native]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   check:
@@ -18,3 +19,34 @@ jobs:
         run: cargo test --locked --no-fail-fast
       - name: Run Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+
+  build-exe:
+    needs: check
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/v2-native'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Download PDFium 8066
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:USERPROFILE '.cache\pdfium-bundled\pdfium-8066'
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $tgz = Join-Path $dir 'pdfium-win-x64.tgz'
+          Invoke-WebRequest -Uri 'https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F8066/pdfium-win-x64.tgz' -OutFile $tgz
+          tar -xzf $tgz -C $dir
+          $dll = Join-Path $dir 'bin\pdfium.dll'
+          if (-not (Test-Path $dll)) { throw "pdfium.dll not found after extraction" }
+          Move-Item -LiteralPath $dll -Destination (Join-Path $dir 'pdfium.dll') -Force
+      - name: Build single-file Windows EXE
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+      - name: Upload HayakuReader.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HayakuReader-windows-x64
+          path: dist/HayakuReader.exe
+          if-no-files-found: error

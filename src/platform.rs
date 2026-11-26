@@ -366,6 +366,66 @@ pub fn shell_open(address: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn set_clipboard_text(text: &str) -> Result<(), String> {
+    const GMEM_MOVEABLE: u32 = 0x0002;
+    const CF_UNICODETEXT: u32 = 13;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn OpenClipboard(hwnd: *const core::ffi::c_void) -> i32;
+        fn EmptyClipboard() -> i32;
+        fn SetClipboardData(
+            format: u32,
+            mem: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        fn CloseClipboard() -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalAlloc(flags: u32, bytes: usize) -> *mut core::ffi::c_void;
+        fn GlobalLock(mem: *mut core::ffi::c_void) -> *mut u16;
+        fn GlobalUnlock(mem: *mut core::ffi::c_void) -> i32;
+        fn GlobalFree(mem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let byte_len = wide.len() * std::mem::size_of::<u16>();
+    unsafe {
+        let mut opened = false;
+        for _ in 0..8 {
+            if OpenClipboard(std::ptr::null()) != 0 {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(12));
+        }
+        if !opened {
+            return Err("无法打开系统剪贴板".to_owned());
+        }
+        let result = (|| {
+            if EmptyClipboard() == 0 {
+                return Err("无法清空系统剪贴板".to_owned());
+            }
+            let hmem = GlobalAlloc(GMEM_MOVEABLE, byte_len);
+            if hmem.is_null() {
+                return Err("无法分配剪贴板内存".to_owned());
+            }
+            let ptr = GlobalLock(hmem);
+            if ptr.is_null() {
+                GlobalFree(hmem);
+                return Err("无法锁定剪贴板内存".to_owned());
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+            GlobalUnlock(hmem);
+            if SetClipboardData(CF_UNICODETEXT, hmem).is_null() {
+                GlobalFree(hmem);
+                return Err("写入剪贴板文字失败".to_owned());
+            }
+            Ok(())
+        })();
+        CloseClipboard();
+        result
+    }
+}
+
 pub fn set_clipboard_png(png: &[u8]) -> Result<(), String> {
     const GMEM_MOVEABLE: u32 = 0x0002;
     const PNG_SIG: &[u8] = b"\x89PNG\r\n\x1a\n";

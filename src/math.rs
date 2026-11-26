@@ -713,4 +713,14 @@ mod tests {
         let sum_tex = parse_math_fragment(sum_mml);
         assert!(render_latex(&sum_tex, font, true, 18.0, 1.0, [0, 0, 0, 255]).is_ok());
     }
+
+    #[test]
+    fn renders_set_notation_formulas_from_epub() {
+        let font = shared_stix_font().expect("STIX Two Math embedded");
+        for formula in [r"A=\{1,2\}", r"B=\{x\mid ax=1\}", r"B\subseteq A", "a"] {
+            let rendered = render_latex(formula, font, false, 19.0, 2.0, [240, 240, 240, 255])
+                .unwrap_or_else(|e| panic!("failed to render `{formula}`: {e}"));
+            assert!(rendered.pixel_width > 0 && rendered.pixel_height > 0);
+        }
+    }
 }

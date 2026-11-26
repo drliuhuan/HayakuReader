@@ -492,15 +492,18 @@ fn find_closing_delim(s: &str, open_end: usize, close: &str, allow_newline: bool
     let bytes = s.as_bytes();
     let mut i = open_end;
     while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            i += 2;
+        if s[i..].starts_with(close) {
+            return Some(i);
+        }
+        if bytes[i] == b'\\'
+            && i + 1 < bytes.len()
+            && let Some(next_ch) = s[i + 1..].chars().next()
+        {
+            i += 1 + next_ch.len_utf8();
             continue;
         }
         if !allow_newline && bytes[i] == b'\n' {
             return None;
-        }
-        if s[i..].starts_with(close) {
-            return Some(i);
         }
         let ch = s[i..].chars().next()?;
         i += ch.len_utf8();
@@ -528,8 +531,8 @@ fn find_next_math(s: &str, from: usize) -> Option<(usize, usize, String, bool)> 
                         return Some((i, end + 2, latex, false));
                     }
                 }
-            } else {
-                i += 2;
+            } else if let Some(next_ch) = s[i + 1..].chars().next() {
+                i += 1 + next_ch.len_utf8();
                 continue;
             }
         } else if s[i..].starts_with("$$") {
@@ -2227,6 +2230,37 @@ mod tests {
             Block::DisplayMath {
                 latex: r"\frac{1}{3}".to_owned()
             }
+        );
+    }
+
+    #[test]
+    fn parses_epub_paren_latex_with_escaped_braces_and_macros() {
+        let xhtml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p>已知集合\(A=\{1,2\}\)，\(B=\{x\mid ax=1\}\)。若\(B\subseteq A\)，求实数\(a\)的值。</p>
+</body></html>"#;
+        let (blocks, _, _) =
+            parse_xhtml_blocks_with_anchors(xhtml, "OEBPS/ch1.xhtml", 0, &HashMap::new());
+        assert_eq!(
+            blocks,
+            vec![Block::Paragraph(vec![
+                Inline::Text("已知集合".to_owned()),
+                Inline::InlineMath {
+                    latex: r"A=\{1,2\}".to_owned()
+                },
+                Inline::Text("，".to_owned()),
+                Inline::InlineMath {
+                    latex: r"B=\{x\mid ax=1\}".to_owned()
+                },
+                Inline::Text("。若".to_owned()),
+                Inline::InlineMath {
+                    latex: r"B\subseteq A".to_owned()
+                },
+                Inline::Text("，求实数".to_owned()),
+                Inline::InlineMath {
+                    latex: "a".to_owned()
+                },
+                Inline::Text("的值。".to_owned()),
+            ])]
         );
     }
 

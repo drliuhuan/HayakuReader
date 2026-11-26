@@ -38,6 +38,8 @@ pub struct Settings {
     pub smart_invert: bool,
     #[serde(rename = "smart-invert-hint-seen")]
     pub smart_invert_hint_seen: bool,
+    #[serde(rename = "tab-sleep-hint-seen")]
+    pub tab_sleep_hint_seen: bool,
 }
 
 impl Default for Settings {
@@ -52,6 +54,7 @@ impl Default for Settings {
             install_dismissed: false,
             smart_invert: true,
             smart_invert_hint_seen: false,
+            tab_sleep_hint_seen: false,
         }
     }
 }

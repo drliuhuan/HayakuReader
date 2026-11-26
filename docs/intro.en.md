@@ -1,22 +1,19 @@
 # HayakuReader
 
-HayakuReader is a local Windows reader built in Rust by **drliuhuan**. Open PDF, EPUB, TXT, AZW3, AZW, MOBI, DOC, DOCX, HTML, and Markdown. Copy selected text and keep highlights, notes, and bookmarks.
+HayakuReader is a local Windows document reader built in pure Rust by **drliuhuan**. Powered by a native GPU rendering engine with no WebView2 dependency, it opens PDF, EPUB, TXT, AZW3, AZW, MOBI, DOC, DOCX, HTML, XML, and Markdown with text selection, bookmarks, full-text search, and comfortable dark-mode reading.
 
-- Switch between documents in tabs. Idle and less recently used tabs sleep and resume when selected.
-- Reading positions and annotations stay on your computer. You can restore your tabs on startup.
-- The single EXE supports per-user installation, file associations, and updates from GitHub.
+- **Native multi-format rendering**: Embedded PDFium for crisp PDF rendering; native Word pagination with dynamic CJK font matching; native reflowable layout supporting Ruby annotations, inline/display LaTeX math, and syntax-highlighted code mode with line numbers.
+- **Tabs & power-saving sleep**: Switch between open documents with arrow-navigated tabs that automatically scroll to the active tab. Background tabs idle for 5 minutes or outside the 5 most recently used automatically sleep to free memory; on restart, only the active tab loads immediately while others resume on demand.
+- **Flexible reading controls**: Light and dark themes, smart dark-mode inversion for PDF/Word (preserving vivid colors and illustrations while inverting scanned pages), draggable reading-width margins for reflowable documents, auto-hiding sidebar, and `F11` focus mode.
+- **Offline & portable**: Reading progress, bookmarks, and preferences stay local. The single EXE supports per-user installation, file associations, Start Menu / Desktop shortcuts, and GitHub update checks.
 
-Starting with v0.2.1, HTM and HTML are unchecked by default. You can still select both formats during installation or in settings after installing.
+### Shortcuts
 
-v0.2.2 shows update download progress and speed, offers a manual GitHub download after a failure, and asks you to close the previous process if it blocks an update.
+- `Ctrl+O` Open · `Ctrl+F` Find · `Ctrl+B` Pin / auto sidebar
+- `Ctrl+W` Close tab · `Ctrl+Tab` Next tab · `F11` Focus mode
+- `Ctrl+wheel` / `Ctrl+±` / `Ctrl+0` Zoom & reset · `Ctrl+A` Select document · `Ctrl+C` Copy
 
-v0.2.4 creates Start Menu and Desktop shortcuts on installation and dismisses the splash screen immediately once an associated file finishes loading. It adds global shortcuts (`Ctrl+O/F/B/W/Tab`, `Ctrl+wheel` zoom, `F11` focus mode), floating settings and search panels with match navigation, 4-color quick highlights and in-page annotation editing, perceptual dark-mode smart page inversion (preserving vivid colors and inserted images, lifting dark colors, and inverting full-page scanned PDFs), Markdown/HTML Rendered and Code view switching (with line numbers and syntax highlighting), Markdown annotation export, start-page recent history with delete/clear, HTTP Range loading for large PDFs, and nested EPUB/Kindle outlines with fragment anchors.
-
-v0.2.5 further improves speed and memory efficiency with LRU page canvas/bitmap eviction for PDF and Word, scroll and highlight hot-path optimizations, a zero-allocation smart dark-mode LUT, zero-copy static asset serving, and Thin LTO release builds.
-
-v0.2.6 eliminates colored fringes around small text in smart dark-mode inversion, restores full PDF/Word rendering sharpness with 2× supersampling at small zoom, switches to the polyfilled legacy PDF.js build and adds path resolution fallbacks for older WebView2 runtimes, and keeps error notifications visible until clicked.
-
-v0.2.7 introduces a frameless custom title bar with top-bar dragging, double-click maximize/restore, top-edge resizing, and dedicated minimize/maximize/close controls; moves the smart-invert toggle to the bottom status bar with a one-time first-use callout in dark mode; prevents UI controls from being accidentally selected, and limits `Ctrl+A` to document content (showing a loading progress dialog for large PDF/Word documents before selecting all text).
+### Notes
 
 Complex Word layouts may differ from the originals. Kindle files protected by DRM or compressed with HUFF/CDIC are currently unsupported. OCR and Markdown editing are planned for later releases.
 

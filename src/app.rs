@@ -5,7 +5,8 @@ use crate::{
     pdf::{PdfDoc, PdfLinkItem, PdfTextRun},
     platform::{self, DownloadProgress, InstallationStatus, Release},
     storage::{
-        self, Annotation, BookState, EXTENSIONS, Position, Recent, Settings, TabEntry, Workspace,
+        self, Anchor, Annotation, BookState, EXTENSIONS, Position, Recent, Settings, TabEntry,
+        Workspace,
     },
     theme::{Palette, ThemeMode, smart_invert_rgba},
     word::{Word, WordTextRun},
@@ -27,8 +28,35 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+const TAB_SLEEP_IDLE_MS: u64 = 5 * 60 * 1000;
+const TAB_SLEEP_MAX_AWAKE: usize = 5;
+const SPLASH_DIRECT_DURATION: Duration = Duration::from_secs(1);
+const INTRO_ZH_MD: &str = include_str!("../docs/intro.zh.md");
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+enum SplashState {
+    Timed {
+        started_at: Instant,
+        duration: Duration,
+        frames_rendered: u8,
+        restored: bool,
+    },
+    LoadingFile {
+        primary: PathBuf,
+        extra_sleeping: Vec<PathBuf>,
+        frames_rendered: u8,
+    },
+    Done,
+}
 
 enum LoadedSource {
     Pdf(PdfDoc),
@@ -89,6 +117,15 @@ struct ImageContextMenu {
 struct LinkWarningModal {
     target: String,
     can_open: bool,
+}
+
+struct AnnotationEditorModal {
+    existing_id: Option<String>,
+    kind: String,
+    color: String,
+    text: String,
+    parts: Vec<Anchor>,
+    position: Option<Position>,
 }
 
 struct SearchMatch {
@@ -191,6 +228,16 @@ pub struct HayakuApp {
     workspace: Workspace,
     tabs: Vec<TabEntry>,
     active_book: Option<OpenBook>,
+    background_books: HashMap<String, OpenBook>,
+    last_sleep_check: Instant,
+    tab_sleep_hint_open: bool,
+    tab_sleep_hint_tab_id: Option<String>,
+    tab_screen_rects: HashMap<String, Rect>,
+    tabs_scroll_offset: f32,
+    tabs_scroll_max: f32,
+    scroll_active_tab_into_view: bool,
+    smart_invert_btn_rect: Option<Rect>,
+    splash: SplashState,
     sidebar_open: bool,
     sidebar_pinned: bool,
     sidebar_tab: SidebarTab,
@@ -221,6 +268,7 @@ pub struct HayakuApp {
     fixed_sel_head: Option<FixedTextPos>,
     fixed_sel_dragging: bool,
     fixed_all_selected: bool,
+    last_selection_rect: Option<Rect>,
 
     math_cache: MathCache,
     math_textures: HashMap<MathTexKey, Option<CachedMathTex>>,
@@ -230,6 +278,7 @@ pub struct HayakuApp {
     status_msg: Option<(String, Option<Instant>)>,
     context_menu: Option<ImageContextMenu>,
     link_warning: Option<LinkWarningModal>,
+    annotation_editor: Option<AnnotationEditorModal>,
     smart_invert_hint_open: bool,
 
     install_status: Option<InstallationStatus>,
@@ -287,6 +336,26 @@ impl HayakuApp {
         };
         let (bg_tx, bg_rx) = mpsc::channel();
         let bg_stop = Arc::new(AtomicBool::new(false));
+        let splash = if let Some(first_path) = initial {
+            let mut all_paths = vec![first_path];
+            while let Some(extra) = dropped.pop_front() {
+                all_paths.push(extra);
+            }
+            let primary = all_paths.pop().expect("non-empty startup paths");
+            SplashState::LoadingFile {
+                primary,
+                extra_sleeping: all_paths,
+                frames_rendered: 0,
+            }
+        } else {
+            SplashState::Timed {
+                started_at: Instant::now(),
+                duration: SPLASH_DIRECT_DURATION,
+                frames_rendered: 0,
+                restored: false,
+            }
+        };
+
         let mut app = Self {
             data,
             settings,
@@ -294,6 +363,16 @@ impl HayakuApp {
             workspace,
             tabs,
             active_book: None,
+            background_books: HashMap::new(),
+            last_sleep_check: Instant::now(),
+            tab_sleep_hint_open: false,
+            tab_sleep_hint_tab_id: None,
+            tab_screen_rects: HashMap::new(),
+            tabs_scroll_offset: 0.0,
+            tabs_scroll_max: 0.0,
+            scroll_active_tab_into_view: false,
+            smart_invert_btn_rect: None,
+            splash,
             sidebar_open: false,
             sidebar_pinned: false,
             sidebar_tab: SidebarTab::Contents,
@@ -321,6 +400,7 @@ impl HayakuApp {
             fixed_sel_head: None,
             fixed_sel_dragging: false,
             fixed_all_selected: false,
+            last_selection_rect: None,
             math_cache: MathCache::default(),
             math_textures: HashMap::new(),
             image_textures: HashMap::new(),
@@ -328,6 +408,7 @@ impl HayakuApp {
             status_msg: None,
             context_menu: None,
             link_warning: None,
+            annotation_editor: None,
             smart_invert_hint_open: false,
             install_status,
             show_install_dialog: false,
@@ -343,26 +424,6 @@ impl HayakuApp {
             scroll_fraction: 0.0,
             current_unit: 0,
         };
-
-        if let Some(first_path) = initial {
-            app.open_path(&first_path);
-            while let Some(extra) = dropped.pop_front() {
-                app.open_path(&extra);
-            }
-        } else if app.settings.restore_session
-            && let Some(active_id) = app.workspace.active.clone()
-            && let Some(rec) = app.recent.iter().find(|r| r.id == active_id).cloned()
-            && rec.path.is_file()
-        {
-            app.open_path(&rec.path);
-        }
-
-        if let Some(st) = &app.install_status
-            && !st.installation_exists
-            && !app.settings.install_dismissed
-        {
-            app.show_install_dialog = true;
-        }
 
         let watch_ctx = cc.egui_ctx.clone();
         let watch_data = app.data.clone();
@@ -384,7 +445,6 @@ impl HayakuApp {
         });
 
         app.spawn_release_check(&cc.egui_ctx, false);
-        app.maybe_trigger_smart_invert_hint();
         app
     }
 
@@ -435,11 +495,222 @@ impl HayakuApp {
         self.theme_mode() == ThemeMode::Dark && self.settings.smart_invert
     }
 
+    fn active_book_uses_smart_invert(&self) -> bool {
+        self.active_book
+            .as_ref()
+            .is_some_and(|b| matches!(b.source, LoadedSource::Pdf(_) | LoadedSource::Word(_)))
+    }
+
+    fn is_tab_sleeping(&self, id: &str) -> bool {
+        self.active_book.as_ref().is_none_or(|b| b.id != id)
+            && !self.background_books.contains_key(id)
+    }
+
     fn is_modal_open(&self) -> bool {
-        self.link_warning.is_some()
+        !matches!(self.splash, SplashState::Done)
+            || self.link_warning.is_some()
+            || self.annotation_editor.is_some()
             || self.smart_invert_hint_open
+            || self.tab_sleep_hint_open
             || self.show_install_dialog
             || self.show_update_dialog
+    }
+
+    fn copy_text_reliable(&mut self, ctx: &Context, text: String, success_msg: &str) {
+        if text.is_empty() {
+            return;
+        }
+        ctx.copy_text(text.clone());
+        #[cfg(windows)]
+        {
+            if let Err(e) = platform::set_clipboard_text(&text) {
+                self.set_status(format!("复制失败：{e}"), Some(3));
+                return;
+            }
+        }
+        self.set_status(success_msg, Some(2));
+    }
+
+    fn on_splash_finished(&mut self) {
+        if let Some(st) = &self.install_status
+            && !st.installation_exists
+            && !self.settings.install_dismissed
+        {
+            self.show_install_dialog = true;
+        }
+        self.maybe_trigger_smart_invert_hint();
+    }
+
+    fn restore_active_session_tab_only(&mut self) {
+        if !self.settings.restore_session || self.tabs.is_empty() {
+            return;
+        }
+        let target_id = self
+            .workspace
+            .active
+            .clone()
+            .filter(|id| self.tabs.iter().any(|t| t.id == *id))
+            .or_else(|| self.tabs.last().map(|t| t.id.clone()));
+        if let Some(active_id) = target_id
+            && let Some(rec) = self.recent.iter().find(|r| r.id == active_id).cloned()
+            && rec.path.is_file()
+        {
+            self.open_path(&rec.path);
+        }
+    }
+
+    fn register_sleeping_path(&mut self, path: &Path) {
+        let Ok(normalized) = storage::dunce_path(path) else {
+            return;
+        };
+        if !normalized.is_file() {
+            return;
+        }
+        let title = normalized
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "文档".to_owned());
+        let id = if let Some(rec) = self.recent.iter().find(|r| r.path == normalized) {
+            rec.id.clone()
+        } else {
+            let new_id = uuid::Uuid::new_v4().to_string();
+            self.recent.push(Recent {
+                id: new_id.clone(),
+                path: normalized,
+                digest: String::new(),
+            });
+            self.recent.truncate(200);
+            let _ = storage::write_json(&self.data.join("recent.json"), &self.recent);
+            new_id
+        };
+        if !self.tabs.iter().any(|t| t.id == id) {
+            self.tabs.push(TabEntry {
+                id,
+                title,
+                last_used: 0,
+            });
+        }
+        self.save_workspace();
+    }
+
+    fn touch_tab(&mut self, id: &str, now_ms: u64) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            tab.last_used = now_ms;
+        }
+    }
+
+    fn park_active_book(&mut self, now_ms: u64) {
+        self.save_active_book();
+        if let Some(book) = self.active_book.take() {
+            let id = book.id.clone();
+            self.touch_tab(&id, now_ms);
+            self.background_books.insert(id, book);
+        }
+    }
+
+    fn activate_loaded_book(&mut self, book: OpenBook, now_ms: u64, show_opened_status: bool) {
+        let id = book.id.clone();
+        let title = book.title.clone();
+        let pos = book.state.position.clone().unwrap_or_default();
+        self.current_unit = pos.index;
+        self.scroll_fraction = pos.fraction;
+        self.pending_jump = Some(PendingJump {
+            chapter: pos.index,
+            fragment: String::new(),
+            fraction: pos.fraction,
+        });
+
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            tab.title = title;
+            tab.last_used = now_ms;
+        } else {
+            self.tabs.push(TabEntry {
+                id: id.clone(),
+                title,
+                last_used: now_ms,
+            });
+        }
+
+        self.active_book = Some(book);
+        self.sync_auto_sidebar(true);
+        self.fixed_zoom = None;
+        self.flow_cache = None;
+        self.active_outline_idx = None;
+        self.flow_sel_anchor = None;
+        self.flow_sel_head = None;
+        self.flow_sel_dragging = false;
+        self.fixed_sel_anchor = None;
+        self.fixed_sel_head = None;
+        self.fixed_sel_dragging = false;
+        self.fixed_all_selected = false;
+        self.search_matches.clear();
+        self.search_cursor = 0;
+        self.scroll_active_tab_into_view = true;
+        if !self.active_book_uses_smart_invert() {
+            self.smart_invert_hint_open = false;
+        }
+        self.sleep_inactive_tabs_at(now_ms);
+        self.save_workspace();
+        if show_opened_status {
+            self.set_status("打开成功", Some(2));
+        }
+        self.maybe_trigger_smart_invert_hint();
+    }
+
+    fn sleep_inactive_tabs_at(&mut self, now_ms: u64) -> Vec<String> {
+        let active_id = self.active_book.as_ref().map(|b| b.id.clone());
+        let mut ordered: Vec<(String, u64, bool)> = self
+            .tabs
+            .iter()
+            .map(|t| (t.id.clone(), t.last_used, active_id.as_deref() == Some(t.id.as_str())))
+            .collect();
+        ordered.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)));
+
+        let mut slept = Vec::new();
+        for (rank, (id, last_used, is_active)) in ordered.into_iter().enumerate() {
+            if is_active || !self.background_books.contains_key(&id) {
+                continue;
+            }
+            let outside_recent = rank >= TAB_SLEEP_MAX_AWAKE;
+            let idle_expired = last_used > 0 && now_ms.saturating_sub(last_used) >= TAB_SLEEP_IDLE_MS;
+            if outside_recent || idle_expired {
+                self.background_books.remove(&id);
+                self.page_cache.retain(|(bid, _), _| bid != &id);
+                self.image_textures.retain(|(bid, _), _| bid != &id);
+                slept.push(id);
+            }
+        }
+        if !slept.is_empty() && !self.settings.tab_sleep_hint_seen {
+            self.tab_sleep_hint_tab_id = Some(slept[0].clone());
+            if matches!(self.splash, SplashState::Done)
+                && !self.show_install_dialog
+                && !self.show_update_dialog
+                && !self.smart_invert_hint_open
+            {
+                self.tab_sleep_hint_open = true;
+            }
+        }
+        slept
+    }
+
+    fn switch_to_tab(&mut self, id: &str) {
+        let now_ms = now_epoch_ms();
+        if self.active_book.as_ref().is_some_and(|b| b.id == id) {
+            self.touch_tab(id, now_ms);
+            self.scroll_active_tab_into_view = true;
+            return;
+        }
+        if let Some(book) = self.background_books.remove(id) {
+            self.context_menu = None;
+            self.park_active_book(now_ms);
+            self.activate_loaded_book(book, now_ms, false);
+            return;
+        }
+        if let Some(rec) = self.recent.iter().find(|r| r.id == id).cloned() {
+            self.open_path(&rec.path);
+        } else {
+            self.set_status("找不到该标签页对应的文件路径。", Some(3));
+        }
     }
 
     fn set_status(&mut self, msg: impl Into<String>, secs: Option<u64>) {
@@ -482,18 +753,19 @@ impl HayakuApp {
     }
 
     fn maybe_trigger_smart_invert_hint(&mut self) {
-        if self.active_book.is_some()
+        if matches!(self.splash, SplashState::Done)
+            && self.active_book_uses_smart_invert()
             && self.is_smart_invert()
             && !self.settings.smart_invert_hint_seen
             && !self.show_install_dialog
             && !self.show_update_dialog
         {
+            self.show_settings = false;
             self.smart_invert_hint_open = true;
         }
     }
 
     fn open_path(&mut self, path: &Path) {
-        self.save_active_book();
         self.context_menu = None;
         let normalized = match storage::dunce_path(path) {
             Ok(p) => p,
@@ -506,6 +778,27 @@ impl HayakuApp {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "文档".to_owned());
+        let existing_by_path = self
+            .recent
+            .iter()
+            .find(|r| r.path == normalized)
+            .map(|r| r.id.clone());
+        if let Some(id) = existing_by_path.as_deref() {
+            if self.active_book.as_ref().is_some_and(|b| b.id == id) {
+                let now_ms = now_epoch_ms();
+                self.touch_tab(id, now_ms);
+                self.scroll_active_tab_into_view = true;
+                return;
+            }
+            if let Some(book) = self.background_books.remove(id) {
+                let now_ms = now_epoch_ms();
+                self.park_active_book(now_ms);
+                self.activate_loaded_book(book, now_ms, false);
+                return;
+            }
+        }
+
+        let now_ms = now_epoch_ms();
         let digest = match storage::file_digest(&normalized) {
             Ok(d) => d,
             Err(e) => {
@@ -518,11 +811,12 @@ impl HayakuApp {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let existing_id = self
-            .recent
-            .iter()
-            .find(|r| r.path == normalized || (r.digest == digest && !r.path.exists()))
-            .map(|r| r.id.clone());
+        let existing_id = existing_by_path.or_else(|| {
+            self.recent
+                .iter()
+                .find(|r| !r.digest.is_empty() && r.digest == digest && !r.path.exists())
+                .map(|r| r.id.clone())
+        });
         let id = existing_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let mut state: BookState =
             storage::read_json(&self.data.join(format!("{id}.json"))).unwrap_or_default();
@@ -565,6 +859,7 @@ impl HayakuApp {
             state.view_mode = Some("code".to_owned());
         }
 
+        self.park_active_book(now_ms);
         self.recent.retain(|r| r.id != id);
         self.recent.insert(
             0,
@@ -577,56 +872,15 @@ impl HayakuApp {
         self.recent.truncate(200);
         let _ = storage::write_json(&self.data.join("recent.json"), &self.recent);
 
-        if !self.tabs.iter().any(|t| t.id == id) {
-            self.tabs.push(TabEntry {
-                id: id.clone(),
-                title: title.clone(),
-                last_used: 0,
-            });
-        }
-
-        let pos = state.position.clone().unwrap_or_default();
-        self.current_unit = pos.index;
-        self.scroll_fraction = pos.fraction;
-        self.pending_jump = if pos.index > 0 || pos.fraction > 0.0 {
-            Some(PendingJump {
-                chapter: pos.index,
-                fragment: String::new(),
-                fraction: pos.fraction,
-            })
-        } else {
-            Some(PendingJump {
-                chapter: 0,
-                fragment: String::new(),
-                fraction: 0.0,
-            })
-        };
-
-        self.active_book = Some(OpenBook {
+        let book = OpenBook {
             id,
             title,
             digest,
             kind,
             source,
             state,
-        });
-        self.sync_auto_sidebar(true);
-        self.fixed_zoom = None;
-        self.page_cache.clear();
-        self.flow_cache = None;
-        self.active_outline_idx = None;
-        self.flow_sel_anchor = None;
-        self.flow_sel_head = None;
-        self.flow_sel_dragging = false;
-        self.fixed_sel_anchor = None;
-        self.fixed_sel_head = None;
-        self.fixed_sel_dragging = false;
-        self.fixed_all_selected = false;
-        self.search_matches.clear();
-        self.search_cursor = 0;
-        self.save_workspace();
-        self.set_status("打开成功", Some(2));
-        self.maybe_trigger_smart_invert_hint();
+        };
+        self.activate_loaded_book(book, now_ms, true);
     }
 
     fn close_tab(&mut self, id: &str) {
@@ -634,13 +888,21 @@ impl HayakuApp {
             self.save_active_book();
             self.active_book = None;
             self.flow_cache = None;
+            self.smart_invert_hint_open = false;
+        }
+        self.background_books.remove(id);
+        self.page_cache.retain(|(bid, _), _| bid != id);
+        self.image_textures.retain(|(bid, _), _| bid != id);
+        self.tab_screen_rects.remove(id);
+        if self.tab_sleep_hint_tab_id.as_deref() == Some(id) {
+            self.tab_sleep_hint_tab_id = None;
+            self.tab_sleep_hint_open = false;
         }
         self.tabs.retain(|t| t.id != id);
         if self.active_book.is_none()
             && let Some(next_id) = self.tabs.last().map(|t| t.id.clone())
-            && let Some(rec) = self.recent.iter().find(|r| r.id == next_id).cloned()
         {
-            self.open_path(&rec.path);
+            self.switch_to_tab(&next_id);
         } else {
             self.sync_auto_sidebar(false);
             self.save_workspace();
@@ -857,9 +1119,16 @@ impl HayakuApp {
                     self.update_downloading = false;
                     self.set_status(format!("更新失败：{e}"), None);
                 }
-                BgEvent::InboxFiles(paths) => {
-                    for p in paths {
-                        self.open_path(&p);
+                BgEvent::InboxFiles(mut paths) => {
+                    if let Some(primary) = paths.pop() {
+                        for extra in paths {
+                            self.register_sleeping_path(&extra);
+                        }
+                        self.open_path(&primary);
+                        if !matches!(self.splash, SplashState::Done) {
+                            self.splash = SplashState::Done;
+                            self.on_splash_finished();
+                        }
                     }
                     ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
@@ -945,7 +1214,8 @@ impl HayakuApp {
                 i.key_pressed(Key::F11),
                 i.key_pressed(Key::Escape),
                 if ctrl { i.smooth_scroll_delta.y } else { 0.0 },
-                ctrl && i.key_pressed(Key::C),
+                i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+                    || (ctrl && i.key_pressed(Key::C)),
                 ctrl && i.key_pressed(Key::A),
                 !typing && !ctrl && i.key_pressed(Key::Home),
                 !typing && !ctrl && i.key_pressed(Key::End),
@@ -978,9 +1248,7 @@ impl HayakuApp {
                 .and_then(|b| self.tabs.iter().position(|t| t.id == b.id))
                 .unwrap_or(0);
             let next_id = self.tabs[(cur + 1) % self.tabs.len()].id.clone();
-            if let Some(rec) = self.recent.iter().find(|r| r.id == next_id).cloned() {
-                self.open_path(&rec.path);
-            }
+            self.switch_to_tab(&next_id);
         }
         if f11 && self.active_book.is_some() {
             self.focus_mode = !self.focus_mode;
@@ -1008,8 +1276,7 @@ impl HayakuApp {
                 self.selected_fixed_text()
             };
             if !txt.is_empty() {
-                ctx.copy_text(txt);
-                self.set_status("已复制选中文字。", Some(2));
+                self.copy_text_reliable(ctx, txt, "已复制选中文字。");
             }
         }
 
@@ -1318,6 +1585,9 @@ impl HayakuApp {
                             self.show_settings = !self.show_settings;
                         }
                         if self.active_book.is_some() {
+                            if ui.button("笔记").clicked() {
+                                self.open_note_editor_from_selection();
+                            }
                             if ui.button("书签").clicked() {
                                 self.add_bookmark();
                             }
@@ -1397,62 +1667,562 @@ impl HayakuApp {
         }
     }
 
+    fn clear_selection(&mut self) {
+        self.flow_sel_anchor = None;
+        self.flow_sel_head = None;
+        self.flow_sel_dragging = false;
+        self.fixed_sel_anchor = None;
+        self.fixed_sel_head = None;
+        self.fixed_sel_dragging = false;
+        self.fixed_all_selected = false;
+        self.last_selection_rect = None;
+    }
+
+    fn selected_anchors(&self) -> Vec<Anchor> {
+        let Some(book) = &self.active_book else {
+            return Vec::new();
+        };
+        match &book.source {
+            LoadedSource::Pdf(_) | LoadedSource::Word(_) => {
+                let (Some(a), Some(b)) = (self.fixed_sel_anchor, self.fixed_sel_head) else {
+                    return Vec::new();
+                };
+                let (start, end) = if a <= b { (a, b) } else { (b, a) };
+                if start == end {
+                    return Vec::new();
+                }
+                let mut anchors = Vec::new();
+                for page in start.page..=end.page {
+                    let key = (book.id.clone(), page);
+                    let Some(cached) = self.page_cache.get(&key) else {
+                        continue;
+                    };
+                    let texts: Vec<&str> = if !cached.pdf_runs.is_empty() {
+                        cached.pdf_runs.iter().map(|r| r.text.as_str()).collect()
+                    } else {
+                        cached.word_runs.iter().map(|r| r.text.as_str()).collect()
+                    };
+                    if texts.is_empty() {
+                        continue;
+                    }
+                    let r_start = if page == start.page { start.run_idx } else { 0 };
+                    let r_end = if page == end.page {
+                        end.run_idx.min(texts.len() - 1)
+                    } else {
+                        texts.len() - 1
+                    };
+                    let mut full = String::new();
+                    let mut total_chars = 0usize;
+                    let mut sel_start_char = None;
+                    let mut sel_end_char = 0usize;
+                    for (ri, t) in texts.iter().enumerate() {
+                        let len = t.chars().count();
+                        if ri >= r_start && ri <= r_end {
+                            let c0 = if page == start.page && ri == start.run_idx {
+                                start.char_idx.min(len)
+                            } else {
+                                0
+                            };
+                            let c1 = if page == end.page && ri == end.run_idx {
+                                end.char_idx.min(len)
+                            } else {
+                                len
+                            };
+                            if c1 > c0 {
+                                if sel_start_char.is_none() {
+                                    sel_start_char = Some(total_chars + c0);
+                                }
+                                sel_end_char = total_chars + c1;
+                            }
+                        }
+                        full.push_str(t);
+                        total_chars += len;
+                    }
+                    if let Some(s_char) = sel_start_char
+                        && sel_end_char > s_char
+                    {
+                        let quote = slice_chars(&full, s_char, sel_end_char);
+                        if !quote.trim().is_empty() {
+                            let before = slice_chars(&full, s_char.saturating_sub(24), s_char);
+                            let after = slice_chars(&full, sel_end_char, (sel_end_char + 24).min(total_chars));
+                            anchors.push(Anchor {
+                                index: page,
+                                start: s_char,
+                                quote,
+                                digest: book.digest.clone(),
+                                before,
+                                after,
+                            });
+                        }
+                    }
+                }
+                anchors
+            }
+            LoadedSource::Flow(_) => {
+                let Some(cache) = &self.flow_cache else {
+                    return Vec::new();
+                };
+                let (Some(a), Some(b)) = (self.flow_sel_anchor, self.flow_sel_head) else {
+                    return Vec::new();
+                };
+                let (start, end) = if a <= b { (a, b) } else { (b, a) };
+                if start == end || cache.items.is_empty() {
+                    return Vec::new();
+                }
+                let end_idx = end.item_idx.min(cache.items.len() - 1);
+                let mut anchors = Vec::new();
+                let mut per_chapter: HashMap<usize, (usize, usize, String)> = HashMap::new();
+                for (idx, item) in cache.items[..=end_idx].iter().enumerate().skip(start.item_idx) {
+                    if item.plain.is_empty() {
+                        continue;
+                    }
+                    let ch = item.chapter_idx;
+                    let ch_start_item = cache.chapter_first_item.get(ch).copied().unwrap_or(0);
+                    let mut ch_offset = 0usize;
+                    for prev in &cache.items[ch_start_item..idx] {
+                        if !prev.plain.is_empty() {
+                            ch_offset += prev.plain.chars().count() + 1;
+                        }
+                    }
+                    let total_c = item.plain.chars().count();
+                    let c0 = if idx == start.item_idx {
+                        start.char_idx.min(total_c)
+                    } else {
+                        0
+                    };
+                    let c1 = if idx == end.item_idx {
+                        end.char_idx.min(total_c)
+                    } else {
+                        total_c
+                    };
+                    if c1 > c0 {
+                        let frag = slice_chars(&item.plain, c0, c1);
+                        let entry = per_chapter
+                            .entry(ch)
+                            .or_insert_with(|| (ch_offset + c0, ch_offset + c1, String::new()));
+                        if !entry.2.is_empty() {
+                            entry.2.push('\n');
+                        }
+                        entry.2.push_str(&frag);
+                        entry.1 = ch_offset + c1;
+                    }
+                }
+                let mut keys: Vec<usize> = per_chapter.keys().copied().collect();
+                keys.sort_unstable();
+                for ch in keys {
+                    if let Some((s_char, e_char, quote)) = per_chapter.remove(&ch)
+                        && !quote.trim().is_empty()
+                    {
+                        let ch_full = chapter_plain_from_cache(cache, ch);
+                        let ch_len = ch_full.chars().count();
+                        let before = slice_chars(&ch_full, s_char.saturating_sub(24), s_char);
+                        let after = slice_chars(&ch_full, e_char, (e_char + 24).min(ch_len));
+                        anchors.push(Anchor {
+                            index: ch,
+                            start: s_char,
+                            quote,
+                            digest: book.digest.clone(),
+                            before,
+                            after,
+                        });
+                    }
+                }
+                anchors
+            }
+        }
+    }
+
+    fn add_highlight_from_selection(&mut self, color: &str) {
+        let parts = self.selected_anchors();
+        if parts.is_empty() {
+            return;
+        }
+        let unit = parts[0].index;
+        let quote_preview = parts
+            .iter()
+            .map(|p| p.quote.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let digest = self
+            .active_book
+            .as_ref()
+            .map(|b| b.digest.clone())
+            .unwrap_or_default();
+        if let Some(book) = self.active_book.as_mut() {
+            book.state.annotations.push(Annotation {
+                id: uuid::Uuid::new_v4().to_string(),
+                kind: "highlight".to_owned(),
+                color: color.to_owned(),
+                text: truncate_str(quote_preview.trim(), 60),
+                parts,
+                position: Some(Position {
+                    index: unit,
+                    fraction: self.scroll_fraction,
+                    anchor: None,
+                }),
+                digest,
+                missing: false,
+            });
+            self.save_active_book();
+            self.clear_selection();
+            self.set_status("已添加高亮。", Some(2));
+        }
+    }
+
+    fn open_note_editor_from_selection(&mut self) {
+        let parts = self.selected_anchors();
+        let unit = parts.first().map(|p| p.index).unwrap_or(self.current_unit);
+        self.annotation_editor = Some(AnnotationEditorModal {
+            existing_id: None,
+            kind: "note".to_owned(),
+            color: "yellow".to_owned(),
+            text: String::new(),
+            parts,
+            position: Some(Position {
+                index: unit,
+                fraction: self.scroll_fraction,
+                anchor: None,
+            }),
+        });
+    }
+
+    fn open_annotation_editor_for(&mut self, ann: &Annotation) {
+        self.annotation_editor = Some(AnnotationEditorModal {
+            existing_id: Some(ann.id.clone()),
+            kind: ann.kind.clone(),
+            color: if ann.color.is_empty() {
+                "yellow".to_owned()
+            } else {
+                ann.color.clone()
+            },
+            text: ann.text.clone(),
+            parts: ann.parts.clone(),
+            position: ann.position.clone(),
+        });
+    }
+
+    fn export_annotations_markdown(&mut self) {
+        let Some(book) = &self.active_book else {
+            return;
+        };
+        if book.state.annotations.is_empty() {
+            self.set_status("当前文档暂无批注可导出。", Some(2));
+            return;
+        }
+        let is_fixed = matches!(book.source, LoadedSource::Pdf(_) | LoadedSource::Word(_));
+        let mut md = format!("# {} · 批注与高亮\n\n", book.title);
+        for ann in &book.state.annotations {
+            let loc = ann
+                .position
+                .as_ref()
+                .map(|p| {
+                    if is_fixed {
+                        format!("第 {} 页", p.index + 1)
+                    } else {
+                        format!("第 {} 章", p.index + 1)
+                    }
+                })
+                .unwrap_or_default();
+            let kind_label = match ann.kind.as_str() {
+                "bookmark" => "书签",
+                "note" => "笔记",
+                _ => "高亮",
+            };
+            md.push_str(&format!("## {kind_label} · {loc}\n\n"));
+            if !ann.parts.is_empty() {
+                let quote = ann
+                    .parts
+                    .iter()
+                    .map(|p| p.quote.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !quote.is_empty() {
+                    for line in quote.lines() {
+                        md.push_str(&format!("> {line}\n"));
+                    }
+                    md.push('\n');
+                }
+            }
+            if !ann.text.trim().is_empty() && ann.kind != "highlight" {
+                md.push_str(ann.text.trim());
+                md.push_str("\n\n");
+            }
+        }
+        let default_name = format!("{}-批注.md", book.title);
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Markdown", &["md"])
+            .set_file_name(&default_name)
+            .save_file()
+        {
+            match fs::write(&path, md) {
+                Ok(()) => self.set_status("批注已导出为 Markdown。", Some(3)),
+                Err(e) => self.set_status(format!("导出批注失败：{e}"), None),
+            }
+        }
+    }
+
     fn draw_tabs_bar(&mut self, ui: &mut Ui) {
+        self.tab_screen_rects.clear();
         if self.tabs.is_empty() || self.focus_mode {
             return;
         }
         let p = self.palette();
+        let dark = self.theme_mode() == ThemeMode::Dark;
         Panel::top("document_tabs")
-            .exact_size(34.0)
+            .exact_size(36.0)
             .show_separator_line(true)
             .frame(
                 Frame::new()
                     .fill(p.side)
-                    .inner_margin(Margin::symmetric(8, 3)),
+                    .inner_margin(Margin::symmetric(6, 4)),
             )
             .show(ui, |ui| {
-                ScrollArea::horizontal().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let active_id = self.active_book.as_ref().map(|b| b.id.clone());
-                        let mut switch_to = None;
-                        let mut close_id = None;
-                        for tab in &self.tabs {
-                            let is_active = active_id.as_deref() == Some(tab.id.as_str());
-                            let frame = Frame::new()
-                                .fill(if is_active { p.surface } else { p.side })
-                                .stroke(Stroke::new(
-                                    1.0,
-                                    if is_active { p.accent } else { p.line },
-                                ))
-                                .corner_radius(CornerRadius::same(6))
-                                .inner_margin(Margin::symmetric(8, 3));
-                            frame.show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    let btn = ui.add(
-                                        egui::Button::new(truncate_str(&tab.title, 22))
-                                            .frame(false),
-                                    );
-                                    if btn.clicked() && !is_active {
-                                        switch_to = Some(tab.id.clone());
-                                    }
-                                    if btn.middle_clicked() {
-                                        close_id = Some(tab.id.clone());
-                                    }
-                                    if ui.add(egui::Button::new("×").frame(false)).clicked() {
-                                        close_id = Some(tab.id.clone());
-                                    }
-                                });
-                            });
-                        }
-                        if let Some(id) = close_id {
-                            self.close_tab(&id);
-                        } else if let Some(id) = switch_to
-                            && let Some(rec) = self.recent.iter().find(|r| r.id == id).cloned()
-                        {
-                            self.open_path(&rec.path);
-                        }
-                    });
+                let avail_w = ui.available_width();
+                let arrow_w = 24.0;
+                let arrow_gap = 4.0;
+                let viewport_w = (avail_w - (arrow_w + arrow_gap) * 2.0).max(40.0);
+                let step = (viewport_w * 0.55).max(160.0);
+                let can_left = self.tabs_scroll_offset > 0.5;
+                let can_right = self.tabs_scroll_offset + 0.5 < self.tabs_scroll_max;
+
+                let mut switch_to: Option<String> = None;
+                let mut close_id: Option<String> = None;
+                let mut active_rel_span: Option<(f32, f32)> = None;
+                let mut new_tab_rects: Vec<(String, Rect)> = Vec::new();
+                let mut content_w = 0.0f32;
+                let mut tabs_viewport_rect = Rect::NOTHING;
+
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = arrow_gap;
+
+                    // Left scroll arrow button
+                    let (left_rect, left_resp) =
+                        ui.allocate_exact_size(Vec2::new(arrow_w, 26.0), Sense::click());
+                    let left_resp = left_resp.on_hover_text("向左滚动标签栏");
+                    if can_left && left_resp.hovered() {
+                        ui.painter().rect_filled(left_rect, 5.0, p.surface);
+                    }
+                    ui.painter().rect_stroke(
+                        left_rect,
+                        5.0,
+                        Stroke::new(1.0, if can_left { p.line } else { Color32::TRANSPARENT }),
+                        StrokeKind::Inside,
+                    );
+                    draw_chevron(
+                        ui.painter(),
+                        left_rect.center(),
+                        true,
+                        if can_left {
+                            p.ink
+                        } else {
+                            Color32::from_rgba_unmultiplied(p.muted.r(), p.muted.g(), p.muted.b(), 110)
+                        },
+                    );
+                    if can_left && left_resp.clicked() {
+                        self.tabs_scroll_offset = (self.tabs_scroll_offset - step).max(0.0);
+                    }
+
+                    // Scrollable tab strip with scrollbar completely hidden
+                    let scroll_out = ui
+                        .allocate_ui_with_layout(
+                            Vec2::new(viewport_w, 28.0),
+                            egui::Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ScrollArea::horizontal()
+                                    .id_salt("document_tabs_scroll")
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                    )
+                                    .horizontal_scroll_offset(self.tabs_scroll_offset)
+                                    .show(ui, |ui| {
+                                        let inner = ui.horizontal(|ui| {
+                                            let content_origin_x = ui.cursor().left();
+                                            let active_id =
+                                                self.active_book.as_ref().map(|b| b.id.clone());
+                                            for tab in &self.tabs {
+                                                let is_active =
+                                                    active_id.as_deref() == Some(tab.id.as_str());
+                                                let sleeping = self.is_tab_sleeping(&tab.id);
+                                                let frame = Frame::new()
+                                                    .fill(if is_active { p.surface } else { p.side })
+                                                    .stroke(Stroke::new(
+                                                        1.0,
+                                                        if is_active { p.accent } else { p.line },
+                                                    ))
+                                                    .corner_radius(CornerRadius::same(6))
+                                                    .inner_margin(Margin::symmetric(8, 3));
+                                                let tab_resp = frame
+                                                    .show(ui, |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.spacing_mut().item_spacing.x = 5.0;
+                                                            if sleeping {
+                                                                let (leaf_rect, _) =
+                                                                    ui.allocate_exact_size(
+                                                                        Vec2::new(13.0, 13.0),
+                                                                        Sense::hover(),
+                                                                    );
+                                                                draw_eco_leaf_icon(
+                                                                    ui.painter(),
+                                                                    leaf_rect,
+                                                                    dark,
+                                                                );
+                                                            }
+                                                            let text_color = if sleeping {
+                                                                Color32::from_rgba_unmultiplied(
+                                                                    p.muted.r(),
+                                                                    p.muted.g(),
+                                                                    p.muted.b(),
+                                                                    195,
+                                                                )
+                                                            } else {
+                                                                p.ink
+                                                            };
+                                                            let label_text = RichText::new(
+                                                                truncate_str(&tab.title, 22),
+                                                            )
+                                                            .color(text_color);
+                                                            let tooltip = if sleeping {
+                                                                format!(
+                                                                    "{}（已休眠以节省内存，点击恢复）",
+                                                                    tab.title
+                                                                )
+                                                            } else {
+                                                                tab.title.clone()
+                                                            };
+                                                            let btn = ui
+                                                                .add(
+                                                                    egui::Button::new(label_text)
+                                                                        .frame(false),
+                                                                )
+                                                                .on_hover_text(tooltip);
+                                                            if btn.clicked() && !is_active {
+                                                                switch_to = Some(tab.id.clone());
+                                                            }
+                                                            if btn.middle_clicked() {
+                                                                close_id = Some(tab.id.clone());
+                                                            }
+                                                            let close_text =
+                                                                RichText::new("×").color(
+                                                                    if sleeping {
+                                                                        text_color
+                                                                    } else {
+                                                                        p.muted
+                                                                    },
+                                                                );
+                                                            if ui
+                                                                .add(
+                                                                    egui::Button::new(close_text)
+                                                                        .frame(false),
+                                                                )
+                                                                .on_hover_text("关闭标签页")
+                                                                .clicked()
+                                                            {
+                                                                close_id = Some(tab.id.clone());
+                                                            }
+                                                        });
+                                                    })
+                                                    .response;
+                                                let tab_rect = tab_resp.rect;
+                                                new_tab_rects.push((tab.id.clone(), tab_rect));
+                                                if is_active {
+                                                    active_rel_span = Some((
+                                                        tab_rect.left() - content_origin_x,
+                                                        tab_rect.right() - content_origin_x,
+                                                    ));
+                                                }
+                                            }
+                                        });
+                                        inner.response.rect.width()
+                                    })
+                            },
+                        )
+                        .inner;
+                    content_w = scroll_out.content_size.x.max(scroll_out.inner);
+                    tabs_viewport_rect = scroll_out.inner_rect;
+
+                    // Right scroll arrow button
+                    let (right_rect, right_resp) =
+                        ui.allocate_exact_size(Vec2::new(arrow_w, 26.0), Sense::click());
+                    let right_resp = right_resp.on_hover_text("向右滚动标签栏");
+                    if can_right && right_resp.hovered() {
+                        ui.painter().rect_filled(right_rect, 5.0, p.surface);
+                    }
+                    ui.painter().rect_stroke(
+                        right_rect,
+                        5.0,
+                        Stroke::new(1.0, if can_right { p.line } else { Color32::TRANSPARENT }),
+                        StrokeKind::Inside,
+                    );
+                    draw_chevron(
+                        ui.painter(),
+                        right_rect.center(),
+                        false,
+                        if can_right {
+                            p.ink
+                        } else {
+                            Color32::from_rgba_unmultiplied(p.muted.r(), p.muted.g(), p.muted.b(), 110)
+                        },
+                    );
+                    if can_right && right_resp.clicked() {
+                        self.tabs_scroll_offset =
+                            (self.tabs_scroll_offset + step).min(self.tabs_scroll_max);
+                    }
                 });
+
+                for (id, rect) in new_tab_rects {
+                    self.tab_screen_rects.insert(id, rect);
+                }
+
+                self.tabs_scroll_max = (content_w - viewport_w).max(0.0);
+                self.tabs_scroll_offset =
+                    self.tabs_scroll_offset.clamp(0.0, self.tabs_scroll_max);
+
+                // Support mouse wheel scrolling when hovering the tab bar
+                if !self.is_modal_open()
+                    && self.tabs_scroll_max > 0.5
+                    && ui
+                        .ctx()
+                        .pointer_latest_pos()
+                        .is_some_and(|pos| tabs_viewport_rect.contains(pos))
+                {
+                    let (dx, dy) = ui
+                        .ctx()
+                        .input(|i| (i.smooth_scroll_delta.x, i.smooth_scroll_delta.y));
+                    let delta = if dx.abs() > dy.abs() { -dx } else { -dy };
+                    if delta.abs() > 0.1 {
+                        self.tabs_scroll_offset = (self.tabs_scroll_offset + delta)
+                            .clamp(0.0, self.tabs_scroll_max);
+                        ui.ctx().request_repaint();
+                    }
+                }
+
+                // Auto-scroll active tab into view when switched programmatically or opened externally
+                if self.scroll_active_tab_into_view {
+                    if let Some((rel_left, rel_right)) = active_rel_span {
+                        let old = self.tabs_scroll_offset;
+                        if rel_left < self.tabs_scroll_offset {
+                            self.tabs_scroll_offset = (rel_left - 6.0).max(0.0);
+                        } else if rel_right > self.tabs_scroll_offset + viewport_w {
+                            self.tabs_scroll_offset = (rel_right - viewport_w + 6.0)
+                                .clamp(0.0, self.tabs_scroll_max);
+                        }
+                        if (self.tabs_scroll_offset - old).abs() > 0.5 {
+                            ui.ctx().request_repaint();
+                        }
+                        self.scroll_active_tab_into_view = false;
+                    } else if self.active_book.is_some() {
+                        ui.ctx().request_repaint();
+                    } else {
+                        self.scroll_active_tab_into_view = false;
+                    }
+                }
+
+                if let Some(id) = close_id {
+                    self.close_tab(&id);
+                } else if let Some(id) = switch_to {
+                    self.switch_to_tab(&id);
+                }
             });
     }
 
@@ -1563,26 +2333,165 @@ impl HayakuApp {
                     }
                     SidebarTab::Notes => {
                         let mut remove_idx = None;
+                        let mut edit_ann: Option<Annotation> = None;
                         let mut jump_to = None;
+                        let mut export_md = false;
                         if let Some(book) = &self.active_book {
                             if book.state.annotations.is_empty() {
-                                ui.label(RichText::new("暂无书签或批注").color(p.muted));
+                                ui.label(RichText::new("暂无书签、高亮或批注").color(p.muted));
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new("提示：拖动选中正文即可一键添加四色高亮或笔记。")
+                                        .size(12.5)
+                                        .color(p.muted),
+                                );
                             } else {
+                                ui.horizontal(|ui| {
+                                    if ui.button("导出 Markdown").clicked() {
+                                        export_md = true;
+                                    }
+                                });
+                                ui.add_space(6.0);
+                                let is_fixed = matches!(
+                                    book.source,
+                                    LoadedSource::Pdf(_) | LoadedSource::Word(_)
+                                );
                                 for (idx, ann) in book.state.annotations.iter().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        if ui.button(&ann.text).clicked()
+                                    let card = Frame::new()
+                                        .fill(p.surface)
+                                        .stroke(Stroke::new(1.0, p.line))
+                                        .corner_radius(CornerRadius::same(7))
+                                        .inner_margin(Margin::same(8));
+                                    card.show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            let dot_color = if ann.kind == "bookmark" {
+                                                p.accent
+                                            } else {
+                                                highlight_swatch_color(&ann.color)
+                                            };
+                                            let (dot_rect, _) = ui.allocate_exact_size(
+                                                Vec2::splat(10.0),
+                                                Sense::hover(),
+                                            );
+                                            ui.painter().circle_filled(
+                                                dot_rect.center(),
+                                                4.5,
+                                                dot_color,
+                                            );
+                                            let kind_txt = match ann.kind.as_str() {
+                                                "bookmark" => "书签",
+                                                "note" => "笔记",
+                                                _ => "高亮",
+                                            };
+                                            let loc_txt = ann
+                                                .position
+                                                .as_ref()
+                                                .map(|pos| {
+                                                    if is_fixed {
+                                                        format!("第 {} 页", pos.index + 1)
+                                                    } else {
+                                                        format!("第 {} 章", pos.index + 1)
+                                                    }
+                                                })
+                                                .unwrap_or_default();
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new(format!(
+                                                            "{kind_txt} · {loc_txt}"
+                                                        ))
+                                                        .size(12.5)
+                                                        .color(p.muted),
+                                                    )
+                                                    .frame(false),
+                                                )
+                                                .clicked()
+                                            {
+                                                if let Some(pos) = &ann.position {
+                                                    jump_to = Some((pos.index, pos.fraction));
+                                                } else if let Some(first) = ann.parts.first() {
+                                                    jump_to = Some((first.index, 0.0));
+                                                }
+                                            }
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .add(egui::Button::new("×").frame(false))
+                                                        .on_hover_text("删除")
+                                                        .clicked()
+                                                    {
+                                                        remove_idx = Some(idx);
+                                                    }
+                                                    if ui
+                                                        .add(
+                                                            egui::Button::new(
+                                                                RichText::new("编辑").size(12.0),
+                                                            )
+                                                            .frame(false),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        edit_ann = Some(ann.clone());
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        if let Some(first_part) = ann.parts.first()
+                                            && !first_part.quote.trim().is_empty()
+                                        {
+                                            let q = truncate_str(first_part.quote.trim(), 48);
+                                            if ui
+                                                .add(
+                                                    egui::Label::new(
+                                                        RichText::new(format!("“{q}”"))
+                                                            .size(12.5)
+                                                            .color(p.muted),
+                                                    )
+                                                    .wrap()
+                                                    .sense(Sense::click()),
+                                                )
+                                                .clicked()
+                                            {
+                                                if let Some(pos) = &ann.position {
+                                                    jump_to = Some((pos.index, pos.fraction));
+                                                } else {
+                                                    jump_to = Some((first_part.index, 0.0));
+                                                }
+                                            }
+                                        }
+                                        if !ann.text.trim().is_empty()
+                                            && ann.kind != "highlight"
+                                            && ui
+                                                .add(
+                                                    egui::Label::new(
+                                                        RichText::new(truncate_str(
+                                                            ann.text.trim(),
+                                                            80,
+                                                        ))
+                                                        .color(p.ink),
+                                                    )
+                                                    .wrap()
+                                                    .sense(Sense::click()),
+                                                )
+                                                .clicked()
                                             && let Some(pos) = &ann.position
                                         {
                                             jump_to = Some((pos.index, pos.fraction));
                                         }
-                                        if ui.button("×").clicked() {
-                                            remove_idx = Some(idx);
-                                        }
                                     });
+                                    ui.add_space(4.0);
                                 }
                             }
                         } else {
                             ui.label(RichText::new("请先打开文档").color(p.muted));
+                        }
+                        if export_md {
+                            self.export_annotations_markdown();
+                        }
+                        if let Some(ann) = edit_ann {
+                            self.open_annotation_editor_for(&ann);
                         }
                         if let Some(idx) = remove_idx
                             && let Some(book) = self.active_book.as_mut()
@@ -1606,11 +2515,13 @@ impl HayakuApp {
     }
 
     fn draw_bottom_bar(&mut self, ui: &mut Ui) {
+        self.smart_invert_btn_rect = None;
         if self.focus_mode {
             return;
         }
         let p = self.palette();
         let dark = self.theme_mode() == ThemeMode::Dark;
+        let uses_smart_invert = self.active_book_uses_smart_invert();
         Panel::bottom("status_footer")
             .exact_size(38.0)
             .show_separator_line(true)
@@ -1651,7 +2562,7 @@ impl HayakuApp {
                     };
                     ui.label(RichText::new(loc).color(p.muted));
 
-                    if dark && self.active_book.is_some() {
+                    if dark && uses_smart_invert {
                         ui.add_space(8.0);
                         let active = self.settings.smart_invert;
                         let label = if active {
@@ -1676,10 +2587,15 @@ impl HayakuApp {
                         })
                         .stroke(Stroke::new(1.0, if active { p.accent } else { p.line }))
                         .corner_radius(CornerRadius::same(14));
-                        if ui.add(btn).clicked() {
+                        let btn_resp = ui.add(btn);
+                        self.smart_invert_btn_rect = Some(btn_resp.rect);
+                        if btn_resp.clicked() {
                             self.settings.smart_invert = !self.settings.smart_invert;
                             self.page_cache.clear();
                             self.save_settings();
+                            if !self.settings.smart_invert {
+                                self.smart_invert_hint_open = false;
+                            }
                         }
                     }
 
@@ -1759,89 +2675,136 @@ impl HayakuApp {
 
     fn draw_welcome(&mut self, ui: &mut Ui) {
         let p = self.palette();
+        let mut open_repo = false;
+        let mut open_files = false;
+        let mut open_target = None;
+        let mut del_target = None;
+        let mut clear_recent = false;
         ScrollArea::vertical().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(36.0);
-                if let Some(logo) = &self.logo_texture {
-                    ui.add(egui::Image::new((logo.id(), Vec2::splat(56.0))));
-                    ui.add_space(10.0);
-                }
-                ui.label(
-                    RichText::new("HayakuReader (Native v2)")
-                        .size(28.0)
-                        .strong()
-                        .color(p.ink),
-                );
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new("轻量原生 GPU 阅读器 · 支持 PDF、Word、EPUB、Kindle、HTML、XML、Markdown、TXT\n轻小说振假名（Ruby）与学术公式（行内 / 独行）原生高精度排版")
-                        .color(p.muted),
-                );
-                ui.add_space(16.0);
-                if ui
-                    .add_sized(
-                        [140.0, 36.0],
-                        egui::Button::new(RichText::new("打开文件").color(p.accent_ink))
-                            .fill(p.accent),
-                    )
-                    .clicked()
-                {
-                    self.pick_and_open_files();
-                }
-                if !self.recent.is_empty() {
-                    ui.add_space(24.0);
-                    Frame::new()
-                        .fill(p.surface)
-                        .stroke(Stroke::new(1.0, p.line))
-                        .corner_radius(CornerRadius::same(10))
-                        .inner_margin(Margin::same(14))
-                        .show(ui, |ui| {
-                            ui.set_max_width(540.0);
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("最近阅读").strong());
-                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                    if ui.button("清空记录").clicked() {
-                                        let _ = storage::clear_recent_entries(
-                                            &self.data,
-                                            &mut self.recent,
-                                        );
-                                    }
-                                });
-                            });
-                            ui.separator();
-                            let mut open_target = None;
-                            let mut del_target = None;
-                            for rec in self.recent.iter().take(12) {
-                                let name = rec
-                                    .path
-                                    .file_name()
-                                    .map(|s| s.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| rec.path.display().to_string());
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .button(truncate_str(&name, 46))
-                                        .on_hover_text(rec.path.display().to_string())
-                                        .clicked()
-                                    {
-                                        open_target = Some(rec.path.clone());
-                                    }
-                                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                        if ui.button("×").clicked() {
-                                            del_target = Some(rec.id.clone());
-                                        }
-                                    });
-                                });
+            let avail_w = ui.available_width();
+            let col_w = (avail_w - 48.0).clamp(320.0, 680.0);
+            let side_pad = ((avail_w - col_w) * 0.5).max(16.0);
+            ui.add_space(28.0);
+            ui.horizontal(|ui| {
+                ui.add_space(side_pad);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(col_w, 0.0),
+                    egui::Layout::top_down(Align::LEFT),
+                    |ui| {
+                        ui.set_width(col_w);
+                        ui.vertical_centered(|ui| {
+                            if let Some(logo) = &self.logo_texture {
+                                ui.add(egui::Image::new((logo.id(), Vec2::splat(56.0))));
+                                ui.add_space(10.0);
                             }
-                            if let Some(id) = del_target {
-                                let _ = storage::delete_recent_entry(&self.data, &mut self.recent, &id);
-                            }
-                            if let Some(path) = open_target {
-                                self.open_path(&path);
+                            ui.label(
+                                RichText::new("HayakuReader")
+                                    .size(32.0)
+                                    .strong()
+                                    .color(p.ink),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "v{} · 纯 Rust 原生本地阅读器",
+                                    platform::VERSION
+                                ))
+                                .size(13.5)
+                                .color(p.muted),
+                            );
+                        });
+                        ui.add_space(16.0);
+
+                        if draw_welcome_intro_markdown(ui, INTRO_ZH_MD, p) {
+                            open_repo = true;
+                        }
+
+                        ui.add_space(18.0);
+                        ui.vertical_centered(|ui| {
+                            if ui
+                                .add_sized(
+                                    [156.0, 38.0],
+                                    egui::Button::new(
+                                        RichText::new("打开文件")
+                                            .size(15.0)
+                                            .strong()
+                                            .color(p.accent_ink),
+                                    )
+                                    .fill(p.accent),
+                                )
+                                .clicked()
+                            {
+                                open_files = true;
                             }
                         });
-                }
+
+                        if !self.recent.is_empty() {
+                            ui.add_space(22.0);
+                            Frame::new()
+                                .fill(p.surface)
+                                .stroke(Stroke::new(1.0, p.line))
+                                .corner_radius(CornerRadius::same(10))
+                                .inner_margin(Margin::same(14))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("最近阅读").size(15.0).strong());
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if ui.button("清空记录").clicked() {
+                                                    clear_recent = true;
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.separator();
+                                    for rec in self.recent.iter().take(12) {
+                                        let name = rec
+                                            .path
+                                            .file_name()
+                                            .map(|s| s.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| rec.path.display().to_string());
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .button(truncate_str(&name, 52))
+                                                .on_hover_text(rec.path.display().to_string())
+                                                .clicked()
+                                            {
+                                                open_target = Some(rec.path.clone());
+                                            }
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    if ui.button("×").clicked() {
+                                                        del_target = Some(rec.id.clone());
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    }
+                                });
+                        }
+                        ui.add_space(36.0);
+                    },
+                );
             });
         });
+        if open_repo && let Err(e) = platform::shell_open(platform::REPO) {
+            self.set_status(e, Some(4));
+        }
+        if open_files {
+            self.pick_and_open_files();
+        }
+        if clear_recent {
+            let _ = storage::clear_recent_entries(&self.data, &mut self.recent);
+        }
+        if let Some(id) = del_target {
+            let _ = storage::delete_recent_entry(&self.data, &mut self.recent, &id);
+        }
+        if let Some(path) = open_target {
+            self.open_path(&path);
+        }
     }
 
     fn draw_fixed_viewer(&mut self, ui: &mut Ui) {
@@ -1883,13 +2846,28 @@ impl HayakuApp {
         let mut clicked_external: Option<String> = None;
         let mut clicked_page: Option<usize> = None;
         let mut requested_menu: Option<ImageContextMenu> = None;
+        let mut clicked_annotation_id: Option<String> = None;
+        let mut sel_bounds: Option<Rect> = None;
+
+        let dark = self.theme_mode() == ThemeMode::Dark;
+        let page_annotations: Vec<Annotation> = self
+            .active_book
+            .as_ref()
+            .map(|b| b.state.annotations.clone())
+            .unwrap_or_default();
 
         let modal_open = self.is_modal_open();
+        let has_ctx_menu = self.context_menu.is_some();
         let pointer_pos = (!modal_open)
             .then(|| ui.ctx().pointer_latest_pos())
             .flatten();
-        let primary_pressed = !modal_open && ui.ctx().input(|i| i.pointer.primary_pressed());
-        let primary_down = !modal_open && ui.ctx().input(|i| i.pointer.primary_down());
+        let primary_pressed =
+            !modal_open && !has_ctx_menu && ui.ctx().input(|i| i.pointer.primary_pressed());
+        let primary_down =
+            !modal_open && !has_ctx_menu && ui.ctx().input(|i| i.pointer.primary_down());
+        let primary_released =
+            !modal_open && !has_ctx_menu && ui.ctx().input(|i| i.pointer.primary_released());
+        let was_dragging = self.fixed_sel_dragging;
         if !primary_down {
             self.fixed_sel_dragging = false;
         }
@@ -2048,6 +3026,32 @@ impl HayakuApp {
                         Color32::WHITE,
                     );
 
+                    // Paint saved highlights & notes on this page
+                    let page_hl_rects = paint_fixed_page_annotations(
+                        ui,
+                        idx,
+                        page_rect,
+                        factor,
+                        &cached.pdf_runs,
+                        &cached.word_runs,
+                        &page_annotations,
+                        dark,
+                    );
+                    if primary_released
+                        && (!was_dragging || self.fixed_sel_anchor == self.fixed_sel_head)
+                        && let Some(pos) = view_pointer_pos
+                        && let Some((ann_id, _)) =
+                            page_hl_rects.iter().find(|(_, r)| r.contains(pos))
+                    {
+                        clicked_annotation_id = Some(ann_id.clone());
+                    }
+                    if view_pointer_pos.is_some_and(|pos| {
+                        page_hl_rects.iter().any(|(_, r)| r.contains(pos))
+                    }) && !self.fixed_sel_dragging
+                    {
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
+
                     // Paint selected text runs
                     if self.fixed_all_selected {
                         for run in &cached.pdf_runs {
@@ -2123,6 +3127,13 @@ impl HayakuApp {
                                         Pos2::new(rr.left() + rr.width() * f1, rr.bottom()),
                                     );
                                     ui.painter().rect_filled(sub, 1.0, p.selection);
+                                    let vis_sub = sub.intersect(clip);
+                                    if vis_sub.is_positive() {
+                                        sel_bounds = Some(match sel_bounds {
+                                            Some(acc) => acc.union(vis_sub),
+                                            None => vis_sub,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -2336,7 +3347,17 @@ impl HayakuApp {
         self.last_scroll_y = scroll_out.state.clamped_offset().y;
         self.last_viewport_h = scroll_out.inner_rect.height();
         self.last_content_h = scroll_out.content_size.y;
+        self.last_selection_rect = sel_bounds;
 
+        if let Some(ann_id) = clicked_annotation_id
+            && let Some(ann) = self
+                .active_book
+                .as_ref()
+                .and_then(|b| b.state.annotations.iter().find(|a| a.id == ann_id))
+                .cloned()
+        {
+            self.open_annotation_editor_for(&ann);
+        }
         if let Some(url) = clicked_external {
             self.handle_link_click(&LinkTarget::External(url));
         }
@@ -2548,15 +3569,32 @@ impl HayakuApp {
 
         let mut clicked_link: Option<LinkTarget> = None;
         let mut requested_menu: Option<ImageContextMenu> = None;
+        let mut clicked_annotation_id: Option<String> = None;
+        let mut sel_bounds: Option<Rect> = None;
+
+        let dark = mode == ThemeMode::Dark;
+        let flow_annotations: Vec<Annotation> = self
+            .active_book
+            .as_ref()
+            .map(|b| b.state.annotations.clone())
+            .unwrap_or_default();
 
         let modal_open = self.is_modal_open();
+        let has_ctx_menu = self.context_menu.is_some();
         let pointer_pos = if modal_open {
             None
         } else {
             ui.ctx().pointer_latest_pos()
         };
-        let primary_pressed = !modal_open && ui.ctx().input(|i| i.pointer.primary_pressed());
-        let primary_down = !modal_open && ui.ctx().input(|i| i.pointer.primary_down());
+        let primary_pressed =
+            !modal_open && !has_ctx_menu && ui.ctx().input(|i| i.pointer.primary_pressed());
+        let primary_down =
+            !modal_open && !has_ctx_menu && ui.ctx().input(|i| i.pointer.primary_down());
+        let primary_released =
+            !modal_open && !has_ctx_menu && ui.ctx().input(|i| i.pointer.primary_released());
+        let secondary_clicked =
+            !modal_open && ui.ctx().input(|i| i.pointer.secondary_clicked());
+        let was_dragging = self.flow_sel_dragging;
         if !primary_down {
             self.flow_sel_dragging = false;
         }
@@ -2745,8 +3783,59 @@ impl HayakuApp {
                                     Stroke::new(3.0, p.accent),
                                 );
                             }
+                            // Paint saved annotations on this flow item
+                            let item_plain = &cache.items[idx].plain;
+                            let item_ch = cache.items[idx].chapter_idx;
+                            if !item_plain.is_empty() && !flow_annotations.is_empty() {
+                                for ann in &flow_annotations {
+                                    for part in &ann.parts {
+                                        if part.index == item_ch
+                                            && let Some((hc0, hc1)) =
+                                                locate_anchor_in_text(item_plain, part)
+                                        {
+                                            let hl_col = highlight_fill_color(&ann.color, dark);
+                                            let rects = paint_galley_selection_rects(
+                                                ui,
+                                                &galley,
+                                                content_pos,
+                                                hc0,
+                                                hc1,
+                                                hl_col,
+                                                ann.kind == "note",
+                                                highlight_swatch_color(&ann.color),
+                                            );
+                                            if primary_released
+                                                && (!was_dragging
+                                                    || self.flow_sel_anchor == self.flow_sel_head)
+                                                && let Some(pos) = view_pointer_pos
+                                                && rects.iter().any(|r| r.contains(pos))
+                                            {
+                                                clicked_annotation_id = Some(ann.id.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if let Some((c0, c1)) = item_sel {
-                                paint_galley_selection(ui, &galley, content_pos, c0, c1, p.selection);
+                                let rects = paint_galley_selection_rects(
+                                    ui,
+                                    &galley,
+                                    content_pos,
+                                    c0,
+                                    c1,
+                                    p.selection,
+                                    false,
+                                    Color32::TRANSPARENT,
+                                );
+                                for r in rects {
+                                    let vr = r.intersect(clip);
+                                    if vr.is_positive() {
+                                        sel_bounds = Some(match sel_bounds {
+                                            Some(acc) => acc.union(vr),
+                                            None => vr,
+                                        });
+                                    }
+                                }
                             }
                             ui.painter().galley(content_pos, galley.clone(), p.ink);
 
@@ -2809,14 +3898,25 @@ impl HayakuApp {
                             let code_pos =
                                 Pos2::new(item_rect.left() + num_w, item_rect.top() + 2.0);
                             if let Some((c0, c1)) = item_sel {
-                                paint_galley_selection(
+                                let rects = paint_galley_selection_rects(
                                     ui,
                                     &code_galley,
                                     code_pos,
                                     c0,
                                     c1,
                                     p.selection,
+                                    false,
+                                    Color32::TRANSPARENT,
                                 );
+                                for r in rects {
+                                    let vr = r.intersect(clip);
+                                    if vr.is_positive() {
+                                        sel_bounds = Some(match sel_bounds {
+                                            Some(acc) => acc.union(vr),
+                                            None => vr,
+                                        });
+                                    }
+                                }
                             }
                             ui.painter().galley(code_pos, code_galley.clone(), p.ink);
                             if let Some(pos) = hit_pointer_pos
@@ -2861,16 +3961,60 @@ impl HayakuApp {
                                     let (lines, _, char_boxes, extra_gap, base_ascent, total_h) =
                                         measure_rich_lines(ui, inlines, *scale_mul, &mut ctx);
                                     updated_h = Some(total_h + *pad_top + gap);
+                                    let item_plain = &cache.items[idx].plain;
+                                    let item_ch = cache.items[idx].chapter_idx;
+                                    let rich_origin =
+                                        item_rect.min.to_vec2() + Vec2::new(0.0, *pad_top);
+                                    if !item_plain.is_empty() && !flow_annotations.is_empty() {
+                                        for ann in &flow_annotations {
+                                            for part in &ann.parts {
+                                                if part.index == item_ch
+                                                    && let Some((hc0, hc1)) =
+                                                        locate_anchor_in_text(item_plain, part)
+                                                {
+                                                    let hl_col =
+                                                        highlight_fill_color(&ann.color, dark);
+                                                    let ul_col = highlight_swatch_color(&ann.color);
+                                                    for r in &char_boxes
+                                                        [hc0..hc1.min(char_boxes.len())]
+                                                    {
+                                                        let sr = r.translate(rich_origin);
+                                                        ui.painter().rect_filled(sr, 1.0, hl_col);
+                                                        if ann.kind == "note" {
+                                                            ui.painter().line_segment(
+                                                                [
+                                                                    Pos2::new(sr.left(), sr.bottom()),
+                                                                    Pos2::new(sr.right(), sr.bottom()),
+                                                                ],
+                                                                Stroke::new(2.0, ul_col),
+                                                            );
+                                                        }
+                                                        if primary_released
+                                                            && (!was_dragging
+                                                                || self.flow_sel_anchor
+                                                                    == self.flow_sel_head)
+                                                            && let Some(pos) = view_pointer_pos
+                                                            && sr.contains(pos)
+                                                        {
+                                                            clicked_annotation_id =
+                                                                Some(ann.id.clone());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     if let Some((c0, c1)) = item_sel {
                                         for r in &char_boxes[c0..c1.min(char_boxes.len())] {
-                                            ui.painter().rect_filled(
-                                                r.translate(
-                                                    item_rect.min.to_vec2()
-                                                        + Vec2::new(0.0, *pad_top),
-                                                ),
-                                                1.0,
-                                                p.selection,
-                                            );
+                                            let sr = r.translate(rich_origin);
+                                            ui.painter().rect_filled(sr, 1.0, p.selection);
+                                            let vr = sr.intersect(clip);
+                                            if vr.is_positive() {
+                                                sel_bounds = Some(match sel_bounds {
+                                                    Some(acc) => acc.union(vr),
+                                                    None => vr,
+                                                });
+                                            }
                                         }
                                     }
                                     let mut click_hit_boxes = Vec::new();
@@ -2953,7 +4097,37 @@ impl HayakuApp {
                                     ui.scope_builder(UiBuilder::new().max_rect(unclipped), |ui| {
                                         draw_flow_block_fallback(ui, block, &mut ctx);
                                     });
-                                let real_h = (scoped.response.rect.height() + gap).max(20.0);
+                                let block_rect = scoped.response.rect;
+                                if let Some((c0, c1)) = item_sel
+                                    && c1 > c0
+                                {
+                                    ui.painter().rect_filled(block_rect, 3.0, p.selection);
+                                    let vr = block_rect.intersect(clip);
+                                    if vr.is_positive() {
+                                        sel_bounds = Some(match sel_bounds {
+                                            Some(acc) => acc.union(vr),
+                                            None => vr,
+                                        });
+                                    }
+                                }
+                                if let Some(pos) = hit_pointer_pos
+                                    && block_rect.contains(pos)
+                                    && !cache.items[idx].plain.is_empty()
+                                {
+                                    if view_pointer_pos.is_some() {
+                                        hover_text_cursor = true;
+                                    }
+                                    let total_c = cache.items[idx].plain.chars().count();
+                                    let fx = ((pos.x - block_rect.left())
+                                        / block_rect.width().max(1.0))
+                                    .clamp(0.0, 1.0);
+                                    let ci = ((fx * total_c as f32).round() as usize).min(total_c);
+                                    new_hit_pos = Some(FlowTextPos {
+                                        item_idx: idx,
+                                        char_idx: ci,
+                                    });
+                                }
+                                let real_h = (block_rect.height() + gap).max(20.0);
                                 updated_h = Some(real_h);
                             }
                         }
@@ -2971,7 +4145,7 @@ impl HayakuApp {
                 if hover_text_cursor {
                     ui.ctx().set_cursor_icon(CursorIcon::Text);
                 }
-                if primary_pressed && view_pointer_pos.is_some() && canvas_resp.hovered() {
+                if primary_pressed && view_pointer_pos.is_some() {
                     if let Some(pos) = new_hit_pos {
                         self.flow_sel_anchor = Some(pos);
                         self.flow_sel_head = Some(pos);
@@ -2983,7 +4157,7 @@ impl HayakuApp {
                 } else if self.flow_sel_dragging && primary_down && let Some(pos) = new_hit_pos {
                     self.flow_sel_head = Some(pos);
                 }
-                if canvas_resp.secondary_clicked()
+                if (canvas_resp.secondary_clicked() || secondary_clicked)
                     && let Some(pointer) = view_pointer_pos
                 {
                     let sel = self.selected_flow_text();
@@ -3074,7 +4248,17 @@ impl HayakuApp {
         self.last_scroll_y = scroll_out.state.clamped_offset().y;
         self.last_viewport_h = scroll_out.inner_rect.height();
         self.last_content_h = scroll_out.content_size.y;
+        self.last_selection_rect = sel_bounds;
 
+        if let Some(ann_id) = clicked_annotation_id
+            && let Some(ann) = self
+                .active_book
+                .as_ref()
+                .and_then(|b| b.state.annotations.iter().find(|a| a.id == ann_id))
+                .cloned()
+        {
+            self.open_annotation_editor_for(&ann);
+        }
         if let Some(target) = clicked_link {
             self.handle_link_click(&target);
         }
@@ -3116,6 +4300,8 @@ impl HayakuApp {
             let mut copy_bytes: Option<Vec<u8>> = None;
             let mut save_req: Option<(Vec<u8>, String)> = None;
             let mut copy_text: Option<String> = None;
+            let mut add_hl_color: Option<&'static str> = None;
+            let mut open_note = false;
             egui::Area::new(Id::unique("image_context_menu"))
                 .fixed_pos(menu.pos)
                 .order(egui::Order::Foreground)
@@ -3126,12 +4312,20 @@ impl HayakuApp {
                         .corner_radius(CornerRadius::same(8))
                         .inner_margin(Margin::same(6))
                         .show(ui, |ui| {
-                            ui.set_min_width(150.0);
-                            if let Some(sel) = &menu.selected_text
-                                && ui.button("复制选中文字").clicked()
-                            {
-                                copy_text = Some(sel.clone());
-                                keep = false;
+                            ui.set_min_width(156.0);
+                            if let Some(sel) = &menu.selected_text {
+                                if ui.button("复制选中文字").clicked() {
+                                    copy_text = Some(sel.clone());
+                                    keep = false;
+                                }
+                                if ui.button("高亮选中文字").clicked() {
+                                    add_hl_color = Some("yellow");
+                                    keep = false;
+                                }
+                                if ui.button("为选中文字添加笔记…").clicked() {
+                                    open_note = true;
+                                    keep = false;
+                                }
                             }
                             if let Some(bytes) = &menu.png_bytes {
                                 if ui.button(&menu.label).clicked() {
@@ -3154,13 +4348,24 @@ impl HayakuApp {
                             }
                         })
                         .response;
-                    if ctx.input(|i| i.pointer.primary_pressed()) && !frame_resp.hovered() {
+                    let clicked_outside = ctx.input(|i| {
+                        i.pointer.primary_pressed()
+                            && i.pointer
+                                .latest_pos()
+                                .is_none_or(|pos| !frame_resp.rect.contains(pos))
+                    });
+                    if clicked_outside {
                         keep = false;
                     }
                 });
             if let Some(txt) = copy_text {
-                ctx.copy_text(txt);
-                self.set_status("已复制文字到剪贴板。", Some(2));
+                self.copy_text_reliable(ctx, txt, "已复制文字到剪贴板。");
+            }
+            if let Some(col) = add_hl_color {
+                self.add_highlight_from_selection(col);
+            }
+            if open_note {
+                self.open_note_editor_from_selection();
             }
             if let Some(bytes) = copy_bytes {
                 match platform::set_clipboard_png(&bytes) {
@@ -3181,6 +4386,96 @@ impl HayakuApp {
             }
             if keep {
                 self.context_menu = Some(menu);
+            }
+        }
+
+        // Floating selection toolbar (Copy, 4-color highlights, Note)
+        if !self.is_modal_open()
+            && self.context_menu.is_none()
+            && !self.flow_sel_dragging
+            && !self.fixed_sel_dragging
+            && let Some(sel_rect) = self.last_selection_rect
+        {
+            let sel_text = if self
+                .active_book
+                .as_ref()
+                .is_some_and(|b| matches!(b.source, LoadedSource::Flow(_)))
+            {
+                self.selected_flow_text()
+            } else {
+                self.selected_fixed_text()
+            };
+            if !sel_text.trim().is_empty() {
+                let screen = ctx.content_rect();
+                let bar_w = 248.0;
+                let bar_h = 36.0;
+                let x = (sel_rect.center().x - bar_w * 0.5)
+                    .clamp(screen.left() + 8.0, (screen.right() - bar_w - 8.0).max(8.0));
+                let y = if sel_rect.top() - bar_h - 8.0 >= screen.top() + 54.0 {
+                    sel_rect.top() - bar_h - 8.0
+                } else {
+                    (sel_rect.bottom() + 8.0).min(screen.bottom() - bar_h - 46.0)
+                };
+                let mut do_copy = false;
+                let mut hl_color: Option<&'static str> = None;
+                let mut do_note = false;
+                egui::Area::new(Id::unique("selection_toolbar_area"))
+                    .fixed_pos(Pos2::new(x, y))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        Frame::new()
+                            .fill(p.surface)
+                            .stroke(Stroke::new(1.0, p.line))
+                            .corner_radius(CornerRadius::same(9))
+                            .inner_margin(Margin::symmetric(6, 4))
+                            .shadow(egui::Shadow {
+                                offset: [0, 4],
+                                blur: 12,
+                                spread: 0,
+                                color: Color32::from_black_alpha(48),
+                            })
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 5.0;
+                                    if ui.button("复制").clicked() {
+                                        do_copy = true;
+                                    }
+                                    for (name, tip) in [
+                                        ("yellow", "黄色高亮"),
+                                        ("green", "绿色高亮"),
+                                        ("blue", "蓝色高亮"),
+                                        ("pink", "粉色高亮"),
+                                    ] {
+                                        let (r, resp) = ui
+                                            .allocate_exact_size(Vec2::splat(22.0), Sense::click());
+                                        let resp = resp.on_hover_text(tip);
+                                        let fill = highlight_swatch_color(name);
+                                        ui.painter().circle_filled(r.center(), 9.0, fill);
+                                        ui.painter().circle_stroke(
+                                            r.center(),
+                                            9.0,
+                                            Stroke::new(
+                                                if resp.hovered() { 1.8 } else { 1.0 },
+                                                if resp.hovered() { p.accent } else { Color32::from_black_alpha(55) },
+                                            ),
+                                        );
+                                        if resp.clicked() {
+                                            hl_color = Some(name);
+                                        }
+                                    }
+                                    if ui.button("笔记").clicked() {
+                                        do_note = true;
+                                    }
+                                });
+                            });
+                    });
+                if do_copy {
+                    self.copy_text_reliable(ctx, sel_text, "已复制选中文字。");
+                } else if let Some(col) = hl_color {
+                    self.add_highlight_from_selection(col);
+                } else if do_note {
+                    self.open_note_editor_from_selection();
+                }
             }
         }
 
@@ -3216,8 +4511,7 @@ impl HayakuApp {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button("复制链接").clicked() {
-                            ctx.copy_text(modal.target.clone());
-                            self.set_status("已复制链接。", Some(2));
+                            self.copy_text_reliable(ctx, modal.target.clone(), "已复制链接。");
                         }
                         if ui.button("取消").clicked() {
                             keep = false;
@@ -3244,27 +4538,249 @@ impl HayakuApp {
             }
         }
 
-        if self.smart_invert_hint_open {
-            egui::Modal::new(Id::unique("smart_invert_hint_modal"))
+        if let Some(mut editor) = self.annotation_editor.take() {
+            let mut keep = true;
+            let mut do_save = false;
+            let mut do_delete = false;
+            egui::Modal::new(Id::unique("annotation_editor_modal"))
                 .frame(modal_frame)
                 .show(ctx, |ui| {
-                    ui.set_max_width(380.0);
-                    ui.heading("智能反色提示");
+                    ui.set_max_width(440.0);
+                    let heading = match (editor.existing_id.is_some(), editor.kind.as_str()) {
+                        (true, "bookmark") => "编辑书签",
+                        (true, "highlight") => "编辑高亮",
+                        (true, _) => "编辑笔记",
+                        (false, _) => "添加笔记",
+                    };
+                    ui.heading(heading);
                     ui.separator();
-                    ui.label("已自动启用智能反色以适配深色阅读（保留鲜亮色彩与插图，扫描 PDF 整页反色）。如需查看文档原始色彩，可随时点击下方状态栏的「已启用智能反色」切换关闭。");
-                    ui.add_space(8.0);
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("我知道了").color(p.accent_ink))
-                                .fill(p.accent),
-                        )
-                        .clicked()
-                    {
-                        self.settings.smart_invert_hint_seen = true;
-                        self.smart_invert_hint_open = false;
-                        self.save_settings();
+                    let quote_text: String = editor
+                        .parts
+                        .iter()
+                        .map(|pt| pt.quote.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !quote_text.is_empty() {
+                        Frame::new()
+                            .fill(p.side)
+                            .stroke(Stroke::new(1.0, p.line))
+                            .corner_radius(CornerRadius::same(6))
+                            .inner_margin(Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(
+                                    RichText::new(truncate_str(&quote_text, 240)).color(p.muted),
+                                );
+                            });
+                        ui.add_space(8.0);
                     }
+                    if editor.kind != "bookmark" {
+                        ui.horizontal(|ui| {
+                            ui.label("高亮颜色：");
+                            for (key, label) in [
+                                ("yellow", "黄"),
+                                ("green", "绿"),
+                                ("blue", "蓝"),
+                                ("pink", "粉"),
+                            ] {
+                                let selected = editor.color == key;
+                                let (r, resp) =
+                                    ui.allocate_exact_size(Vec2::new(42.0, 24.0), Sense::click());
+                                let fill = highlight_swatch_color(key);
+                                ui.painter().rect_filled(
+                                    r,
+                                    6.0,
+                                    Color32::from_rgba_unmultiplied(
+                                        fill.r(),
+                                        fill.g(),
+                                        fill.b(),
+                                        if selected { 170 } else { 75 },
+                                    ),
+                                );
+                                ui.painter().rect_stroke(
+                                    r,
+                                    6.0,
+                                    Stroke::new(
+                                        if selected { 1.8 } else { 1.0 },
+                                        if selected { p.accent } else { p.line },
+                                    ),
+                                    StrokeKind::Inside,
+                                );
+                                ui.painter().text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    label,
+                                    FontId::proportional(13.0),
+                                    p.ink,
+                                );
+                                if resp.clicked() {
+                                    editor.color = key.to_owned();
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                    let note_label = if editor.kind == "bookmark" {
+                        "书签名称"
+                    } else {
+                        "笔记内容（留空则仅保留高亮）"
+                    };
+                    ui.label(note_label);
+                    ui.add(
+                        egui::TextEdit::multiline(&mut editor.text)
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if editor.existing_id.is_some()
+                            && ui
+                                .button(RichText::new("删除").color(Color32::from_rgb(0xb5, 0x47, 0x35)))
+                                .clicked()
+                        {
+                            do_delete = true;
+                            keep = false;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("保存").color(p.accent_ink))
+                                        .fill(p.accent),
+                                )
+                                .clicked()
+                            {
+                                do_save = true;
+                                keep = false;
+                            }
+                            if ui.button("取消").clicked() {
+                                keep = false;
+                            }
+                        });
+                    });
                 });
+            if do_delete
+                && let Some(eid) = &editor.existing_id
+                && let Some(book) = self.active_book.as_mut()
+            {
+                book.state.annotations.retain(|a| a.id != *eid);
+                self.save_active_book();
+                self.sync_auto_sidebar(false);
+                self.set_status("已删除批注。", Some(2));
+            } else if do_save
+                && let Some(book) = self.active_book.as_mut()
+            {
+                let trimmed = editor.text.trim().to_owned();
+                let final_kind = if editor.kind == "bookmark" {
+                    "bookmark".to_owned()
+                } else if trimmed.is_empty() && !editor.parts.is_empty() {
+                    "highlight".to_owned()
+                } else {
+                    "note".to_owned()
+                };
+                if final_kind == "note" && trimmed.is_empty() && editor.parts.is_empty() {
+                    self.set_status("笔记内容不能为空。", Some(2));
+                } else {
+                    if let Some(eid) = &editor.existing_id {
+                        if let Some(existing) =
+                            book.state.annotations.iter_mut().find(|a| a.id == *eid)
+                        {
+                            existing.kind = final_kind;
+                            existing.color = editor.color.clone();
+                            existing.text = if trimmed.is_empty() {
+                                existing
+                                    .parts
+                                    .first()
+                                    .map(|pt| truncate_str(pt.quote.trim(), 60))
+                                    .unwrap_or_default()
+                            } else {
+                                trimmed
+                            };
+                        }
+                    } else {
+                        let digest = book.digest.clone();
+                        book.state.annotations.push(Annotation {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            kind: final_kind,
+                            color: editor.color.clone(),
+                            text: trimmed,
+                            parts: editor.parts.clone(),
+                            position: editor.position.clone(),
+                            digest,
+                            missing: false,
+                        });
+                    }
+                    self.sidebar_open = true;
+                    self.sidebar_tab = SidebarTab::Notes;
+                    self.save_active_book();
+                    self.clear_selection();
+                    self.set_status("批注已保存。", Some(2));
+                }
+            }
+            if keep {
+                self.annotation_editor = Some(editor);
+            }
+        }
+
+        if self.smart_invert_hint_open {
+            if !self.active_book_uses_smart_invert() || !self.is_smart_invert() {
+                self.smart_invert_hint_open = false;
+            } else if let Some(anchor) = self.smart_invert_btn_rect {
+                let dismissed = draw_callout_bubble(
+                    ctx,
+                    "smart_invert_hint_bubble",
+                    anchor,
+                    true,
+                    "智能反色已开启",
+                    "深色模式下已为 PDF / Word 自动启用智能反色（保留鲜亮色彩与插图，扫描 PDF 整页反色）。点击下方状态栏的「已启用智能反色」按钮可随时切换关闭。",
+                    p,
+                );
+                if dismissed {
+                    self.settings.smart_invert_hint_seen = true;
+                    self.smart_invert_hint_open = false;
+                    self.save_settings();
+                }
+            } else {
+                ctx.request_repaint();
+            }
+        }
+
+        if self.tab_sleep_hint_open
+            && !self.smart_invert_hint_open
+            && !self.show_install_dialog
+            && !self.show_update_dialog
+            && self.link_warning.is_none()
+            && self.annotation_editor.is_none()
+        {
+            let target_rect = self
+                .tab_sleep_hint_tab_id
+                .as_ref()
+                .and_then(|id| self.tab_screen_rects.get(id).copied())
+                .or_else(|| {
+                    self.tabs
+                        .iter()
+                        .find(|t| self.is_tab_sleeping(&t.id))
+                        .and_then(|t| self.tab_screen_rects.get(&t.id).copied())
+                })
+                .unwrap_or_else(|| {
+                    let s = ctx.content_rect();
+                    Rect::from_center_size(Pos2::new(s.center().x, s.top() + 64.0), Vec2::new(120.0, 24.0))
+                });
+            let dismissed = draw_callout_bubble(
+                ctx,
+                "tab_sleep_hint_bubble",
+                target_rect,
+                false,
+                "标签页已进入节能休眠",
+                "后台标签页闲置 5 分钟或超出最近 5 个时会自动进入节能休眠以释放内存（文字变灰并显示绿色节能图标）。点击该标签即可随时恢复阅读进度。",
+                p,
+            );
+            if dismissed {
+                self.settings.tab_sleep_hint_seen = true;
+                self.tab_sleep_hint_open = false;
+                self.tab_sleep_hint_tab_id = None;
+                self.save_settings();
+            }
         }
 
         if self.show_settings {
@@ -3330,9 +4846,11 @@ impl HayakuApp {
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("恢复默认").clicked() {
-                            let seen = self.settings.smart_invert_hint_seen;
+                            let seen_si = self.settings.smart_invert_hint_seen;
+                            let seen_sleep = self.settings.tab_sleep_hint_seen;
                             self.settings = Settings {
-                                smart_invert_hint_seen: seen,
+                                smart_invert_hint_seen: seen_si,
+                                tab_sleep_hint_seen: seen_sleep,
                                 ..Settings::default()
                             };
                             changed = true;
@@ -3503,6 +5021,7 @@ impl HayakuApp {
                 }
             } else if close {
                 self.show_install_dialog = false;
+                self.maybe_trigger_smart_invert_hint();
             }
         }
 
@@ -3578,6 +5097,128 @@ impl HayakuApp {
                 });
             if close {
                 self.show_update_dialog = false;
+                self.maybe_trigger_smart_invert_hint();
+            }
+        }
+    }
+
+    fn draw_splash(&mut self, ui: &mut Ui, subtitle: Option<&str>) -> bool {
+        let p = self.palette();
+        let mut skipped = false;
+        CentralPanel::default()
+            .frame(Frame::new().fill(p.paper))
+            .show(ui, |ui| {
+                let full_rect = ui.max_rect();
+                let resp = ui.interact(full_rect, Id::unique("splash_bg"), Sense::click());
+                if resp.clicked() || ui.ctx().input(|i| i.key_pressed(Key::Escape)) {
+                    skipped = true;
+                }
+                ui.scope_builder(UiBuilder::new().max_rect(full_rect), |ui| {
+                    ui.vertical_centered(|ui| {
+                        let content_h = 190.0;
+                        let top_pad = ((full_rect.height() - content_h) * 0.5).max(24.0);
+                        ui.add_space(top_pad);
+                        if let Some(logo) = &self.logo_texture {
+                            ui.add(egui::Image::new((logo.id(), Vec2::splat(80.0))));
+                            ui.add_space(14.0);
+                        }
+                        ui.label(
+                            RichText::new("HayakuReader")
+                                .size(36.0)
+                                .strong()
+                                .color(p.ink),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("drliuhuan").size(15.0).color(p.muted));
+                        ui.add_space(3.0);
+                        ui.label(
+                            RichText::new("github.com/drliuhuan/HayakuReader")
+                                .size(14.0)
+                                .color(p.muted),
+                        );
+                        if let Some(sub) = subtitle {
+                            ui.add_space(14.0);
+                            ui.label(RichText::new(sub).size(13.5).color(p.accent));
+                        }
+                    });
+                });
+            });
+        skipped
+    }
+
+    fn step_splash(&mut self, ui: &mut Ui) -> bool {
+        let ctx = ui.ctx().clone();
+        match std::mem::replace(&mut self.splash, SplashState::Done) {
+            SplashState::Done => false,
+            SplashState::LoadingFile {
+                primary,
+                extra_sleeping,
+                frames_rendered,
+            } => {
+                if frames_rendered == 0 {
+                    let fname = primary
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "文档".to_owned());
+                    let msg = format!("正在打开 {fname}…");
+                    self.draw_splash(ui, Some(&msg));
+                    self.splash = SplashState::LoadingFile {
+                        primary,
+                        extra_sleeping,
+                        frames_rendered: 1,
+                    };
+                    ctx.request_repaint();
+                    true
+                } else {
+                    for extra in extra_sleeping {
+                        self.register_sleeping_path(&extra);
+                    }
+                    self.open_path(&primary);
+                    self.splash = SplashState::Done;
+                    self.on_splash_finished();
+                    ctx.request_repaint();
+                    false
+                }
+            }
+            SplashState::Timed {
+                started_at,
+                duration,
+                frames_rendered,
+                mut restored,
+            } => {
+                if frames_rendered >= 1 && !restored {
+                    self.restore_active_session_tab_only();
+                    restored = true;
+                }
+                let elapsed = started_at.elapsed();
+                if elapsed >= duration {
+                    if !restored {
+                        self.restore_active_session_tab_only();
+                    }
+                    self.splash = SplashState::Done;
+                    self.on_splash_finished();
+                    false
+                } else {
+                    let skipped = self.draw_splash(ui, None);
+                    if skipped {
+                        if !restored {
+                            self.restore_active_session_tab_only();
+                        }
+                        self.splash = SplashState::Done;
+                        self.on_splash_finished();
+                        false
+                    } else {
+                        self.splash = SplashState::Timed {
+                            started_at,
+                            duration,
+                            frames_rendered: frames_rendered.saturating_add(1),
+                            restored,
+                        };
+                        let remaining = duration.saturating_sub(elapsed);
+                        ctx.request_repaint_after(remaining.min(Duration::from_millis(50)));
+                        true
+                    }
+                }
             }
         }
     }
@@ -3589,20 +5230,49 @@ impl eframe::App for HayakuApp {
         self.poll_background(&ctx);
         self.apply_egui_visuals(&ctx);
 
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.save_active_book();
+            self.save_workspace();
+        }
+
+        let p = self.palette();
+        if self.step_splash(ui) {
+            if !ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+                ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    Id::unique("window_outer_border"),
+                ))
+                .rect_stroke(
+                    ctx.content_rect(),
+                    0.0,
+                    Stroke::new(1.0, p.line),
+                    StrokeKind::Inside,
+                );
+            }
+            return;
+        }
+
+        // Periodically check background tabs for 5-minute idle sleep
+        if !self.background_books.is_empty() {
+            if self.last_sleep_check.elapsed() >= Duration::from_secs(1) {
+                self.last_sleep_check = Instant::now();
+                self.sleep_inactive_tabs_at(now_epoch_ms());
+            }
+            ctx.request_repaint_after(Duration::from_secs(5));
+        }
+
+        let mut dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
                 .iter()
                 .map(|f| f.path().to_path_buf())
                 .collect()
         });
-        for p in dropped {
-            self.open_path(&p);
-        }
-
-        if ctx.input(|i| i.viewport().close_requested()) {
-            self.save_active_book();
-            self.save_workspace();
+        if let Some(primary) = dropped.pop() {
+            for extra in dropped {
+                self.register_sleeping_path(&extra);
+            }
+            self.open_path(&primary);
         }
 
         self.handle_shortcuts(&ctx);
@@ -3614,12 +5284,14 @@ impl eframe::App for HayakuApp {
         self.draw_bottom_bar(ui);
         self.draw_sidebar(ui);
 
-        let p = self.palette();
         CentralPanel::default()
             .frame(Frame::new().fill(p.paper))
             .show(ui, |ui| {
                 match self.active_book.as_ref().map(|b| &b.source) {
-                    None => self.draw_welcome(ui),
+                    None => {
+                        self.last_selection_rect = None;
+                        self.draw_welcome(ui);
+                    }
                     Some(LoadedSource::Pdf(_) | LoadedSource::Word(_)) => {
                         self.draw_fixed_viewer(ui)
                     }
@@ -4857,14 +6529,18 @@ fn draw_flow_block_fallback(ui: &mut Ui, block: &Block, ctx: &mut FlowDrawCtx<'_
     }
 }
 
-fn paint_galley_selection(
+#[allow(clippy::too_many_arguments)]
+fn paint_galley_selection_rects(
     ui: &Ui,
     galley: &egui::Galley,
     pos: Pos2,
     c0: usize,
     c1: usize,
     color: Color32,
-) {
+    underline: bool,
+    underline_color: Color32,
+) -> Vec<Rect> {
+    let mut rects = Vec::new();
     let mut offset = 0usize;
     for row in &galley.rows {
         let len = row.row.glyphs.len();
@@ -4881,11 +6557,488 @@ fn paint_galley_selection(
                     Pos2::new(x1, pos.y + row.pos.y + row.rect().height()),
                 );
                 ui.painter().rect_filled(r, 1.0, color);
+                if underline {
+                    ui.painter().line_segment(
+                        [Pos2::new(r.left(), r.bottom()), Pos2::new(r.right(), r.bottom())],
+                        Stroke::new(2.0, underline_color),
+                    );
+                }
+                rects.push(r);
             }
         }
         let _ = CCursor::new(c0);
         offset = row_end;
     }
+    rects
+}
+
+fn highlight_swatch_color(name: &str) -> Color32 {
+    match name {
+        "green" => Color32::from_rgb(0x72, 0xc6, 0x81),
+        "blue" => Color32::from_rgb(0x72, 0xb7, 0xea),
+        "pink" => Color32::from_rgb(0xe9, 0x8d, 0xc2),
+        _ => Color32::from_rgb(0xef, 0xc6, 0x43),
+    }
+}
+
+fn highlight_fill_color(name: &str, dark: bool) -> Color32 {
+    let base = highlight_swatch_color(name);
+    let alpha = if dark { 92 } else { 112 };
+    Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha)
+}
+
+fn chapter_plain_from_cache(cache: &FlowLayoutCache, chapter: usize) -> String {
+    let start = cache.chapter_first_item.get(chapter).copied().unwrap_or(0);
+    let end = cache
+        .chapter_first_item
+        .get(chapter + 1)
+        .copied()
+        .unwrap_or(cache.items.len());
+    let mut out = String::new();
+    for item in &cache.items[start..end] {
+        if !item.plain.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&item.plain);
+        }
+    }
+    out
+}
+
+fn locate_anchor_in_text(haystack: &str, anchor: &Anchor) -> Option<(usize, usize)> {
+    let quote = anchor.quote.as_str();
+    let quote_chars = quote.chars().count();
+    if quote_chars == 0 || haystack.is_empty() {
+        return None;
+    }
+    let hay_chars: Vec<char> = haystack.chars().collect();
+    let q_chars: Vec<char> = quote.chars().collect();
+    if q_chars.len() > hay_chars.len() {
+        return None;
+    }
+    if anchor.start + q_chars.len() <= hay_chars.len()
+        && hay_chars[anchor.start..anchor.start + q_chars.len()] == q_chars[..]
+    {
+        return Some((anchor.start, anchor.start + q_chars.len()));
+    }
+    let mut best: Option<(usize, i64)> = None;
+    let before_chars: Vec<char> = anchor.before.chars().collect();
+    let after_chars: Vec<char> = anchor.after.chars().collect();
+    for pos in 0..=hay_chars.len() - q_chars.len() {
+        if hay_chars[pos..pos + q_chars.len()] == q_chars[..] {
+            let mut score = -(pos.abs_diff(anchor.start) as i64);
+            if !before_chars.is_empty() {
+                let take = before_chars.len().min(pos);
+                let matched = hay_chars[pos - take..pos]
+                    .iter()
+                    .rev()
+                    .zip(before_chars.iter().rev())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                score += (matched as i64) * 100;
+            }
+            if !after_chars.is_empty() {
+                let end_pos = pos + q_chars.len();
+                let matched = hay_chars[end_pos..]
+                    .iter()
+                    .zip(after_chars.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                score += (matched as i64) * 100;
+            }
+            if best.is_none_or(|(_, bs)| score > bs) {
+                best = Some((pos, score));
+            }
+        }
+    }
+    if let Some((pos, _)) = best {
+        return Some((pos, pos + q_chars.len()));
+    }
+    let trimmed = quote.trim();
+    if !trimmed.is_empty() && trimmed != quote {
+        let t_chars: Vec<char> = trimmed.chars().collect();
+        if t_chars.len() <= hay_chars.len() {
+            for pos in 0..=hay_chars.len() - t_chars.len() {
+                if hay_chars[pos..pos + t_chars.len()] == t_chars[..] {
+                    return Some((pos, pos + t_chars.len()));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_fixed_page_annotations(
+    ui: &Ui,
+    page_idx: usize,
+    page_rect: Rect,
+    factor: f32,
+    pdf_runs: &[PdfTextRun],
+    word_runs: &[WordTextRun],
+    annotations: &[Annotation],
+    dark: bool,
+) -> Vec<(String, Rect)> {
+    let mut hit_rects = Vec::new();
+    let has_page_ann = annotations
+        .iter()
+        .any(|ann| ann.parts.iter().any(|pt| pt.index == page_idx && !pt.quote.is_empty()));
+    if !has_page_ann {
+        return hit_rects;
+    }
+
+    let mut page_plain = String::new();
+    let mut run_spans: Vec<(usize, usize, Rect)> = Vec::new();
+    let mut offset = 0usize;
+    if !pdf_runs.is_empty() {
+        for run in pdf_runs {
+            let len = run.text.chars().count();
+            let rr = Rect::from_min_size(
+                Pos2::new(
+                    page_rect.left() + run.rect_pt[0] * factor,
+                    page_rect.top() + run.rect_pt[1] * factor,
+                ),
+                Vec2::new(run.rect_pt[2] * factor, run.rect_pt[3] * factor),
+            );
+            page_plain.push_str(&run.text);
+            run_spans.push((offset, offset + len, rr));
+            offset += len;
+        }
+    } else {
+        for run in word_runs {
+            let len = run.text.chars().count();
+            let rr = Rect::from_min_size(
+                Pos2::new(
+                    page_rect.left() + run.left * factor,
+                    page_rect.top() + run.top * factor,
+                ),
+                Vec2::new(run.width * factor, (run.size * 1.2) * factor),
+            );
+            page_plain.push_str(&run.text);
+            run_spans.push((offset, offset + len, rr));
+            offset += len;
+        }
+    }
+    if run_spans.is_empty() {
+        return hit_rects;
+    }
+
+    for ann in annotations {
+        let fill = highlight_fill_color(&ann.color, dark);
+        let underline = highlight_swatch_color(&ann.color);
+        let is_note = ann.kind == "note";
+        for part in &ann.parts {
+            if part.index != page_idx || part.quote.is_empty() {
+                continue;
+            }
+            let Some((m0, m1)) = locate_anchor_in_text(&page_plain, part) else {
+                continue;
+            };
+            for &(r0, r1, rr) in &run_spans {
+                let len = r1.saturating_sub(r0);
+                if len == 0 || m1 <= r0 || m0 >= r1 {
+                    continue;
+                }
+                let c0 = m0.saturating_sub(r0).min(len);
+                let c1 = m1.saturating_sub(r0).min(len);
+                if c1 > c0 {
+                    let f0 = c0 as f32 / len as f32;
+                    let f1 = c1 as f32 / len as f32;
+                    let sub = Rect::from_min_max(
+                        Pos2::new(rr.left() + rr.width() * f0, rr.top()),
+                        Pos2::new(rr.left() + rr.width() * f1, rr.bottom()),
+                    );
+                    ui.painter().rect_filled(sub, 1.5, fill);
+                    if is_note {
+                        ui.painter().line_segment(
+                            [Pos2::new(sub.left(), sub.bottom()), Pos2::new(sub.right(), sub.bottom())],
+                            Stroke::new(2.0, underline),
+                        );
+                    }
+                    hit_rects.push((ann.id.clone(), sub));
+                }
+            }
+        }
+    }
+    hit_rects
+}
+
+fn draw_chevron(painter: &egui::Painter, center: Pos2, left: bool, color: Color32) {
+    let dx = if left { 2.5 } else { -2.5 };
+    let tip_x = center.x - dx;
+    let tail_x = center.x + dx;
+    let dy = 4.5;
+    let stroke = Stroke::new(1.6, color);
+    painter.line_segment(
+        [Pos2::new(tail_x, center.y - dy), Pos2::new(tip_x, center.y)],
+        stroke,
+    );
+    painter.line_segment(
+        [Pos2::new(tip_x, center.y), Pos2::new(tail_x, center.y + dy)],
+        stroke,
+    );
+}
+
+fn draw_eco_leaf_icon(painter: &egui::Painter, rect: Rect, dark: bool) {
+    let leaf_color = if dark {
+        Color32::from_rgb(0x7c, 0xc2, 0x96)
+    } else {
+        Color32::from_rgb(0x3f, 0x91, 0x5c)
+    };
+    let vein_color = if dark {
+        Color32::from_rgb(0x24, 0x2e, 0x28)
+    } else {
+        Color32::from_rgb(0xef, 0xee, 0xe6)
+    };
+    let l = rect.left();
+    let t = rect.top();
+    let w = rect.width();
+    let h = rect.height();
+    let pts = vec![
+        Pos2::new(l + w * 0.20, t + h * 0.80),
+        Pos2::new(l + w * 0.22, t + h * 0.42),
+        Pos2::new(l + w * 0.48, t + h * 0.16),
+        Pos2::new(l + w * 0.86, t + h * 0.14),
+        Pos2::new(l + w * 0.82, t + h * 0.56),
+        Pos2::new(l + w * 0.54, t + h * 0.82),
+    ];
+    painter.add(egui::Shape::convex_polygon(pts, leaf_color, Stroke::NONE));
+    painter.line_segment(
+        [
+            Pos2::new(l + w * 0.14, t + h * 0.88),
+            Pos2::new(l + w * 0.70, t + h * 0.30),
+        ],
+        Stroke::new(1.15, vein_color),
+    );
+}
+
+fn draw_callout_bubble(
+    ctx: &Context,
+    id_salt: &str,
+    anchor: Rect,
+    above_anchor: bool,
+    title: &str,
+    body: &str,
+    p: Palette,
+) -> bool {
+    let screen = ctx.content_rect();
+    let bubble_w = (screen.width() - 24.0).clamp(240.0, 356.0);
+    let anchor_cx = anchor.center().x.clamp(screen.left() + 20.0, screen.right() - 20.0);
+    let bubble_x = (anchor_cx - bubble_w * 0.5)
+        .clamp(screen.left() + 12.0, (screen.right() - bubble_w - 12.0).max(12.0));
+
+    egui::Area::new(Id::unique((id_salt, "backdrop")))
+        .fixed_pos(screen.min)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            let (bg_rect, _) = ui.allocate_exact_size(screen.size(), Sense::click());
+            let painter = ui.painter();
+            painter.rect_filled(bg_rect, 0.0, Color32::from_rgba_unmultiplied(0x0f, 0x16, 0x12, 110));
+            painter.rect_stroke(
+                anchor.expand(3.0),
+                8.0,
+                Stroke::new(2.0, p.accent),
+                StrokeKind::Outside,
+            );
+        });
+
+    let bubble_id = Id::unique((id_salt, "bubble"));
+    let est_h = ctx
+        .data(|d| d.get_temp::<f32>(bubble_id))
+        .unwrap_or(142.0);
+    let arrow_h = 10.0;
+    let bubble_y = if above_anchor {
+        (anchor.top() - est_h - arrow_h - 4.0).max(screen.top() + 12.0)
+    } else {
+        (anchor.bottom() + arrow_h + 4.0).min((screen.bottom() - est_h - 12.0).max(screen.top() + 12.0))
+    };
+
+    let mut dismissed = false;
+    let area_resp = egui::Area::new(bubble_id)
+        .fixed_pos(Pos2::new(bubble_x, bubble_y))
+        .order(egui::Order::Tooltip)
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(p.surface)
+                .stroke(Stroke::new(1.5, p.accent))
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::same(14))
+                .shadow(egui::Shadow {
+                    offset: [0, 8],
+                    blur: 22,
+                    spread: 0,
+                    color: Color32::from_black_alpha(72),
+                })
+                .show(ui, |ui| {
+                    ui.set_width(bubble_w - 28.0);
+                    ui.label(RichText::new(title).size(15.0).strong().color(p.ink));
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(body).size(13.5).color(p.ink));
+                    ui.add_space(10.0);
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("我知道了").color(p.accent_ink).strong(),
+                                )
+                                .fill(p.accent),
+                            )
+                            .clicked()
+                        {
+                            dismissed = true;
+                        }
+                    });
+                });
+        });
+
+    let actual_rect = area_resp.response.rect;
+    if (actual_rect.height() - est_h).abs() > 1.0 {
+        ctx.data_mut(|d| d.insert_temp(bubble_id, actual_rect.height()));
+        ctx.request_repaint();
+    }
+
+    let arrow_x = anchor_cx.clamp(actual_rect.left() + 18.0, actual_rect.right() - 18.0);
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        Id::unique((id_salt, "arrow")),
+    ));
+    if above_anchor {
+        let base_y = actual_rect.bottom() - 1.5;
+        let tip = Pos2::new(arrow_x, actual_rect.bottom() + arrow_h - 1.0);
+        let left = Pos2::new(arrow_x - 9.0, base_y);
+        let right = Pos2::new(arrow_x + 9.0, base_y);
+        painter.add(egui::Shape::convex_polygon(
+            vec![left, right, tip],
+            p.surface,
+            Stroke::NONE,
+        ));
+        painter.line_segment([left, tip], Stroke::new(1.5, p.accent));
+        painter.line_segment([tip, right], Stroke::new(1.5, p.accent));
+    } else {
+        let base_y = actual_rect.top() + 1.5;
+        let tip = Pos2::new(arrow_x, actual_rect.top() - arrow_h + 1.0);
+        let left = Pos2::new(arrow_x - 9.0, base_y);
+        let right = Pos2::new(arrow_x + 9.0, base_y);
+        painter.add(egui::Shape::convex_polygon(
+            vec![left, right, tip],
+            p.surface,
+            Stroke::NONE,
+        ));
+        painter.line_segment([left, tip], Stroke::new(1.5, p.accent));
+        painter.line_segment([tip, right], Stroke::new(1.5, p.accent));
+    }
+    dismissed
+}
+
+fn append_welcome_inline_md(job: &mut LayoutJob, text: &str, size: f32, p: Palette) {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    let normal = egui::TextFormat {
+        font_id: FontId::proportional(size),
+        color: p.ink,
+        ..Default::default()
+    };
+    let bold = egui::TextFormat {
+        font_id: FontId::proportional(size),
+        color: p.accent,
+        ..Default::default()
+    };
+    let code = egui::TextFormat {
+        font_id: FontId::monospace((size - 1.0).max(11.5)),
+        color: p.accent,
+        background: p.code_bg,
+        ..Default::default()
+    };
+    while i < bytes.len() {
+        if text[i..].starts_with("**")
+            && let Some(end_rel) = text[i + 2..].find("**")
+        {
+            let inner = &text[i + 2..i + 2 + end_rel];
+            job.append(inner, 0.0, bold.clone());
+            i += 4 + end_rel;
+            continue;
+        }
+        if bytes[i] == b'`'
+            && let Some(end_rel) = text[i + 1..].find('`')
+        {
+            let inner = &text[i + 1..i + 1 + end_rel];
+            job.append(&format!(" {inner} "), 0.0, code.clone());
+            i += 2 + end_rel;
+            continue;
+        }
+        let next_special = text[i..]
+            .find("**")
+            .into_iter()
+            .chain(text[i..].find('`'))
+            .filter(|&off| off > 0)
+            .min()
+            .unwrap_or(text.len() - i);
+        let end = i + next_special.max(text[i..].chars().next().map_or(1, char::len_utf8));
+        job.append(&text[i..end], 0.0, normal.clone());
+        i = end;
+    }
+}
+
+fn draw_welcome_intro_markdown(ui: &mut Ui, md: &str, p: Palette) -> bool {
+    let mut open_repo = false;
+    for raw_line in md.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            ui.add_space(6.0);
+            continue;
+        }
+        if line.starts_with("# ") {
+            continue;
+        }
+        if let Some(h) = line.strip_prefix("### ") {
+            ui.add_space(6.0);
+            ui.label(RichText::new(h).size(15.5).strong().color(p.ink));
+            ui.add_space(2.0);
+            continue;
+        }
+        if let Some(item) = line.strip_prefix("- ") {
+            ui.horizontal_top(|ui| {
+                ui.add_space(6.0);
+                ui.label(RichText::new("•").size(14.5).strong().color(p.accent));
+                let mut job = LayoutJob::default();
+                append_welcome_inline_md(&mut job, item, 14.0, p);
+                ui.add(egui::Label::new(job).wrap());
+            });
+            ui.add_space(3.0);
+            continue;
+        }
+        if line.contains("github.com/drliuhuan/HayakuReader") {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("GitHub 仓库：").size(14.0).color(p.muted));
+                let link = ui.add(
+                    egui::Button::new(
+                        RichText::new("github.com/drliuhuan/HayakuReader")
+                            .size(14.0)
+                            .underline()
+                            .color(p.accent),
+                    )
+                    .frame(false),
+                );
+                if link.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                if link.clicked() {
+                    open_repo = true;
+                }
+            });
+            continue;
+        }
+        if line.starts_with('©') {
+            ui.label(RichText::new(line).size(12.5).color(p.muted));
+            continue;
+        }
+        let mut job = LayoutJob::default();
+        append_welcome_inline_md(&mut job, line, 14.5, p);
+        ui.add(egui::Label::new(job).wrap());
+        ui.add_space(4.0);
+    }
+    open_repo
 }
 
 fn hit_test_char_boxes(rel: Vec2, boxes: &[Rect]) -> usize {
@@ -5177,6 +7330,16 @@ mod tests {
             workspace: Workspace::default(),
             tabs: Vec::new(),
             active_book: None,
+            background_books: HashMap::new(),
+            last_sleep_check: Instant::now(),
+            tab_sleep_hint_open: false,
+            tab_sleep_hint_tab_id: None,
+            tab_screen_rects: HashMap::new(),
+            tabs_scroll_offset: 0.0,
+            tabs_scroll_max: 0.0,
+            scroll_active_tab_into_view: false,
+            smart_invert_btn_rect: None,
+            splash: SplashState::Done,
             sidebar_open: false,
             sidebar_pinned: false,
             sidebar_tab: SidebarTab::Contents,
@@ -5204,6 +7367,7 @@ mod tests {
             fixed_sel_head: None,
             fixed_sel_dragging: false,
             fixed_all_selected: false,
+            last_selection_rect: None,
             math_cache: MathCache::default(),
             math_textures: HashMap::new(),
             image_textures: HashMap::new(),
@@ -5211,6 +7375,7 @@ mod tests {
             status_msg: None,
             context_menu: None,
             link_warning: None,
+            annotation_editor: None,
             smart_invert_hint_open: false,
             install_status: None,
             show_install_dialog: false,
@@ -5477,5 +7642,265 @@ mod tests {
         expected.sort();
         assert_eq!(got, expected);
         assert!(drain_inbox_dir(&inbox).is_none());
+    }
+
+    fn make_dummy_flow_book(id: &str, title: &str) -> OpenBook {
+        OpenBook {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            digest: format!("digest-{id}"),
+            kind: "txt",
+            source: LoadedSource::Flow(Arc::new(FlowDocument {
+                kind: "txt",
+                chapters: vec![crate::flow::FlowChapter {
+                    path: "body".to_owned(),
+                    title: "Body".to_owned(),
+                    blocks: vec![Block::Paragraph(vec![Inline::Text(format!(
+                        "Content of {title}"
+                    ))])],
+                    anchors: HashMap::new(),
+                    raw_source: format!("Content of {title}"),
+                }],
+                outline: Vec::new(),
+                resources: HashMap::new(),
+            })),
+            state: BookState::default(),
+        }
+    }
+
+    #[test]
+    fn tab_sleep_enforces_five_recent_limit_and_five_minute_idle_and_first_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_test_app(dir.path().to_path_buf());
+        let base_ms = 1_000_000_000u64;
+
+        // 6 tabs: t0..t4 in background, t5 active; t0 is oldest (rank 5) -> must sleep
+        for i in 0..6 {
+            let id = format!("t{i}");
+            app.tabs.push(TabEntry {
+                id: id.clone(),
+                title: format!("Doc {i}"),
+                last_used: base_ms + (i as u64) * 1_000,
+            });
+            if i < 5 {
+                app.background_books
+                    .insert(id.clone(), make_dummy_flow_book(&id, &format!("Doc {i}")));
+            } else {
+                app.active_book = Some(make_dummy_flow_book(&id, &format!("Doc {i}")));
+            }
+        }
+
+        let slept = app.sleep_inactive_tabs_at(base_ms + 10_000);
+        assert_eq!(slept, vec!["t0".to_owned()]);
+        assert!(app.is_tab_sleeping("t0"));
+        assert!(!app.is_tab_sleeping("t1"));
+        assert!(!app.is_tab_sleeping("t5"));
+        assert!(app.tab_sleep_hint_open, "first sleep should open callout hint");
+        assert_eq!(app.tab_sleep_hint_tab_id.as_deref(), Some("t0"));
+
+        // Mark hint seen; advance 5 minutes -> remaining background tabs t1..t4 must sleep, active t5 stays awake
+        app.settings.tab_sleep_hint_seen = true;
+        app.tab_sleep_hint_open = false;
+        let idle_slept = app.sleep_inactive_tabs_at(base_ms + 10_000 + TAB_SLEEP_IDLE_MS);
+        assert_eq!(idle_slept.len(), 4);
+        for i in 1..5 {
+            assert!(app.is_tab_sleeping(&format!("t{i}")));
+        }
+        assert!(!app.is_tab_sleeping("t5"));
+        assert!(!app.tab_sleep_hint_open, "hint must not reopen once seen");
+    }
+
+    #[test]
+    fn restore_session_only_loads_active_tab_and_keeps_others_sleeping() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f1 = dir.path().join("one.txt");
+        let f2 = dir.path().join("two.txt");
+        let f3 = dir.path().join("three.txt");
+        fs::write(&f1, "hello one").expect("write f1");
+        fs::write(&f2, "hello two").expect("write f2");
+        fs::write(&f3, "hello three").expect("write f3");
+
+        let mut app = make_test_app(dir.path().to_path_buf());
+        app.recent = vec![
+            Recent {
+                id: "id1".to_owned(),
+                path: f1,
+                digest: String::new(),
+            },
+            Recent {
+                id: "id2".to_owned(),
+                path: f2,
+                digest: String::new(),
+            },
+            Recent {
+                id: "id3".to_owned(),
+                path: f3,
+                digest: String::new(),
+            },
+        ];
+        app.tabs = vec![
+            TabEntry {
+                id: "id1".to_owned(),
+                title: "one.txt".to_owned(),
+                last_used: 10,
+            },
+            TabEntry {
+                id: "id2".to_owned(),
+                title: "two.txt".to_owned(),
+                last_used: 20,
+            },
+            TabEntry {
+                id: "id3".to_owned(),
+                title: "three.txt".to_owned(),
+                last_used: 30,
+            },
+        ];
+        app.workspace.active = Some("id2".to_owned());
+        app.restore_active_session_tab_only();
+
+        assert_eq!(app.active_book.as_ref().map(|b| b.id.as_str()), Some("id2"));
+        assert!(app.background_books.is_empty());
+        assert!(app.is_tab_sleeping("id1"));
+        assert!(!app.is_tab_sleeping("id2"));
+        assert!(app.is_tab_sleeping("id3"));
+    }
+
+    #[test]
+    fn smart_invert_only_applies_to_pdf_and_word_not_flow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_test_app(dir.path().to_path_buf());
+        app.settings.theme = "dark".to_owned();
+        app.settings.smart_invert = true;
+        app.active_book = Some(make_dummy_flow_book("flow1", "novel.epub"));
+
+        assert!(!app.active_book_uses_smart_invert());
+        app.maybe_trigger_smart_invert_hint();
+        assert!(!app.smart_invert_hint_open);
+
+        let ctx = Context::default();
+        install_system_fonts(&ctx);
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 720.0))),
+            time: Some(0.0),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(raw, |ui| {
+            app.draw_bottom_bar(ui);
+        });
+        out.drop_without_applying_deltas();
+        assert!(
+            app.smart_invert_btn_rect.is_none(),
+            "Flow document must not display the smart-invert toggle button"
+        );
+    }
+
+    #[test]
+    fn tabs_bar_auto_scrolls_to_reveal_offscreen_active_tab() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_test_app(dir.path().to_path_buf());
+        for i in 0..14 {
+            app.tabs.push(TabEntry {
+                id: format!("tab-{i}"),
+                title: format!("LongDocumentTitle-{i}.epub"),
+                last_used: i as u64,
+            });
+        }
+        app.active_book = Some(make_dummy_flow_book("tab-13", "LongDocumentTitle-13.epub"));
+        app.tabs_scroll_offset = 0.0;
+        app.scroll_active_tab_into_view = true;
+
+        let ctx = Context::default();
+        install_system_fonts(&ctx);
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 480.0));
+        for t in [0.0_f64, 0.1_f64] {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(t),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                app.draw_tabs_bar(ui);
+                CentralPanel::default().show(ui, |_ui| {});
+            });
+            out.drop_without_applying_deltas();
+        }
+        assert!(
+            app.tabs_scroll_max > 100.0,
+            "14 tabs in a 640px window should overflow horizontally"
+        );
+        assert!(
+            app.tabs_scroll_offset > 0.0,
+            "switching to offscreen rightmost tab should auto-scroll tabs_scroll_offset right"
+        );
+    }
+
+    #[test]
+    fn splash_closes_immediately_after_associated_file_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f1 = dir.path().join("first.txt");
+        let f2 = dir.path().join("second.txt");
+        fs::write(&f1, "alpha").expect("write f1");
+        fs::write(&f2, "beta").expect("write f2");
+
+        let mut app = make_test_app(dir.path().to_path_buf());
+        app.splash = SplashState::LoadingFile {
+            primary: f2,
+            extra_sleeping: vec![f1],
+            frames_rendered: 0,
+        };
+
+        let ctx = Context::default();
+        install_system_fonts(&ctx);
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+
+        // Frame 1 renders splash screen
+        let out1 = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ui| {
+                assert!(app.step_splash(ui));
+            },
+        );
+        out1.drop_without_applying_deltas();
+        assert!(app.active_book.is_none());
+
+        // Frame 2 loads file and dismisses splash immediately, keeping extra file sleeping
+        let out2 = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(0.05),
+                ..Default::default()
+            },
+            |ui| {
+                assert!(!app.step_splash(ui));
+            },
+        );
+        out2.drop_without_applying_deltas();
+        assert!(matches!(app.splash, SplashState::Done));
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(
+            app.active_book.as_ref().map(|b| b.title.as_str()),
+            Some("second.txt")
+        );
+        assert!(app.background_books.is_empty());
+    }
+
+    #[test]
+    fn locate_anchor_in_text_disambiguates_using_context() {
+        let text = "苹果很好吃，香蕉也很甜，苹果很脆。";
+        let anchor = Anchor {
+            index: 0,
+            start: 5,
+            quote: "苹果".to_owned(),
+            digest: String::new(),
+            before: "也很甜，".to_owned(),
+            after: "很脆".to_owned(),
+        };
+        let found = locate_anchor_in_text(text, &anchor).expect("should locate second occurrence");
+        assert_eq!(slice_chars(text, found.0, found.1), "苹果");
+        assert!(found.0 > 6);
     }
 }
