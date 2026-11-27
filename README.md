@@ -12,9 +12,11 @@ Windows 本地阅读器，使用 Rust 构建。作者为 **drliuhuan**。
 
 下载 `HayakuReader.exe` 后双击启动。首次运行可安装到 `%LOCALAPPDATA%\Programs\HayakuReader`。确认后程序会设置所选关联、在开始菜单和桌面创建快捷方式并启动已安装副本。已安装用户可以在阅读设置中调整文件关联和自动更新。Windows 已为某个格式保存默认应用选择时，可在系统的「默认应用」中改选 HayakuReader。
 
-标签页和阅读进度默认在下次启动时恢复，可以在设置中关闭此功能。后台标签页闲置五分钟，或移出最近五个标签页后会休眠。阅读进度、批注和设置保存在 `%LOCALAPPDATA%\HayakuReader`。
+标签页和阅读进度默认在下次启动时恢复，可以在设置中关闭此功能。后台标签页闲置五分钟，或移出最近五个标签页后会休眠。阅读进度、笔记和设置保存在 `%LOCALAPPDATA%\HayakuReader`。
 
 发布包只包含一个 EXE，使用 egui / wgpu 原生渲染，无需 WebView2 Runtime。
+
+右键点击正文选择「打印」，或按 `Ctrl+P`，可设置打印范围、纸张和双面打印，并选择是否包含高亮和笔记。预览按需生成，默认页边距为 25 mm；Markdown、EPUB 等流式文档使用独立的 10.5 pt 打印字号。
 
 ## 构建
 

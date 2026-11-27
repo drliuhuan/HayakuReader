@@ -410,12 +410,27 @@ fn page_images(page: &Page) -> Vec<[f32; 4]> {
 }
 
 impl Word {
-    pub fn open(path: &Path) -> Result<Self, String> {
+    pub fn open(path: &Path) -> Result<Self, String> { Self::open_with_print_size(path, None) }
+
+    pub fn open_for_print(path: &Path, size: [f32; 2]) -> Result<Self, String> {
+        Self::open_with_print_size(path, Some(size))
+    }
+
+    fn open_with_print_size(path: &Path, print_size: Option<[f32; 2]>) -> Result<Self, String> {
         let data = crate::flow::read_bytes(path)?;
-        let document = docboss_core::read(&data).map_err(|error| match error {
+        let mut document = docboss_core::read(&data).map_err(|error| match error {
             Error::Encrypted | Error::Crypt(_) => "此 Word 文件受密码保护".to_owned(),
             other => format!("无法解析 Word 文件：{other}"),
         })?;
+        if let Some([width, height]) = print_size {
+            for section in &mut document.sections {
+                section.properties.page_size.width = (width * 20.0).round() as i32;
+                section.properties.page_size.height = (height * 20.0).round() as i32;
+                let margins = &mut section.properties.margins;
+                margins.left = 0; margins.right = 0; margins.top = 0; margins.bottom = 0;
+                margins.header = 0; margins.footer = 0; margins.gutter = 0;
+            }
+        }
         let cjk = cjk_font_support();
         let referenced = referenced_fonts(&document);
         let referenced_norm: HashSet<String> = referenced

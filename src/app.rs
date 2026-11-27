@@ -199,6 +199,8 @@ struct ImageContextMenu {
     png_bytes: Option<Vec<u8>>,
     selected_text: Option<String>,
     extra_text: Option<String>,
+    annotation_id: Option<String>,
+    position: Option<Position>,
 }
 
 struct LinkWarningModal {
@@ -363,6 +365,7 @@ pub struct HayakuApp {
     active_outline_idx: Option<usize>,
     focus_mode: bool,
     show_settings: bool,
+    print_dialog: Option<crate::printing::PrintDialog>,
     show_search: bool,
     search_query: String,
     last_searched_query: String,
@@ -405,6 +408,7 @@ pub struct HayakuApp {
     cached_sys_dpi: f32,
     applied_visuals_dark: Option<bool>,
     applied_styles: bool,
+    window_state_restored: bool,
     fixed_last_scale_key: u32,
     fixed_scale_changed_at: Option<Instant>,
     flow_width_changed_at: Option<Instant>,
@@ -513,6 +517,7 @@ impl HayakuApp {
             active_outline_idx: None,
             focus_mode: false,
             show_settings: false,
+            print_dialog: None,
             show_search: false,
             search_query: String::new(),
             last_searched_query: String::new(),
@@ -550,6 +555,7 @@ impl HayakuApp {
             cached_sys_dpi: 1.0,
             applied_visuals_dark: None,
             applied_styles: false,
+            window_state_restored: false,
             fixed_last_scale_key: 0,
             fixed_scale_changed_at: None,
             flow_width_changed_at: None,
@@ -700,6 +706,7 @@ impl HayakuApp {
             || self.tab_sleep_hint_open
             || self.show_install_dialog
             || self.show_update_dialog
+            || self.print_dialog.is_some()
     }
 
     fn copy_text_reliable(&mut self, ctx: &Context, text: String, success_msg: &str) {
@@ -1158,7 +1165,7 @@ impl HayakuApp {
             item_idx: None,
             fragment: String::new(),
             fraction,
-            anchor: ann.parts.first().cloned(),
+            anchor: ann.parts.first().cloned().or_else(|| ann.position.as_ref().and_then(|position| position.anchor.clone())),
         });
         self.current_unit = unit;
     }
@@ -1540,7 +1547,8 @@ impl HayakuApp {
             } else {
                 1.0
             };
-            let target_zoom = (text_scale * dpi_comp).clamp(1.0, 2.5);
+            let target_zoom = (text_scale * dpi_comp).clamp(1.0, 2.5)
+                * self.settings.ui_scale.clamp(0.5, 2.0);
             if (ctx.zoom_factor() - target_zoom).abs() > 0.01 {
                 ctx.set_zoom_factor(target_zoom);
             }
@@ -2018,62 +2026,27 @@ impl HayakuApp {
                         if ui.button("设置").clicked() {
                             self.show_settings = !self.show_settings;
                         }
-                        if self.active_book.is_some() {
-                            if ui.button("笔记").clicked() {
-                                self.open_note_editor_from_selection();
-                            }
-                            if ui.button("书签").clicked() {
-                                self.add_bookmark();
-                            }
-                            if ui.button("搜索").clicked() {
-                                self.show_search = !self.show_search;
-                            }
-                            if self
-                                .active_book
-                                .as_ref()
-                                .is_some_and(|b| book_supports_code_mode(b.kind))
-                            {
-                                let is_code = self
-                                    .active_book
-                                    .as_ref()
-                                    .and_then(|b| b.state.view_mode.as_deref())
-                                    == Some("code");
-                                if ui
-                                    .button(if is_code { "渲染模式" } else { "代码模式" })
-                                    .clicked()
-                                    && let Some(b) = self.active_book.as_mut()
-                                {
-                                    b.state.view_mode = Some(if is_code {
-                                        "rendered".to_owned()
-                                    } else {
-                                        "code".to_owned()
-                                    });
-                                    let _ = storage::write_json(
-                                        &self.data.join(format!("{}.json", b.id)),
-                                        &b.state,
-                                    );
-                                    self.flow_cache = None;
-                                    self.clear_selection();
-                                }
-                            }
+                        if self.active_book.is_some() && ui.button("搜索").clicked() {
+                            self.show_search = !self.show_search;
                         }
                     });
                 });
             });
     }
 
-    fn add_bookmark(&mut self) {
+    fn add_bookmark(&mut self, position: Option<Position>) {
+        let unit = position.as_ref().map_or(self.current_unit, |position| position.index);
         let label = if let Some(book) = &self.active_book {
             match &book.source {
                 LoadedSource::Pdf(_) | LoadedSource::Word(_) => {
-                    format!("第 {} 页", self.current_unit + 1)
+                    format!("第 {} 页", unit + 1)
                 }
                 LoadedSource::Flow(f) => f
                     .chapters
-                    .get(self.current_unit)
+                    .get(unit)
                     .map(|c| c.title.clone())
                     .filter(|t| !t.is_empty())
-                    .unwrap_or_else(|| format!("第 {} 章", self.current_unit + 1)),
+                    .unwrap_or_else(|| format!("第 {} 章", unit + 1)),
             }
         } else {
             return;
@@ -2086,11 +2059,9 @@ impl HayakuApp {
                 color: "yellow".to_owned(),
                 text: label,
                 parts: Vec::new(),
-                position: Some(Position {
-                    index: self.current_unit,
-                    fraction: self.scroll_fraction,
-                    anchor: None,
-                }),
+                position: Some(position.unwrap_or(Position {
+                    index: unit, fraction: self.scroll_fraction, anchor: None,
+                })),
                 view_mode,
                 digest: book.digest.clone(),
                 missing: false,
@@ -2102,6 +2073,30 @@ impl HayakuApp {
             self.save_active_book();
             self.set_status("已添加书签。", Some(2));
         }
+    }
+
+    fn select_all_body(&mut self) {
+        if self.active_book.as_ref().is_some_and(|book| matches!(book.source, LoadedSource::Flow(_))) {
+            if let Some(cache) = &self.flow_cache && let Some(last) = cache.items.last() {
+                self.flow_sel_anchor = Some(FlowTextPos { item_idx: 0, char_idx: 0 });
+                self.flow_sel_head = Some(FlowTextPos { item_idx: cache.items.len() - 1,
+                    char_idx: last.plain.chars().count() });
+            }
+        } else { self.fixed_all_selected = true; }
+    }
+
+    fn open_print_dialog(&mut self) {
+        let Some(book) = &self.active_book else { return; };
+        let input = match &book.source {
+            LoadedSource::Flow(flow) => crate::printing::Input::Flow(Arc::clone(flow), book.state.view_mode.as_deref() == Some("code")),
+            LoadedSource::Pdf(_) | LoadedSource::Word(_) => {
+                let Some(recent) = self.recent.iter().find(|recent| recent.id == book.id) else { return; };
+                if book.kind == "pdf" { crate::printing::Input::Pdf(recent.path.clone()) }
+                else { crate::printing::Input::Word(recent.path.clone()) }
+            }
+        };
+        self.print_dialog = Some(crate::printing::PrintDialog::new(input,
+            book.title.clone(), book.state.annotations.clone()));
     }
 
     fn clear_selection(&mut self) {
@@ -2353,12 +2348,12 @@ impl HayakuApp {
             return;
         };
         if book.state.annotations.is_empty() {
-            self.set_status("当前文档暂无批注可导出。", Some(2));
+            self.set_status("当前文档暂无笔记可导出。", Some(2));
             return;
         }
         let is_fixed = matches!(book.source, LoadedSource::Pdf(_) | LoadedSource::Word(_));
         let has_code_mode = book_supports_code_mode(book.kind);
-        let mut md = format!("# {} · 批注与高亮\n\n", book.title);
+        let mut md = format!("# {} · 笔记与高亮\n\n", book.title);
         for ann in &book.state.annotations {
             let loc = ann
                 .position
@@ -2406,15 +2401,15 @@ impl HayakuApp {
                 md.push_str("\n\n");
             }
         }
-        let default_name = format!("{}-批注.md", book.title);
+        let default_name = format!("{}-笔记.md", book.title);
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Markdown", &["md"])
             .set_file_name(&default_name)
             .save_file()
         {
             match fs::write(&path, md) {
-                Ok(()) => self.set_status("批注已导出为 Markdown。", Some(3)),
-                Err(e) => self.set_status(format!("导出批注失败：{e}"), None),
+                Ok(()) => self.set_status("笔记已导出为 Markdown。", Some(3)),
+                Err(e) => self.set_status(format!("导出笔记失败：{e}"), None),
             }
         }
     }
@@ -2469,7 +2464,8 @@ impl HayakuApp {
                 let mut new_tab_rects: Vec<(String, Rect)> = Vec::new();
                 let pointer_pos = (!self.is_modal_open())
                     .then(|| ui.ctx().pointer_latest_pos())
-                    .flatten();
+                    .flatten()
+                    .filter(|pos| pointer_on_layer(ui, *pos));
 
                 // Left scroll arrow pinned at left end
                 let left_resp = ui
@@ -2587,7 +2583,8 @@ impl HayakuApp {
                                                         )
                                                     };
                                                     let label_text =
-                                                        RichText::new(truncate_str(&tab.title, 22))
+                                                        RichText::new(truncate_middle(&tab.title, 50))
+                                                            .size(14.0)
                                                             .color(text_color);
                                                     let tooltip = if sleeping {
                                                         format!(
@@ -2600,6 +2597,7 @@ impl HayakuApp {
                                                     let btn = ui
                                                         .add(
                                                             egui::Button::new(label_text)
+                                                                .wrap_mode(egui::TextWrapMode::Extend)
                                                                 .frame(false),
                                                         )
                                                         .on_hover_text(tooltip);
@@ -2754,7 +2752,7 @@ impl HayakuApp {
                     ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Recent, "最近打开");
                     ui.add_enabled_ui(has_book, |ui| {
                         ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Contents, "目录");
-                        ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Notes, "批注");
+                        ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Notes, "笔记");
                     });
                 });
                 ui.separator();
@@ -2949,7 +2947,7 @@ impl HayakuApp {
                         let mut export_md = false;
                         if let Some(book) = &self.active_book {
                             if book.state.annotations.is_empty() {
-                                ui.label(RichText::new("暂无书签、高亮或批注").color(p.muted));
+                                ui.label(RichText::new("暂无书签、高亮或笔记").color(p.muted));
                                 ui.add_space(6.0);
                                 ui.label(
                                     RichText::new("提示：拖动选中正文即可一键添加四色高亮或笔记。")
@@ -3174,14 +3172,24 @@ impl HayakuApp {
                                     .filter(|t| !t.is_empty());
                                 let pct = (self.scroll_fraction * 100.0).round() as i32;
                                 match ch_title {
-                                    Some(t) => format!("{t} · {pct}%"),
-                                    None => format!("{pct}%"),
+                                    Some(t) => format!("{t} · 阅读进度：{pct}%"),
+                                    None => format!("阅读进度：{pct}%"),
                                 }
                             }
                         }
                     } else {
                         "就绪".to_owned()
                     };
+                    if self.active_book.as_ref().is_some_and(|book| book_supports_code_mode(book.kind)) {
+                        let is_code = self.active_book.as_ref().and_then(|book| book.state.view_mode.as_deref()) == Some("code");
+                        if ui.button(if is_code { "渲染模式" } else { "代码模式" }).clicked()
+                            && let Some(book) = self.active_book.as_mut() {
+                            book.state.view_mode = Some(if is_code { "rendered" } else { "code" }.to_owned());
+                            self.flow_cache = None;
+                            self.clear_selection();
+                            self.save_active_book();
+                        }
+                    }
                     ui.label(RichText::new(loc).color(p.muted));
 
                     if dark && uses_smart_invert {
@@ -3700,8 +3708,8 @@ impl HayakuApp {
                         if !self.fixed_sel_dragging {
                             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                         }
-                        if primary_released
-                            && (!was_dragging || self.fixed_sel_anchor == self.fixed_sel_head)
+                        if ui.ctx().input(|i| i.pointer.secondary_clicked()) || (primary_released
+                            && (!was_dragging || self.fixed_sel_anchor == self.fixed_sel_head))
                         {
                             clicked_annotation_id = Some(ann_id.clone());
                         }
@@ -3996,6 +4004,8 @@ impl HayakuApp {
                             png_bytes: extracted_png,
                             selected_text: (!sel.is_empty()).then_some(sel),
                             extra_text: copy_text,
+                            annotation_id: None,
+                            position: Some(Position { index: idx, fraction: py_pt / page_sizes[idx][1].max(1.0), anchor: None }),
                         });
                     }
                 } else {
@@ -4016,6 +4026,8 @@ impl HayakuApp {
         self.last_selection_rect = sel_bounds;
         self.hovered_note = hovered_note;
 
+        if ui.ctx().input(|i| i.pointer.secondary_clicked())
+            && let Some(menu) = requested_menu.as_mut() { menu.annotation_id = clicked_annotation_id.take(); }
         if let Some(ann_id) = clicked_annotation_id
             && let Some(ann) = self
                 .active_book
@@ -4350,8 +4362,8 @@ impl HayakuApp {
             let mut hover_text_cursor = false;
             let hit_ctx = AnnotationHitCtx {
                 view_pointer_pos,
-                allow_click: primary_released
-                    && (!was_dragging || self.flow_sel_anchor == self.flow_sel_head),
+                allow_click: secondary_clicked || (primary_released
+                    && (!was_dragging || self.flow_sel_anchor == self.flow_sel_head)),
             };
 
             for idx in 0..cache.items.len() {
@@ -4551,6 +4563,7 @@ impl HayakuApp {
                                             Some(acc) => acc.union(vr),
                                             None => vr,
                                         });
+
                                     }
                                 }
                             }
@@ -4984,17 +4997,28 @@ impl HayakuApp {
                 if (canvas_resp.secondary_clicked() || secondary_clicked)
                     && let Some(pointer) = view_pointer_pos
                 {
+                    let menu_position = new_hit_pos.map(|hit| {
+                        let item = &cache.items[hit.item_idx];
+                        let start = cache.item_char_ranges[hit.item_idx].0 + hit.char_idx;
+                        let quote = item.plain.chars().skip(hit.char_idx).take(24).collect();
+                        Position { index: item.chapter_idx, fraction: 0.0,
+                            anchor: Some(Anchor { index: item.chapter_idx, start, quote,
+                                ..Default::default() }) }
+                    });
                     let sel = self.selected_flow_text();
-                    if !sel.is_empty() {
+                    if requested_menu.is_none() {
                         requested_menu = Some(ImageContextMenu {
                             pos: pointer,
                             label: String::new(),
                             filename: String::new(),
                             png_bytes: None,
-                            selected_text: Some(sel),
+                            selected_text: (!sel.is_empty()).then_some(sel),
                             extra_text: None,
+                            annotation_id: None,
+                            position: None,
                         });
                     }
+                    if let Some(menu) = requested_menu.as_mut() { menu.position = menu_position; }
                 }
             }
 
@@ -5076,6 +5100,8 @@ impl HayakuApp {
         self.last_selection_rect = sel_bounds;
         self.hovered_note = hovered_note;
 
+        if ui.ctx().input(|i| i.pointer.secondary_clicked())
+            && let Some(menu) = requested_menu.as_mut() { menu.annotation_id = clicked_annotation_id.take(); }
         if let Some(ann_id) = clicked_annotation_id
             && let Some(ann) = self
                 .active_book
@@ -5094,6 +5120,10 @@ impl HayakuApp {
     }
 
     fn draw_popups(&mut self, ctx: &Context) {
+        if let Some(dialog) = self.print_dialog.as_mut() && !dialog.show(ctx) {
+            self.print_dialog = None;
+        }
+
         let p = self.palette();
         let dark = self.theme_mode() == ThemeMode::Dark;
 
@@ -5129,6 +5159,10 @@ impl HayakuApp {
             let mut copy_text: Option<String> = None;
             let mut add_hl_color: Option<&'static str> = None;
             let mut open_note = false;
+            let mut select_all = false;
+            let mut print = false;
+            let mut bookmark = false;
+            let mut edit = false;
             egui::Area::new(Id::unique("image_context_menu"))
                 .fixed_pos(menu.pos)
                 .order(egui::Order::Foreground)
@@ -5140,6 +5174,16 @@ impl HayakuApp {
                         .inner_margin(Margin::same(6))
                         .show(ui, |ui| {
                             ui.set_min_width(156.0);
+                            if ui.button("全选").clicked() { select_all = true; keep = false; }
+                            if ui.button("打印…").clicked() { print = true; keep = false; }
+                            if ui.button("在此处插入书签").clicked() { bookmark = true; keep = false; }
+                            if let Some(annotation) = menu.annotation_id.as_ref().and_then(|id|
+                                self.active_book.as_ref()?.state.annotations.iter().find(|annotation| &annotation.id == id))
+                                && ui.button(if annotation.kind == "highlight" { "编辑高亮" } else { "编辑笔记" }).clicked() {
+                                edit = true; keep = false;
+                            }
+                            ui.separator();
+
                             if let Some(sel) = &menu.selected_text {
                                 if ui.button("复制选中文字").clicked() {
                                     copy_text = Some(sel.clone());
@@ -5185,6 +5229,13 @@ impl HayakuApp {
                         keep = false;
                     }
                 });
+            if select_all { self.select_all_body(); }
+            if print { self.open_print_dialog(); }
+            if bookmark { self.add_bookmark(menu.position.clone()); }
+            if edit && let Some(annotation) = menu.annotation_id.as_ref().and_then(|id|
+                self.active_book.as_ref()?.state.annotations.iter().find(|annotation| &annotation.id == id)).cloned() {
+                self.open_annotation_editor_for(&annotation);
+            }
             if let Some(txt) = copy_text {
                 self.copy_text_reliable(ctx, txt, "已复制文字到剪贴板。");
             }
@@ -5497,7 +5548,7 @@ impl HayakuApp {
                 self.bump_annotations_rev();
                 self.save_active_book();
                 self.sync_auto_sidebar(false);
-                self.set_status("已删除批注。", Some(2));
+                self.set_status("已删除笔记。", Some(2));
             } else if do_save
                 && let Some(book) = self.active_book.as_mut()
             {
@@ -5548,7 +5599,7 @@ impl HayakuApp {
                     self.sidebar_tab = SidebarTab::Notes;
                     self.save_active_book();
                     self.clear_selection();
-                    self.set_status("批注已保存。", Some(2));
+                    self.set_status("笔记已保存。", Some(2));
                 }
             }
             if keep {
@@ -5665,103 +5716,68 @@ impl HayakuApp {
             let mut changed = false;
             let mut open_install = false;
             let mut check_upd = false;
-            egui::Window::new("设置")
+            egui::Window::new(RichText::new("设置").size(16.0))
+                .id(Id::unique("reading_settings"))
+                .auto_sized()
+                .vscroll(false)
+                .max_height((ctx.content_rect().height() - 64.0).max(160.0))
                 .collapsible(false)
                 .resizable(false)
-                .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-16.0, 56.0))
+                .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-12.8, 44.8))
                 .show(ctx, |ui| {
-                    ui.set_width(480.0);
-                    ui.spacing_mut().item_spacing.y = 10.0;
-                    ui.horizontal(|ui| {
-                        let slot_w = (ui.available_width() - 96.0).max(280.0);
-                        Frame::new()
-                            .fill(p.code_bg)
-                            .stroke(Stroke::new(1.0, p.line))
-                            .corner_radius(CornerRadius::same(8))
-                            .inner_margin(Margin::same(3))
-                            .show(ui, |ui| {
-                                ui.set_width(slot_w);
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 3.0;
-                                    let btn_w = ((slot_w - 6.0) / 3.0).max(86.0);
-                                    for (val, label) in [
-                                        ("system", "跟随系统"),
-                                        ("light", "浅色"),
-                                        ("dark", "深色"),
-                                    ] {
-                                        let active = self.settings.theme.eq_ignore_ascii_case(val)
-                                            || (val == "system"
-                                                && !self.settings.theme.eq_ignore_ascii_case("light")
-                                                && !self.settings.theme.eq_ignore_ascii_case("dark"));
-                                        let btn = egui::Button::new(
-                                            RichText::new(label)
-                                                .color(if active { p.accent_ink } else { p.muted })
-                                                .strong(),
-                                        )
-                                        .fill(if active { p.accent } else { Color32::TRANSPARENT })
-                                        .stroke(Stroke::NONE)
-                                        .corner_radius(CornerRadius::same(6));
-                                        if ui.add_sized([btn_w, 36.0], btn).clicked() {
-                                            self.settings.theme = val.to_owned();
-                                            changed = true;
-                                        }
+                    scale_settings_style(ui);
+                    ui.set_width(384.0);
+                    ScrollArea::vertical().id_salt("settings_content")
+                        .max_height((ctx.content_rect().height() - 110.0).max(100.0))
+                        .auto_shrink([false, true]).show(ui, |ui| {
+                    ui.set_width(384.0);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    egui::Grid::new("settings_rows")
+                        .num_columns(2)
+                        .spacing(Vec2::new(12.8, 8.0))
+                        .show(ui, |ui| {
+                            settings_label(ui, "主题");
+                            ui.horizontal(|ui| {
+                                for (value, label) in [("system", "跟随系统"), ("light", "浅色"), ("dark", "深色")] {
+                                    let active = self.settings.theme.eq_ignore_ascii_case(value)
+                                        || (value == "system" && !matches!(self.settings.theme.as_str(), "light" | "dark"));
+                                    if ui.add_sized([86.0, 28.8], egui::Button::new(label)
+                                        .fill(if active { p.accent } else { p.code_bg }))
+                                        .clicked() {
+                                        self.settings.theme = value.to_owned();
+                                        changed = true;
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                            settings_label(ui, "字号");
+                            changed |= settings_number(ui, &mut self.settings.font_size, 13.0..=34.0, 1.0, 0, "");
+                            ui.end_row();
+                            settings_label(ui, "行距");
+                            changed |= settings_number(ui, &mut self.settings.line_height, 1.3..=2.4, 0.1, 1, "");
+                            ui.end_row();
+                            settings_label(ui, "阅读宽度");
+                            changed |= settings_number(ui, &mut self.settings.text_width, 360.0..=1800.0, 10.0, 0, "");
+                            ui.end_row();
+                            settings_label(ui, "界面缩放");
+                            egui::ComboBox::from_id_salt("ui_scale_selection")
+                                .selected_text(format!("{}%", (self.settings.ui_scale * 100.0).round() as i32))
+                                .show_ui(ui, |ui| {
+                                    for percent in [50, 60, 70, 75, 80, 90, 100, 110, 120, 125, 130, 140, 150, 160, 175, 180, 190, 200] {
+                                        changed |= ui.selectable_value(&mut self.settings.ui_scale,
+                                            percent as f32 / 100.0, format!("{percent}%")).changed();
                                     }
                                 });
-                            });
-                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new("主题").color(p.ink));
+                            ui.end_row();
+                            settings_label(ui, "恢复标签页");
+                            changed |= ui.checkbox(&mut self.settings.restore_session, "").changed();
+                            ui.end_row();
+                            if self.install_status.as_ref().is_some_and(|s| s.installed) {
+                                settings_label(ui, "自动安装更新");
+                                changed |= ui.checkbox(&mut self.settings.auto_update, "").changed();
+                                ui.end_row();
+                            }
                         });
-                    });
-                    ui.add_space(6.0);
-                    ui.scope(|ui| {
-                        let vis = ui.visuals_mut();
-                        vis.slider_trailing_fill = true;
-                        vis.selection.bg_fill = p.accent;
-                        ui.spacing_mut().slider_width = 260.0;
-
-                        ui.horizontal(|ui| {
-                            changed |= ui
-                                .add(egui::Slider::new(&mut self.settings.font_size, 13.0..=34.0))
-                                .changed();
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(RichText::new("字号").color(p.ink));
-                            });
-                        });
-                        ui.horizontal(|ui| {
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut self.settings.line_height, 1.3..=2.4)
-                                        .step_by(0.1),
-                                )
-                                .changed();
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(RichText::new("行距").color(p.ink));
-                            });
-                        });
-                        ui.horizontal(|ui| {
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(
-                                        &mut self.settings.text_width,
-                                        360.0..=1800.0,
-                                    )
-                                        .step_by(10.0),
-                                )
-                                .changed();
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(RichText::new("阅读宽度").color(p.ink));
-                            });
-                        });
-                    });
-                    ui.add_space(4.0);
-                    changed |= ui
-                        .checkbox(&mut self.settings.restore_session, "启动时恢复标签页")
-                        .changed();
-                    if self.install_status.as_ref().is_some_and(|s| s.installed) {
-                        changed |= ui
-                            .checkbox(&mut self.settings.auto_update, "自动安装更新")
-                            .changed();
-                    }
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("恢复默认").clicked() {
@@ -5776,16 +5792,11 @@ impl HayakuApp {
                         }
                         if let Some(st) = &self.install_status {
                             let label = if st.installed { "文件关联" } else { "安装" };
-                            if ui.button(label).clicked() {
-                                open_install = true;
-                            }
+                            if ui.button(label).clicked() { open_install = true; }
                         }
-                        if ui.button("检查更新").clicked() {
-                            check_upd = true;
-                        }
-                        if ui.button("关闭").clicked() {
-                            close = true;
-                        }
+                        if ui.button("检查更新").clicked() { check_upd = true; }
+                        if ui.button("关闭").clicked() { close = true; }
+                    });
                     });
                 });
             if changed {
@@ -5814,7 +5825,7 @@ impl HayakuApp {
                 .active_book
                 .as_ref()
                 .is_some_and(|b| matches!(b.source, LoadedSource::Pdf(_) | LoadedSource::Word(_)));
-            egui::Window::new("搜索正文")
+            egui::Window::new(RichText::new("搜索正文").size(16.0))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-16.0, 56.0))
@@ -6356,10 +6367,15 @@ impl HayakuApp {
 impl eframe::App for HayakuApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if !self.window_state_restored {
+            self.window_state_restored = platform::restore_window_state(&self.data);
+            if !self.window_state_restored { ctx.request_repaint(); }
+        }
         self.poll_background(&ctx);
         self.apply_egui_visuals(&ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) {
+            platform::save_window_state(&self.data);
             self.save_active_book();
             self.save_workspace();
         }
@@ -6405,6 +6421,7 @@ impl eframe::App for HayakuApp {
         }
 
         self.handle_shortcuts(&ctx);
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::P)) && !self.is_modal_open() { self.open_print_dialog(); }
 
         if !self.focus_mode {
             self.draw_top_bar(ui);
@@ -6446,6 +6463,7 @@ impl eframe::App for HayakuApp {
     }
 
     fn on_exit(&mut self) {
+        platform::save_window_state(&self.data);
         self.bg_stop.store(true, Ordering::Relaxed);
         self.save_active_book();
         self.save_workspace();
@@ -7722,7 +7740,9 @@ fn draw_flow_block_fallback(ui: &mut Ui, block: &Block, ctx: &mut FlowDrawCtx<'_
                         png_bytes: Some(png),
                         selected_text: None,
                         extra_text: None,
-                    });
+                        annotation_id: None,
+                            position: None,
+                        });
                 }
             } else if !alt.is_empty() {
                 ui.label(RichText::new(format!("[图片: {alt}]")).color(ctx.palette.muted));
@@ -7978,7 +7998,7 @@ fn chapter_plain_from_cache(cache: &FlowLayoutCache, chapter: usize) -> String {
     out
 }
 
-fn locate_anchor_in_text(haystack: &str, anchor: &Anchor) -> Option<(usize, usize)> {
+pub(crate) fn locate_anchor_in_text(haystack: &str, anchor: &Anchor) -> Option<(usize, usize)> {
     let quote = anchor.quote.as_str();
     let quote_chars = quote.chars().count();
     if quote_chars == 0 || haystack.is_empty() {
@@ -8872,7 +8892,7 @@ fn word_runs_plain(runs: &[WordTextRun]) -> String {
     out
 }
 
-fn decode_resource_image(path: &str, bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+pub(crate) fn decode_resource_image(path: &str, bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     if path.to_ascii_lowercase().ends_with(".svg") {
         let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok()?;
         let size = tree.size().to_int_size();
@@ -8960,6 +8980,107 @@ fn truncate_to_width(painter: &egui::Painter, text: &str, font: &FontId, max_wid
         }
     }
     format!("{}…", &text[..bounds[best]])
+}
+
+fn pointer_on_layer(ui: &Ui, pos: Pos2) -> bool {
+    ui.ctx().layer_id_at(pos) == Some(ui.layer_id())
+}
+
+/// Lay out printing with the reader's native renderer, without opening a window.
+pub(crate) fn print_flow_scenes(document: &FlowDocument, code: bool, width: f32, font_size: f32)
+    -> (Vec<crate::printing::rich::BlockScene>, HashMap<egui::TextureId, ColorImage>) {
+    let context = Context::default();
+    install_system_fonts(&context);
+    context.set_visuals(egui::Visuals::light());
+    context.style_mut_of(egui::Theme::Light, |style| {
+        for font in style.text_styles.values_mut() { font.size = font_size; }
+        style.spacing.item_spacing = Vec2::new(6.0, font_size * 0.55);
+    });
+    let mut math_cache = MathCache::default();
+    let mut math_textures = HashMap::new();
+    let mut image_textures = HashMap::new();
+    let mut textures = HashMap::new();
+    let mut scenes = Vec::new();
+    let scale = 150.0 / 96.0;
+    let logical_width = width / scale;
+    for (chapter_index, chapter) in document.chapters.iter().enumerate() {
+        let source_blocks;
+        let blocks = if code {
+            source_blocks = vec![Block::Code { lang: document.kind.to_owned(), code: chapter.raw_source.clone() }];
+            &source_blocks
+        } else { &chapter.blocks };
+        let mut start = 0;
+        for block in blocks {
+            let mut plain = String::new();
+            crate::flow::collect_block_plain(block, &mut plain);
+            let bold = crate::printing::rich::bold_ranges(block);
+            let mut height = 0.0;
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(logical_width, 1_000_000.0))),
+                ..Default::default()
+            };
+            input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().native_pixels_per_point = Some(scale);
+            let frame = context.run_ui(input, |ui| {
+                ui.set_width(logical_width);
+                let mut clicked_link = None; let mut requested_menu = None;
+                let mut ctx = FlowDrawCtx {
+                    book_id: "print", palette: Palette::for_mode(ThemeMode::Light), mode: ThemeMode::Light,
+                    font_size, line_height: 1.6, max_width: logical_width, resources: &document.resources,
+                    math_cache: &mut math_cache, math_textures: &mut math_textures,
+                    image_textures: &mut image_textures, clicked_link: &mut clicked_link,
+                    requested_menu: &mut requested_menu,
+                };
+                draw_flow_block_fallback(ui, block, &mut ctx);
+                ui.add_space(font_size * 0.55);
+                height = ui.min_rect().height();
+            });
+            let scene = crate::printing::rich::capture(&context, frame,
+                crate::printing::rich::CaptureSpec { plain: &plain, height, width:logical_width,
+                    chapter:chapter_index, start, bold:&bold }, &mut textures, &mut scenes);
+            scenes.push(scene);
+            start += plain.encode_utf16().count();
+        }
+    }
+    (scenes, textures)
+}
+
+fn truncate_middle(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars { return text.to_owned(); }
+    if max_chars == 0 { return String::new(); }
+    let head = (max_chars - 1).div_ceil(2);
+    let tail = max_chars - head - 1;
+    format!("{}…{}", text.chars().take(head).collect::<String>(),
+        text.chars().skip(count - tail).collect::<String>())
+}
+
+fn scale_settings_style(ui: &mut Ui) {
+    let style = ui.style_mut();
+    for font in style.text_styles.values_mut() { font.size *= 0.8; }
+    style.spacing.button_padding *= 0.8;
+    style.spacing.interact_size *= 0.8;
+    style.spacing.item_spacing *= 0.8;
+    style.spacing.icon_width *= 0.8;
+    style.spacing.icon_width_inner *= 0.8;
+    style.spacing.slider_rail_height *= 0.8;
+    style.spacing.slider_width = 184.0;
+}
+
+fn settings_label(ui: &mut Ui, text: &str) {
+    ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
+        ui.set_min_width(76.8);
+        ui.label(text);
+    });
+}
+
+fn settings_number(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>,
+    step: f64, decimals: usize, suffix: &str) -> bool {
+    ui.horizontal(|ui| {
+        let slider = ui.add(egui::Slider::new(value, range.clone()).show_value(false).step_by(step));
+        let number = ui.add(egui::DragValue::new(value).range(range).speed(step)
+            .fixed_decimals(decimals).suffix(suffix).min_size(Vec2::new(64.0, 22.4)));
+        slider.changed() || number.changed()
+    }).inner
 }
 
 fn truncate_str(s: &str, max_chars: usize) -> String {
@@ -9246,6 +9367,7 @@ mod tests {
             active_outline_idx: None,
             focus_mode: false,
             show_settings: false,
+            print_dialog: None,
             show_search: false,
             search_query: String::new(),
             last_searched_query: String::new(),
@@ -9283,6 +9405,7 @@ mod tests {
             cached_sys_dpi: 1.0,
             applied_visuals_dark: None,
             applied_styles: false,
+            window_state_restored: false,
             fixed_last_scale_key: 0,
             fixed_scale_changed_at: None,
             flow_width_changed_at: None,
@@ -9307,6 +9430,95 @@ mod tests {
             scroll_fraction: 0.0,
             current_unit: 0,
         }
+    }
+
+    #[test]
+    fn right_click_annotation_opens_context_without_launching_editor() {
+        for kind in ["highlight", "note"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = make_test_app(dir.path().to_owned());
+            let mut book = make_dummy_flow_book("right-click", "book.txt");
+            book.state.annotations.push(Annotation { id: "mark".into(), kind: kind.into(),
+                text: "Note".into(), color: "yellow".into(), parts: vec![Anchor {
+                    quote: "Content".into(), ..Default::default()
+                }], ..Default::default() });
+            app.active_book = Some(book);
+            let ctx = Context::default();
+            install_system_fonts(&ctx);
+            let pos = Pos2::new(125.0, 34.0);
+            for step in 0..4 {
+                let mut events = vec![egui::Event::PointerMoved(pos)];
+                if step >= 2 { events.push(egui::Event::PointerButton {
+                    pos, button: PointerButton::Secondary, pressed: step == 2,
+                    modifiers: egui::Modifiers::default(),
+                }); }
+                let frame = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+                    events, ..Default::default()
+                }, |ui| {
+                    CentralPanel::default().frame(Frame::new()).show(ui, |ui| app.draw_flow_viewer(ui));
+                });
+                frame.drop_without_applying_deltas();
+            }
+            let menu = app.context_menu.as_ref().expect("right click should open body menu");
+            assert_eq!(menu.annotation_id.as_deref(), Some("mark"));
+            assert!(menu.position.as_ref().and_then(|position| position.anchor.as_ref()).is_some());
+            assert!(app.annotation_editor.is_none(), "editing must wait for the context-menu action");
+        }
+    }
+
+    #[test]
+    fn compact_settings_fit_window_at_extreme_ui_scales() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_test_app(dir.path().to_owned());
+        app.show_settings = true;
+        let ctx = Context::default();
+        install_system_fonts(&ctx);
+        for scale in [0.5, 1.0, 2.0] {
+            ctx.set_zoom_factor(scale);
+            for _ in 0..3 {
+                let frame = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO,
+                        Vec2::new(1200.0 / scale, 900.0 / scale))),
+                    ..Default::default()
+                }, |ui| { app.draw_popups(ui.ctx()); });
+                frame.drop_without_applying_deltas();
+            }
+            let rect = ctx.memory(|memory| memory.area_rect(Id::unique("reading_settings"))).unwrap();
+            assert!(rect.width() <= 430.0, "settings too wide: {rect:?}");
+            assert!(rect.height() <= 900.0 / scale, "settings exceed viewport: {rect:?}");
+            assert!(rect.height() < 380.0, "settings contain excess empty space: {rect:?}");
+        }
+    }
+
+    #[test]
+    fn middle_ellipsis_keeps_filename_ends_within_fifty_unicode_characters() {
+        assert_eq!(truncate_middle("短标题.epub", 50), "短标题.epub");
+        let title = format!("开头{}结尾.epub", "中文标题".repeat(30));
+        let shown = truncate_middle(&title, 50);
+        assert_eq!(shown.chars().count(), 50);
+        assert!(shown.starts_with("开头"));
+        assert!(shown.ends_with("结尾.epub"));
+        assert!(shown.contains('…'));
+    }
+
+    #[test]
+    fn overlay_blocks_manual_tab_hover_detection() {
+        let ctx = Context::default();
+        let point = Pos2::new(150.0, 80.0);
+        let mut blocked = false;
+        for _ in 0..3 {
+            let frame = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                events: vec![egui::Event::PointerMoved(point)], ..Default::default()
+            }, |ui| {
+                blocked = !pointer_on_layer(ui, point);
+                egui::Window::new("Overlay").fixed_pos(Pos2::new(100.0, 40.0))
+                    .fixed_size(Vec2::new(300.0, 200.0)).show(ui.ctx(), |ui| { ui.label("Settings"); });
+            });
+            frame.drop_without_applying_deltas();
+        }
+        assert!(blocked, "a settings window must block tab hover on the background layer");
     }
 
     #[test]

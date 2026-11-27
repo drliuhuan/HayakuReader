@@ -22,6 +22,8 @@ pub struct Recent {
 #[serde(default)]
 pub struct Settings {
     pub theme: String,
+    #[serde(rename = "ui-scale")]
+    pub ui_scale: f32,
     #[serde(rename = "font-size")]
     pub font_size: f32,
     #[serde(rename = "line-height")]
@@ -46,6 +48,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: "system".to_owned(),
+            ui_scale: 1.0,
             font_size: 19.0,
             line_height: 1.8,
             text_width: 760.0,
@@ -225,6 +228,17 @@ pub fn clear_recent_entries(data: &Path, recent: &mut Vec<Recent>) -> io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_settings_default_ui_scale_and_custom_scale_roundtrips() {
+        let legacy: Settings = serde_json::from_str(r#"{"font-size":20}"#).unwrap();
+        assert_eq!(legacy.ui_scale, 1.0);
+        for scale in [0.5, 1.0, 2.0] {
+            let settings = Settings { ui_scale: scale, ..Settings::default() };
+            let restored: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.ui_scale, scale);
+        }
+    }
 
     #[test]
     fn read_and_write_json_roundtrip_and_default() -> io::Result<()> {

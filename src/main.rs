@@ -5,6 +5,7 @@ mod flow;
 mod highlight;
 mod math;
 mod pdf;
+mod printing;
 #[cfg(windows)]
 mod platform;
 mod storage;

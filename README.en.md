@@ -16,6 +16,8 @@ Open tabs and reading positions are restored on the next launch by default; this
 
 The release is a single standalone EXE using native egui / wgpu rendering, with no WebView2 Runtime dependency.
 
+Right-click the document and choose Print, or press `Ctrl+P`, to configure paper, page range, duplex printing, and optional highlights and notes. Previews load on demand. Printing defaults to 25 mm margins; Markdown, EPUB, and other flow documents use an independent 10.5 pt body size.
+
 ## Building
 
 Requires the Windows x64 Rust MSVC target, Microsoft C++ build tools, the Windows SDK, and a PDFium DLL to embed (set `PDFIUM_DLL` to its path). Run the following commands to produce `dist\HayakuReader.exe`:

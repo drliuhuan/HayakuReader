@@ -124,7 +124,7 @@ fn collect_inline_plain(inlines: &[Inline], out: &mut String) {
 }
 
 #[allow(dead_code)]
-fn collect_block_plain(block: &Block, out: &mut String) {
+pub(crate) fn collect_block_plain(block: &Block, out: &mut String) {
     match block {
         Block::Heading { inlines, .. } | Block::Paragraph(inlines) => {
             collect_inline_plain(inlines, out);

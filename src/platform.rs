@@ -821,6 +821,104 @@ pub fn allow_set_foreground_window() {
     }
 }
 
+// WINDOWPLACEMENT stores the normal rectangle even while maximized, in Windows
+// workspace coordinates, so moving between DPI settings does not involve UI zoom.
+mod window_state {
+    use super::*;
+    type Hwnd = *mut core::ffi::c_void;
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+    struct Point { x: i32, y: i32 }
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+    struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+    struct Placement {
+        length: u32, flags: u32, show_cmd: u32,
+        min_position: Point, max_position: Point, normal_position: Rect,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(callback: unsafe extern "system" fn(Hwnd, isize) -> i32, data: isize) -> i32;
+        fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+        fn IsWindowVisible(hwnd: Hwnd) -> i32;
+        fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, count: i32) -> i32;
+        fn GetWindowPlacement(hwnd: Hwnd, placement: *mut Placement) -> i32;
+        fn SetWindowPlacement(hwnd: Hwnd, placement: *const Placement) -> i32;
+    }
+    unsafe extern "system" fn find_window(hwnd: Hwnd, data: isize) -> i32 {
+        unsafe {
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == std::process::id() && IsWindowVisible(hwnd) != 0 {
+                // winit also owns a visible event-target helper window. Only the
+                // actual reader window has this title (including during splash).
+                let mut title = [0u16; 256];
+                let count = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+                if count > 0 && String::from_utf16_lossy(&title[..count as usize]).starts_with("HayakuReader") {
+                    *(data as *mut Hwnd) = hwnd;
+                    return 0;
+                }
+            }
+        }
+        1
+    }
+    fn current_window() -> Hwnd {
+        let mut hwnd: Hwnd = std::ptr::null_mut();
+        unsafe { EnumWindows(find_window, (&mut hwnd as *mut Hwnd) as isize); }
+        hwnd
+    }
+    fn normalize(placement: &mut Placement) {
+        // Restore a minimized window to its preceding normal/maximized state.
+        placement.show_cmd = if placement.show_cmd == 3 || (matches!(placement.show_cmd, 2 | 6 | 7 | 11) && placement.flags & 2 != 0) { 3 } else { 1 };
+        placement.flags = 0;
+        placement.length = std::mem::size_of::<Placement>() as u32;
+    }
+    pub(super) fn save(data: &Path) {
+        let hwnd = current_window();
+        let mut placement = Placement { length: std::mem::size_of::<Placement>() as u32, ..Default::default() };
+        if !hwnd.is_null() && unsafe { GetWindowPlacement(hwnd, &mut placement) } != 0 {
+            normalize(&mut placement);
+            let _ = write_json(&data.join("window-state.json"), &placement);
+        }
+    }
+    pub(super) fn restore(data: &Path) -> bool {
+        let Ok(mut placement) = read_json::<Placement>(&data.join("window-state.json")) else { return true; };
+        let rect = placement.normal_position;
+        if i64::from(rect.right) - i64::from(rect.left) < 300
+            || i64::from(rect.bottom) - i64::from(rect.top) < 200 { return true; }
+        normalize(&mut placement);
+        let hwnd = current_window();
+        if hwnd.is_null() { return false; }
+        unsafe { SetWindowPlacement(hwnd, &placement); }
+        true
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn minimized_state_retains_maximized_restore_and_normal_bounds() {
+            let mut placement = Placement { show_cmd: 2, flags: 2,
+                normal_position: Rect { left: 100, top: 120, right: 1100, bottom: 820 },
+                ..Default::default() };
+            normalize(&mut placement);
+            assert_eq!(placement.show_cmd, 3);
+            assert_eq!(placement.normal_position.left, 100);
+            let encoded = serde_json::to_string(&placement).unwrap();
+            let decoded: Placement = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.normal_position.bottom, 820);
+            placement.flags = 0;
+            placement.show_cmd = 2;
+            normalize(&mut placement);
+            assert_eq!(placement.show_cmd, 1);
+        }
+    }
+}
+
+pub fn save_window_state(data: &Path) { window_state::save(data); }
+pub fn restore_window_state(data: &Path) -> bool { window_state::restore(data) }
+
 pub fn bring_current_process_window_to_front() {
     type Hwnd = *mut core::ffi::c_void;
     const SW_RESTORE: i32 = 9;
