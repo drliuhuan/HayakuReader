@@ -63,6 +63,19 @@ fn main() {
     }
 }
 
+/// Configures wgpu to prefer the integrated/low-power adapter by default so hybrid-graphics
+/// laptops do not wake the discrete GPU for 2D document reading while respecting `WGPU_POWER_PREF`.
+#[cfg(windows)]
+fn default_wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    let mut wgpu_setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    wgpu_setup.power_preference = eframe::wgpu::PowerPreference::from_env()
+        .unwrap_or(eframe::wgpu::PowerPreference::LowPower);
+    eframe::egui_wgpu::WgpuConfiguration {
+        wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
+        ..Default::default()
+    }
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
     #[cfg(not(windows))]
     return Err("HayakuReader 原生桌面版当前面向 Windows 平台。".into());
@@ -119,6 +132,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         let options = eframe::NativeOptions {
             viewport,
+            wgpu_options: default_wgpu_options(),
             ..Default::default()
         };
         eframe::run_native(
@@ -167,4 +181,17 @@ fn rendered_svg_app_icon_is_valid() {
     assert_eq!(icon.width, 64);
     assert_eq!(icon.height, 64);
     assert_eq!(icon.rgba.len(), 64 * 64 * 4);
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn default_wgpu_options_prefers_low_power_by_default() {
+    if std::env::var_os("WGPU_POWER_PREF").is_none() {
+        match default_wgpu_options().wgpu_setup {
+            eframe::egui_wgpu::WgpuSetup::CreateNew(setup) => {
+                assert_eq!(setup.power_preference, eframe::wgpu::PowerPreference::LowPower);
+            }
+            other => panic!("expected WgpuSetup::CreateNew, got {other:?}"),
+        }
+    }
 }
