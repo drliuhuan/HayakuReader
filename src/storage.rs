@@ -112,6 +112,8 @@ pub struct Annotation {
     pub parts: Vec<Anchor>,
     #[serde(default)]
     pub position: Option<Position>,
+    #[serde(rename = "viewMode", default)]
+    pub view_mode: Option<String>,
     #[serde(default)]
     pub digest: String,
     #[serde(default)]
@@ -274,5 +276,25 @@ mod tests {
         let cleared: Vec<Recent> = read_json(&dir.path().join("recent.json"))?;
         assert!(cleared.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn annotation_view_mode_serializes_and_defaults_none_for_legacy_json() {
+        let code_ann = Annotation {
+            id: "a1".into(),
+            kind: "highlight".into(),
+            color: "yellow".into(),
+            text: "snippet".into(),
+            view_mode: Some("code".into()),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&code_ann).expect("serialize annotation");
+        assert!(encoded.contains(r#""viewMode":"code""#));
+        let decoded: Annotation = serde_json::from_str(&encoded).expect("deserialize annotation");
+        assert_eq!(decoded.view_mode.as_deref(), Some("code"));
+
+        let legacy_json = r#"{"id":"a0","kind":"note","text":"old"}"#;
+        let legacy: Annotation = serde_json::from_str(legacy_json).expect("deserialize legacy");
+        assert_eq!(legacy.view_mode, None);
     }
 }

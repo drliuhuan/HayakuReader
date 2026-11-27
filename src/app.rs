@@ -80,12 +80,21 @@ struct OpenBook {
     state: BookState,
 }
 
+fn book_supports_code_mode(kind: &str) -> bool {
+    matches!(kind, "markdown" | "html" | "xml")
+}
+
+fn annotation_is_code_mode(ann: &Annotation) -> bool {
+    ann.view_mode.as_deref() == Some("code")
+}
+
 #[derive(Clone, Debug)]
 struct PendingJump {
     chapter: usize,
     item_idx: Option<usize>,
     fragment: String,
     fraction: f32,
+    anchor: Option<Anchor>,
 }
 
 struct CachedPageTexture {
@@ -134,6 +143,7 @@ struct AnnotationEditorModal {
     text: String,
     parts: Vec<Anchor>,
     position: Option<Position>,
+    view_mode: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -232,11 +242,25 @@ struct FlowItemEntry {
     plain: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FlowItemAnnotationSpan {
+    ann_id: String,
+    kind: String,
+    color: String,
+    text: String,
+    created_at: u64,
+    char_start: usize,
+    char_end: usize,
+}
+
 struct FlowLayoutCache {
     key: FlowCacheKey,
     items: Vec<FlowItemEntry>,
+    item_char_ranges: Vec<(usize, usize)>,
     chapter_first_item: Vec<usize>,
     anchor_to_item: HashMap<(usize, String), usize>,
+    resolved_ann_rev: Option<u64>,
+    item_annotations: HashMap<usize, Vec<FlowItemAnnotationSpan>>,
 }
 
 enum BgEvent {
@@ -286,6 +310,7 @@ pub struct HayakuApp {
     last_content_h: f32,
 
     flow_cache: Option<FlowLayoutCache>,
+    annotations_rev: u64,
     flow_sel_anchor: Option<FlowTextPos>,
     flow_sel_head: Option<FlowTextPos>,
     flow_sel_dragging: bool,
@@ -459,6 +484,7 @@ impl HayakuApp {
             fixed_scale_changed_at: None,
             flow_width_changed_at: None,
             flow_pending_width: 0,
+            annotations_rev: 0,
             status_msg: None,
             context_menu: None,
             link_warning: None,
@@ -709,7 +735,9 @@ impl HayakuApp {
             item_idx: None,
             fragment: String::new(),
             fraction: pos.fraction,
+            anchor: None,
         });
+        self.bump_annotations_rev();
 
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tab.title = title;
@@ -1012,6 +1040,63 @@ impl HayakuApp {
         }
     }
 
+    fn bump_annotations_rev(&mut self) {
+        self.annotations_rev = self.annotations_rev.wrapping_add(1);
+    }
+
+    fn active_book_annotation_view_mode(&self) -> Option<String> {
+        let book = self.active_book.as_ref()?;
+        if !book_supports_code_mode(book.kind) {
+            return None;
+        }
+        Some(
+            if book.state.view_mode.as_deref() == Some("code") {
+                "code"
+            } else {
+                "rendered"
+            }
+            .to_owned(),
+        )
+    }
+
+    fn jump_to_annotation(&mut self, ann: &Annotation) {
+        if let Some(book) = self.active_book.as_mut()
+            && matches!(book.source, LoadedSource::Flow(_))
+            && book_supports_code_mode(book.kind)
+        {
+            let want_code = annotation_is_code_mode(ann);
+            let current_code = book.state.view_mode.as_deref() == Some("code");
+            if want_code != current_code {
+                book.state.view_mode = Some(
+                    if want_code {
+                        "code"
+                    } else {
+                        "rendered"
+                    }
+                    .to_owned(),
+                );
+                self.flow_cache = None;
+                self.clear_selection();
+                self.save_active_book();
+            }
+        }
+        let (unit, fraction) = if let Some(pos) = &ann.position {
+            (pos.index, pos.fraction)
+        } else if let Some(first) = ann.parts.first() {
+            (first.index, 0.0)
+        } else {
+            return;
+        };
+        self.pending_jump = Some(PendingJump {
+            chapter: unit,
+            item_idx: None,
+            fragment: String::new(),
+            fraction,
+            anchor: ann.parts.first().cloned(),
+        });
+        self.current_unit = unit;
+    }
+
     fn handle_link_click(&mut self, target: &LinkTarget) {
         match target {
             LinkTarget::Internal { chapter, fragment } => {
@@ -1020,6 +1105,7 @@ impl HayakuApp {
                     item_idx: None,
                     fragment: fragment.clone(),
                     fraction: 0.0,
+                    anchor: None,
                 });
                 self.current_unit = *chapter;
             }
@@ -1143,6 +1229,7 @@ impl HayakuApp {
                 item_idx: m.item_idx,
                 fragment: String::new(),
                 fraction: m.fraction,
+                anchor: None,
             });
             self.current_unit = m.unit;
         }
@@ -1890,7 +1977,7 @@ impl HayakuApp {
                             if self
                                 .active_book
                                 .as_ref()
-                                .is_some_and(|b| matches!(b.kind, "markdown" | "html" | "xml"))
+                                .is_some_and(|b| book_supports_code_mode(b.kind))
                             {
                                 let is_code = self
                                     .active_book
@@ -1912,8 +1999,7 @@ impl HayakuApp {
                                         &b.state,
                                     );
                                     self.flow_cache = None;
-                                    self.flow_sel_anchor = None;
-                                    self.flow_sel_head = None;
+                                    self.clear_selection();
                                 }
                             }
                         }
@@ -1938,6 +2024,7 @@ impl HayakuApp {
         } else {
             return;
         };
+        let view_mode = self.active_book_annotation_view_mode();
         if let Some(book) = self.active_book.as_mut() {
             book.state.annotations.push(Annotation {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -1950,10 +2037,12 @@ impl HayakuApp {
                     fraction: self.scroll_fraction,
                     anchor: None,
                 }),
+                view_mode,
                 digest: book.digest.clone(),
                 missing: false,
                 created_at: now_epoch_secs(),
             });
+            self.bump_annotations_rev();
             self.sidebar_open = true;
             self.sidebar_tab = SidebarTab::Notes;
             self.save_active_book();
@@ -2142,6 +2231,7 @@ impl HayakuApp {
             .as_ref()
             .map(|b| b.digest.clone())
             .unwrap_or_default();
+        let view_mode = self.active_book_annotation_view_mode();
         if let Some(book) = self.active_book.as_mut() {
             book.state.annotations.push(Annotation {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -2154,10 +2244,12 @@ impl HayakuApp {
                     fraction: self.scroll_fraction,
                     anchor: None,
                 }),
+                view_mode,
                 digest,
                 missing: false,
                 created_at: now_epoch_secs(),
             });
+            self.bump_annotations_rev();
             self.save_active_book();
             self.clear_selection();
             self.set_status("已添加高亮。", Some(2));
@@ -2178,6 +2270,7 @@ impl HayakuApp {
                 fraction: self.scroll_fraction,
                 anchor: None,
             }),
+            view_mode: self.active_book_annotation_view_mode(),
         });
     }
 
@@ -2193,6 +2286,7 @@ impl HayakuApp {
             text: ann.text.clone(),
             parts: ann.parts.clone(),
             position: ann.position.clone(),
+            view_mode: ann.view_mode.clone(),
         });
     }
 
@@ -2205,6 +2299,7 @@ impl HayakuApp {
             return;
         }
         let is_fixed = matches!(book.source, LoadedSource::Pdf(_) | LoadedSource::Word(_));
+        let has_code_mode = book_supports_code_mode(book.kind);
         let mut md = format!("# {} · 批注与高亮\n\n", book.title);
         for ann in &book.state.annotations {
             let loc = ann
@@ -2223,7 +2318,16 @@ impl HayakuApp {
                 "note" => "笔记",
                 _ => "高亮",
             };
-            md.push_str(&format!("## {kind_label} · {loc}\n\n"));
+            let mode_suffix = if has_code_mode {
+                if annotation_is_code_mode(ann) {
+                    " · 代码模式"
+                } else {
+                    " · 渲染模式"
+                }
+            } else {
+                ""
+            };
+            md.push_str(&format!("## {kind_label}{mode_suffix} · {loc}\n\n"));
             if !ann.parts.is_empty() {
                 let quote = ann
                     .parts
@@ -2759,6 +2863,7 @@ impl HayakuApp {
                                         item_idx: None,
                                         fragment: entry.fragment.clone(),
                                         fraction: 0.0,
+                                        anchor: None,
                                     });
                                     self.current_unit = entry.index;
                                     self.active_outline_idx = Some(oi);
@@ -2769,7 +2874,7 @@ impl HayakuApp {
                     SidebarTab::Notes => {
                         let mut remove_idx = None;
                         let mut edit_ann: Option<Annotation> = None;
-                        let mut jump_to = None;
+                        let mut jump_ann: Option<Annotation> = None;
                         let mut export_md = false;
                         if let Some(book) = &self.active_book {
                             if book.state.annotations.is_empty() {
@@ -2791,6 +2896,7 @@ impl HayakuApp {
                                     book.source,
                                     LoadedSource::Pdf(_) | LoadedSource::Word(_)
                                 );
+                                let has_code_mode = book_supports_code_mode(book.kind);
                                 for (idx, ann) in book.state.annotations.iter().enumerate() {
                                     let card = Frame::new()
                                         .fill(p.surface)
@@ -2820,6 +2926,15 @@ impl HayakuApp {
                                                 "note" => "笔记",
                                                 _ => "高亮",
                                             };
+                                            let mode_badge = if has_code_mode {
+                                                if annotation_is_code_mode(ann) {
+                                                    "代码模式"
+                                                } else {
+                                                    "渲染模式"
+                                                }
+                                            } else {
+                                                ""
+                                            };
                                             let loc_txt = ann
                                                 .position
                                                 .as_ref()
@@ -2831,24 +2946,23 @@ impl HayakuApp {
                                                     }
                                                 })
                                                 .unwrap_or_default();
+                                            let header_txt = if mode_badge.is_empty() {
+                                                format!("{kind_txt} · {loc_txt}")
+                                            } else {
+                                                format!("{kind_txt} · {mode_badge} · {loc_txt}")
+                                            };
                                             if ui
                                                 .add(
                                                     egui::Button::new(
-                                                        RichText::new(format!(
-                                                            "{kind_txt} · {loc_txt}"
-                                                        ))
-                                                        .size(17.5)
-                                                        .color(p.muted),
+                                                        RichText::new(header_txt)
+                                                            .size(17.5)
+                                                            .color(p.muted),
                                                     )
                                                     .frame(false),
                                                 )
                                                 .clicked()
                                             {
-                                                if let Some(pos) = &ann.position {
-                                                    jump_to = Some((pos.index, pos.fraction));
-                                                } else if let Some(first) = ann.parts.first() {
-                                                    jump_to = Some((first.index, 0.0));
-                                                }
+                                                jump_ann = Some(ann.clone());
                                             }
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(Align::Center),
@@ -2890,11 +3004,7 @@ impl HayakuApp {
                                                 )
                                                 .clicked()
                                             {
-                                                if let Some(pos) = &ann.position {
-                                                    jump_to = Some((pos.index, pos.fraction));
-                                                } else {
-                                                    jump_to = Some((first_part.index, 0.0));
-                                                }
+                                                jump_ann = Some(ann.clone());
                                             }
                                         }
                                         if !ann.text.trim().is_empty()
@@ -2913,9 +3023,8 @@ impl HayakuApp {
                                                     .sense(Sense::click()),
                                                 )
                                                 .clicked()
-                                            && let Some(pos) = &ann.position
                                         {
-                                            jump_to = Some((pos.index, pos.fraction));
+                                            jump_ann = Some(ann.clone());
                                         }
                                         #[cfg(windows)]
                                         if ann.created_at > 0 {
@@ -2944,17 +3053,12 @@ impl HayakuApp {
                             && idx < book.state.annotations.len()
                         {
                             book.state.annotations.remove(idx);
+                            self.bump_annotations_rev();
                             self.save_active_book();
                             self.sync_auto_sidebar(false);
                         }
-                        if let Some((unit, fraction)) = jump_to {
-                            self.pending_jump = Some(PendingJump {
-                                chapter: unit,
-                                item_idx: None,
-                                fragment: String::new(),
-                                fraction,
-                            });
-                            self.current_unit = unit;
+                        if let Some(ann) = jump_ann {
+                            self.jump_to_annotation(&ann);
                         }
                     }
                 });
@@ -3080,6 +3184,7 @@ impl HayakuApp {
                                     item_idx: None,
                                     fragment: String::new(),
                                     fraction: 0.0,
+                                    anchor: None,
                                 });
                             }
                             if ui.button("‹").clicked() && self.current_unit > 0 {
@@ -3090,6 +3195,7 @@ impl HayakuApp {
                                     item_idx: None,
                                     fragment: String::new(),
                                     fraction: 0.0,
+                                    anchor: None,
                                 });
                             }
                         } else {
@@ -3815,6 +3921,7 @@ impl HayakuApp {
                 item_idx: None,
                 fragment: String::new(),
                 fraction: 0.0,
+                anchor: None,
             });
             self.current_unit = p;
         }
@@ -3878,12 +3985,16 @@ impl HayakuApp {
             line_height,
         );
 
+        let item_char_ranges = compute_item_char_ranges(&items);
         let _ = ui;
         self.flow_cache = Some(FlowLayoutCache {
             key,
             items,
+            item_char_ranges,
             chapter_first_item,
             anchor_to_item,
+            resolved_ann_rev: None,
+            item_annotations: HashMap::new(),
         });
         self.flow_sel_anchor = None;
         self.flow_sel_head = None;
@@ -3917,6 +4028,20 @@ impl HayakuApp {
         };
 
         self.ensure_flow_cache(ui, measure);
+        if self
+            .flow_cache
+            .as_ref()
+            .is_some_and(|c| c.resolved_ann_rev != Some(self.annotations_rev))
+        {
+            let anns = self
+                .active_book
+                .as_ref()
+                .map(|b| b.state.annotations.as_slice())
+                .unwrap_or(&[]);
+            if let Some(cache) = self.flow_cache.as_mut() {
+                rebuild_flow_item_annotations(cache, anns, is_code_mode, self.annotations_rev);
+            }
+        }
         if self.flow_cache.is_none() {
             return;
         }
@@ -3927,16 +4052,28 @@ impl HayakuApp {
             && let Some(jump) = self.pending_jump.take()
             && let Some(cache) = self.flow_cache.as_mut()
         {
-            let target_item = if let Some(idx) = jump.item_idx {
-                Some(idx.min(cache.items.len().saturating_sub(1)))
+            let (target_item, resolved_specific_item) = if let Some(idx) = jump.item_idx {
+                (Some(idx.min(cache.items.len().saturating_sub(1))), true)
+            } else if let Some(anchor) = &jump.anchor {
+                let mut chapter_plains = HashMap::new();
+                if let Some(&(idx, _, _)) =
+                    resolve_flow_anchor_items(cache, anchor, &mut chapter_plains).first()
+                {
+                    (Some(idx), true)
+                } else {
+                    (cache.chapter_first_item.get(jump.chapter).copied(), false)
+                }
             } else if !jump.fragment.is_empty() {
-                cache
+                let exact = cache
                     .anchor_to_item
                     .get(&(jump.chapter, jump.fragment.clone()))
-                    .copied()
-                    .or_else(|| cache.chapter_first_item.get(jump.chapter).copied())
+                    .copied();
+                (
+                    exact.or_else(|| cache.chapter_first_item.get(jump.chapter).copied()),
+                    exact.is_some(),
+                )
             } else {
-                cache.chapter_first_item.get(jump.chapter).copied()
+                (cache.chapter_first_item.get(jump.chapter).copied(), false)
             };
             if let Some(ti) = target_item {
                 let mut offset_y: f32 = 24.0
@@ -3944,7 +4081,7 @@ impl HayakuApp {
                         .iter()
                         .map(|it| it.height)
                         .sum::<f32>();
-                if jump.item_idx.is_none() && jump.fraction > 0.0 && jump.fragment.is_empty() {
+                if !resolved_specific_item && jump.fraction > 0.0 && jump.fragment.is_empty() {
                     let ch_start = cache
                         .chapter_first_item
                         .get(jump.chapter)
@@ -3958,7 +4095,7 @@ impl HayakuApp {
                     let ch_h: f32 = cache.items[ch_start..ch_end].iter().map(|it| it.height).sum();
                     offset_y += ch_h * jump.fraction.clamp(0.0, 1.0);
                 }
-                let margin_top = if jump.item_idx.is_some() { 80.0 } else { 16.0 };
+                let margin_top = if resolved_specific_item { 80.0 } else { 16.0 };
                 initial_scroll_offset = Some((offset_y - margin_top).max(0.0));
             }
         }
@@ -3975,11 +4112,6 @@ impl HayakuApp {
         let mut hovered_note: Option<(Pos2, String, u64)> = None;
 
         let dark = mode == ThemeMode::Dark;
-        let flow_annotations: Vec<Annotation> = self
-            .active_book
-            .as_ref()
-            .map(|b| b.state.annotations.clone())
-            .unwrap_or_default();
         let search_matches: Vec<(usize, usize, usize, bool)> = if self.show_search
             && !self.search_matches.is_empty()
         {
@@ -4068,6 +4200,11 @@ impl HayakuApp {
 
             let mut new_hit_pos: Option<FlowTextPos> = None;
             let mut hover_text_cursor = false;
+            let hit_ctx = AnnotationHitCtx {
+                view_pointer_pos,
+                allow_click: primary_released
+                    && (!was_dragging || self.flow_sel_anchor == self.flow_sel_head),
+            };
 
             for idx in 0..cache.items.len() {
                 let item_h = cache.items[idx].height;
@@ -4208,51 +4345,17 @@ impl HayakuApp {
                                 );
                             }
                             // Paint saved annotations on this flow item
-                            let item_plain = &cache.items[idx].plain;
-                            let item_ch = cache.items[idx].chapter_idx;
-                            if !item_plain.is_empty() && !flow_annotations.is_empty() {
-                                for ann in &flow_annotations {
-                                    for part in &ann.parts {
-                                        if part.index == item_ch
-                                            && let Some((hc0, hc1)) =
-                                                locate_anchor_in_text(item_plain, part)
-                                        {
-                                            let is_note = ann.kind == "note";
-                                            let fill_col = if is_note {
-                                                Color32::TRANSPARENT
-                                            } else {
-                                                highlight_fill_color(&ann.color, dark)
-                                            };
-                                            let rects = paint_galley_selection_rects(
-                                                ui,
-                                                &galley,
-                                                content_pos,
-                                                hc0,
-                                                hc1,
-                                                fill_col,
-                                                is_note,
-                                                highlight_swatch_color(&ann.color),
-                                            );
-                                            if let Some(pos) = view_pointer_pos
-                                                && rects.iter().any(|r| r.expand2(Vec2::new(0.0, 3.0)).contains(pos))
-                                            {
-                                                if is_note && !ann.text.trim().is_empty() {
-                                                    hovered_note = Some((
-                                                        pos,
-                                                        ann.text.clone(),
-                                                        ann.created_at,
-                                                    ));
-                                                }
-                                                if primary_released
-                                                    && (!was_dragging
-                                                        || self.flow_sel_anchor == self.flow_sel_head)
-                                                {
-                                                    clicked_annotation_id = Some(ann.id.clone());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                            if let Some(spans) = cache.item_annotations.get(&idx) {
+                                paint_flow_galley_annotations(
+                                    ui,
+                                    &galley,
+                                    content_pos,
+                                    spans,
+                                    dark,
+                                    hit_ctx,
+                                    &mut hovered_note,
+                                    &mut clicked_annotation_id,
+                                );
                             }
                             // Paint search keyword highlights on this flow item
                             if !search_matches.is_empty() {
@@ -4363,6 +4466,18 @@ impl HayakuApp {
                             );
                             let code_pos =
                                 Pos2::new(item_rect.left() + num_w, item_rect.top() + 2.0);
+                            if let Some(spans) = cache.item_annotations.get(&idx) {
+                                paint_flow_galley_annotations(
+                                    ui,
+                                    &code_galley,
+                                    code_pos,
+                                    spans,
+                                    dark,
+                                    hit_ctx,
+                                    &mut hovered_note,
+                                    &mut clicked_annotation_id,
+                                );
+                            }
                             if !search_matches.is_empty() {
                                 for &(mi, cs, ce, is_cur) in &search_matches {
                                     if mi == idx {
@@ -4491,61 +4606,42 @@ impl HayakuApp {
                                             p.accent,
                                         );
                                     }
-                                    let item_plain = &cache.items[idx].plain;
-                                    let item_ch = cache.items[idx].chapter_idx;
                                     let rich_origin = item_rect.min.to_vec2()
                                         + Vec2::new(*indent_px, *pad_top);
-                                    if !item_plain.is_empty() && !flow_annotations.is_empty() {
-                                        for ann in &flow_annotations {
-                                            for part in &ann.parts {
-                                                if part.index == item_ch
-                                                    && let Some((hc0, hc1)) =
-                                                        locate_anchor_in_text(item_plain, part)
-                                                {
-                                                    let is_note = ann.kind == "note";
-                                                    let hl_col = if is_note {
-                                                        Color32::TRANSPARENT
-                                                    } else {
-                                                        highlight_fill_color(&ann.color, dark)
-                                                    };
-                                                    let ul_col = highlight_swatch_color(&ann.color);
-                                                    for r in &char_boxes
-                                                        [hc0..hc1.min(char_boxes.len())]
-                                                    {
-                                                        let sr = r.translate(rich_origin);
-                                                        if !is_note {
-                                                            ui.painter().rect_filled(sr, 1.0, hl_col);
-                                                        } else {
-                                                            ui.painter().line_segment(
-                                                                [
-                                                                    Pos2::new(sr.left(), sr.bottom()),
-                                                                    Pos2::new(sr.right(), sr.bottom()),
-                                                                ],
-                                                                Stroke::new(2.2, ul_col),
-                                                            );
-                                                        }
-                                                        if let Some(pos) = view_pointer_pos
-                                                            && sr.expand2(Vec2::new(0.0, 3.0)).contains(pos)
-                                                        {
-                                                            if is_note && !ann.text.trim().is_empty() {
-                                                                hovered_note = Some((
-                                                                    pos,
-                                                                    ann.text.clone(),
-                                                                    ann.created_at,
-                                                                ));
-                                                            }
-                                                            if primary_released
-                                                                && (!was_dragging
-                                                                    || self.flow_sel_anchor
-                                                                        == self.flow_sel_head)
-                                                            {
-                                                                clicked_annotation_id =
-                                                                    Some(ann.id.clone());
-                                                            }
-                                                        }
-                                                    }
+                                    if let Some(spans) = cache.item_annotations.get(&idx) {
+                                        for span in spans {
+                                            let is_note = span.kind == "note";
+                                            let hl_col = if is_note {
+                                                Color32::TRANSPARENT
+                                            } else {
+                                                highlight_fill_color(&span.color, dark)
+                                            };
+                                            let ul_col = highlight_swatch_color(&span.color);
+                                            let mut rects = Vec::new();
+                                            for r in &char_boxes
+                                                [span.char_start..span.char_end.min(char_boxes.len())]
+                                            {
+                                                let sr = r.translate(rich_origin);
+                                                if !is_note {
+                                                    ui.painter().rect_filled(sr, 1.0, hl_col);
+                                                } else {
+                                                    ui.painter().line_segment(
+                                                        [
+                                                            Pos2::new(sr.left(), sr.bottom()),
+                                                            Pos2::new(sr.right(), sr.bottom()),
+                                                        ],
+                                                        Stroke::new(2.2, ul_col),
+                                                    );
                                                 }
+                                                rects.push(sr);
                                             }
+                                            record_annotation_hit(
+                                                &rects,
+                                                span,
+                                                hit_ctx,
+                                                &mut hovered_note,
+                                                &mut clicked_annotation_id,
+                                            );
                                         }
                                     }
                                     if !search_matches.is_empty() {
@@ -5241,6 +5337,7 @@ impl HayakuApp {
                 && let Some(book) = self.active_book.as_mut()
             {
                 book.state.annotations.retain(|a| a.id != *eid);
+                self.bump_annotations_rev();
                 self.save_active_book();
                 self.sync_auto_sidebar(false);
                 self.set_status("已删除批注。", Some(2));
@@ -5283,11 +5380,13 @@ impl HayakuApp {
                             text: trimmed,
                             parts: editor.parts.clone(),
                             position: editor.position.clone(),
+                            view_mode: editor.view_mode.clone(),
                             digest,
                             missing: false,
                             created_at: now_epoch_secs(),
                         });
                     }
+                    self.bump_annotations_rev();
                     self.sidebar_open = true;
                     self.sidebar_tab = SidebarTab::Notes;
                     self.save_active_book();
@@ -7495,6 +7594,170 @@ fn highlight_fill_color(name: &str, dark: bool) -> Color32 {
     Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha)
 }
 
+#[derive(Clone, Copy)]
+struct AnnotationHitCtx {
+    view_pointer_pos: Option<Pos2>,
+    allow_click: bool,
+}
+
+fn record_annotation_hit(
+    rects: &[Rect],
+    span: &FlowItemAnnotationSpan,
+    hit_ctx: AnnotationHitCtx,
+    hovered_note: &mut Option<(Pos2, String, u64)>,
+    clicked_annotation_id: &mut Option<String>,
+) {
+    if let Some(pos) = hit_ctx.view_pointer_pos
+        && rects.iter().any(|r| r.expand2(Vec2::new(0.0, 3.0)).contains(pos))
+    {
+        if span.kind == "note" && !span.text.trim().is_empty() {
+            *hovered_note = Some((pos, span.text.clone(), span.created_at));
+        }
+        if hit_ctx.allow_click {
+            *clicked_annotation_id = Some(span.ann_id.clone());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_flow_galley_annotations(
+    ui: &Ui,
+    galley: &egui::Galley,
+    origin: Pos2,
+    spans: &[FlowItemAnnotationSpan],
+    dark: bool,
+    hit_ctx: AnnotationHitCtx,
+    hovered_note: &mut Option<(Pos2, String, u64)>,
+    clicked_annotation_id: &mut Option<String>,
+) {
+    for span in spans {
+        let is_note = span.kind == "note";
+        let fill_col = if is_note {
+            Color32::TRANSPARENT
+        } else {
+            highlight_fill_color(&span.color, dark)
+        };
+        let rects = paint_galley_selection_rects(
+            ui,
+            galley,
+            origin,
+            span.char_start,
+            span.char_end,
+            fill_col,
+            is_note,
+            highlight_swatch_color(&span.color),
+        );
+        record_annotation_hit(&rects, span, hit_ctx, hovered_note, clicked_annotation_id);
+    }
+}
+
+fn compute_item_char_ranges(items: &[FlowItemEntry]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::with_capacity(items.len());
+    let mut prev_ch: Option<usize> = None;
+    let mut offset = 0usize;
+    for item in items {
+        if prev_ch != Some(item.chapter_idx) {
+            prev_ch = Some(item.chapter_idx);
+            offset = 0;
+        }
+        let len = item.plain.chars().count();
+        if len == 0 {
+            ranges.push((offset, offset));
+        } else {
+            ranges.push((offset, offset + len));
+            offset += len + 1;
+        }
+    }
+    ranges
+}
+
+fn resolve_flow_anchor_items(
+    cache: &FlowLayoutCache,
+    anchor: &Anchor,
+    chapter_plains: &mut HashMap<usize, String>,
+) -> Vec<(usize, usize, usize)> {
+    let ch = anchor.index;
+    let ch_start = cache.chapter_first_item.get(ch).copied().unwrap_or(0);
+    let ch_end = cache
+        .chapter_first_item
+        .get(ch + 1)
+        .copied()
+        .unwrap_or(cache.items.len())
+        .min(cache.items.len());
+    if ch_start >= ch_end {
+        return Vec::new();
+    }
+    let ch_plain = chapter_plains
+        .entry(ch)
+        .or_insert_with(|| chapter_plain_from_cache(cache, ch));
+    let mut resolved = Vec::new();
+    if let Some((ch_s, ch_e)) = locate_anchor_in_text(ch_plain, anchor) {
+        for idx in ch_start..ch_end {
+            if cache.items[idx].plain.is_empty() {
+                continue;
+            }
+            let (it_s, it_e) = cache.item_char_ranges[idx];
+            let ov0 = ch_s.max(it_s);
+            let ov1 = ch_e.min(it_e);
+            if ov1 > ov0 {
+                resolved.push((idx, ov0 - it_s, ov1 - it_s));
+            }
+        }
+    }
+    if resolved.is_empty() {
+        for (idx, item) in cache.items.iter().enumerate().take(ch_end).skip(ch_start) {
+            if !item.plain.is_empty()
+                && let Some((c0, c1)) = locate_anchor_in_text(&item.plain, anchor)
+                && c1 > c0
+            {
+                resolved.push((idx, c0, c1));
+            }
+        }
+    }
+    resolved
+}
+
+fn rebuild_flow_item_annotations(
+    cache: &mut FlowLayoutCache,
+    annotations: &[Annotation],
+    is_code_mode: bool,
+    rev: u64,
+) {
+    if cache.resolved_ann_rev == Some(rev) {
+        return;
+    }
+    cache.item_annotations.clear();
+    cache.resolved_ann_rev = Some(rev);
+    if annotations.is_empty() || cache.items.is_empty() {
+        return;
+    }
+    let mut chapter_plains = HashMap::new();
+    for ann in annotations {
+        if annotation_is_code_mode(ann) != is_code_mode {
+            continue;
+        }
+        for part in &ann.parts {
+            for (idx, char_start, char_end) in
+                resolve_flow_anchor_items(cache, part, &mut chapter_plains)
+            {
+                cache
+                    .item_annotations
+                    .entry(idx)
+                    .or_default()
+                    .push(FlowItemAnnotationSpan {
+                        ann_id: ann.id.clone(),
+                        kind: ann.kind.clone(),
+                        color: ann.color.clone(),
+                        text: ann.text.clone(),
+                        created_at: ann.created_at,
+                        char_start,
+                        char_end,
+                    });
+            }
+        }
+    }
+}
+
 fn chapter_plain_from_cache(cache: &FlowLayoutCache, chapter: usize) -> String {
     let start = cache.chapter_first_item.get(chapter).copied().unwrap_or(0);
     let end = cache
@@ -8808,6 +9071,7 @@ mod tests {
             fixed_scale_changed_at: None,
             flow_width_changed_at: None,
             flow_pending_width: 0,
+            annotations_rev: 0,
             status_msg: None,
             context_menu: None,
             link_warning: None,
@@ -9470,5 +9734,308 @@ mod tests {
             assert!(measured <= 110.5, "trimmed width {measured} exceeded 110.0");
         });
         out.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn code_mode_and_rendered_mode_annotations_are_isolated_and_support_multiline_and_duplicates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_test_app(dir.path().to_path_buf());
+        let raw_md = "alpha\nrepeat line\nbeta\nrepeat line\ngamma".to_owned();
+        let flow = Arc::new(FlowDocument {
+            kind: "markdown",
+            chapters: vec![crate::flow::FlowChapter {
+                path: "notes.md".to_owned(),
+                title: "Main".to_owned(),
+                blocks: vec![
+                    Block::Paragraph(vec![Inline::Text("alpha rendered".to_owned())]),
+                    Block::Paragraph(vec![Inline::Text("beta rendered".to_owned())]),
+                ],
+                anchors: HashMap::new(),
+                raw_source: raw_md,
+            }],
+            outline: Vec::new(),
+            resources: HashMap::new(),
+        });
+        app.active_book = Some(OpenBook {
+            id: "md-1".to_owned(),
+            title: "Notes.md".to_owned(),
+            digest: "d-md".to_owned(),
+            kind: "markdown",
+            source: LoadedSource::Flow(flow.clone()),
+            state: BookState {
+                view_mode: Some("code".to_owned()),
+                ..Default::default()
+            },
+        });
+
+        let code_built = build_flow_items_list(&flow, "markdown", true, 760.0, 19.0, 1.8);
+        let code_ranges = compute_item_char_ranges(&code_built.0);
+        let mut code_cache = FlowLayoutCache {
+            key: FlowCacheKey {
+                book_id: "md-1".to_owned(),
+                is_code_mode: true,
+                width_px: 760,
+                font_size_tenths: 190,
+                line_height_hundredths: 180,
+                dark: false,
+            },
+            items: code_built.0,
+            item_char_ranges: code_ranges,
+            chapter_first_item: code_built.1,
+            anchor_to_item: code_built.2,
+            resolved_ann_rev: None,
+            item_annotations: HashMap::new(),
+        };
+
+        // Select across lines 2 ("repeat line") and 3 ("beta") plus exact line 4 ("repeat line")
+        app.flow_cache = Some(code_cache);
+        app.flow_sel_anchor = Some(FlowTextPos {
+            item_idx: 1,
+            char_idx: 7,
+        });
+        app.flow_sel_head = Some(FlowTextPos {
+            item_idx: 2,
+            char_idx: 2,
+        });
+        app.add_highlight_from_selection("green");
+
+        app.flow_sel_anchor = Some(FlowTextPos {
+            item_idx: 3,
+            char_idx: 0,
+        });
+        app.flow_sel_head = Some(FlowTextPos {
+            item_idx: 3,
+            char_idx: 6,
+        });
+        app.add_highlight_from_selection("blue");
+
+        let rendered_ann = Annotation {
+            id: "r-ann".to_owned(),
+            kind: "note".to_owned(),
+            color: "pink".to_owned(),
+            text: "rendered note".to_owned(),
+            parts: vec![Anchor {
+                index: 0,
+                start: 0,
+                quote: "alpha rendered".to_owned(),
+                digest: "d-md".to_owned(),
+                before: String::new(),
+                after: String::new(),
+            }],
+            position: Some(Position {
+                index: 0,
+                fraction: 0.0,
+                anchor: None,
+            }),
+            view_mode: None,
+            digest: "d-md".to_owned(),
+            missing: false,
+            created_at: 1,
+        };
+        app.active_book
+            .as_mut()
+            .expect("book")
+            .state
+            .annotations
+            .push(rendered_ann);
+        app.bump_annotations_rev();
+
+        let rev = app.annotations_rev;
+        let anns = app
+            .active_book
+            .as_ref()
+            .expect("book")
+            .state
+            .annotations
+            .clone();
+        code_cache = app.flow_cache.take().expect("code cache");
+        rebuild_flow_item_annotations(&mut code_cache, &anns, true, rev);
+
+        // Multi-line selection spans items 1 and 2; duplicate line selection hits only item 3, NOT item 1.
+        assert_eq!(code_cache.item_annotations[&1].len(), 1);
+        assert_eq!(code_cache.item_annotations[&1][0].color, "green");
+        assert_eq!(code_cache.item_annotations[&1][0].char_start, 7);
+        assert_eq!(code_cache.item_annotations[&1][0].char_end, 11);
+        assert_eq!(code_cache.item_annotations[&2].len(), 1);
+        assert_eq!(code_cache.item_annotations[&2][0].char_start, 0);
+        assert_eq!(code_cache.item_annotations[&2][0].char_end, 2);
+        assert_eq!(code_cache.item_annotations[&3].len(), 1);
+        assert_eq!(code_cache.item_annotations[&3][0].color, "blue");
+        assert_eq!(code_cache.item_annotations[&3][0].char_start, 0);
+        assert_eq!(code_cache.item_annotations[&3][0].char_end, 6);
+        assert!(!code_cache.item_annotations.contains_key(&0));
+
+        // Rendered mode cache isolates out code-mode annotations and keeps rendered-mode note.
+        let ren_built = build_flow_items_list(&flow, "markdown", false, 760.0, 19.0, 1.8);
+        let ren_ranges = compute_item_char_ranges(&ren_built.0);
+        let mut ren_cache = FlowLayoutCache {
+            key: FlowCacheKey {
+                book_id: "md-1".to_owned(),
+                is_code_mode: false,
+                width_px: 760,
+                font_size_tenths: 190,
+                line_height_hundredths: 180,
+                dark: false,
+            },
+            items: ren_built.0,
+            item_char_ranges: ren_ranges,
+            chapter_first_item: ren_built.1,
+            anchor_to_item: ren_built.2,
+            resolved_ann_rev: None,
+            item_annotations: HashMap::new(),
+        };
+        rebuild_flow_item_annotations(&mut ren_cache, &anns, false, rev);
+        assert_eq!(ren_cache.item_annotations[&0].len(), 1);
+        assert_eq!(ren_cache.item_annotations[&0][0].ann_id, "r-ann");
+        assert_eq!(ren_cache.item_annotations.len(), 1);
+    }
+
+    #[test]
+    fn jumping_to_annotation_switches_between_code_and_rendered_modes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_test_app(dir.path().to_path_buf());
+        let flow = Arc::new(FlowDocument {
+            kind: "markdown",
+            chapters: vec![crate::flow::FlowChapter {
+                path: "notes.md".to_owned(),
+                title: "Main".to_owned(),
+                blocks: vec![
+                    Block::Paragraph(vec![Inline::Text("rendered target".to_owned())]),
+                ],
+                anchors: HashMap::new(),
+                raw_source: "# Heading\nsecond code line\n".to_owned(),
+            }],
+            outline: Vec::new(),
+            resources: HashMap::new(),
+        });
+        let code_ann = Annotation {
+            id: "code-1".to_owned(),
+            kind: "highlight".to_owned(),
+            color: "yellow".to_owned(),
+            text: "second code line".to_owned(),
+            parts: vec![Anchor {
+                index: 0,
+                start: 10,
+                quote: "second code line".to_owned(),
+                digest: "d-md".to_owned(),
+                before: "# Heading\n".to_owned(),
+                after: String::new(),
+            }],
+            position: Some(Position {
+                index: 0,
+                fraction: 0.4,
+                anchor: None,
+            }),
+            view_mode: Some("code".to_owned()),
+            digest: "d-md".to_owned(),
+            missing: false,
+            created_at: 1,
+        };
+        let rendered_ann = Annotation {
+            id: "ren-1".to_owned(),
+            kind: "highlight".to_owned(),
+            color: "blue".to_owned(),
+            text: "rendered target".to_owned(),
+            parts: vec![Anchor {
+                index: 0,
+                start: 0,
+                quote: "rendered target".to_owned(),
+                digest: "d-md".to_owned(),
+                before: String::new(),
+                after: String::new(),
+            }],
+            position: Some(Position {
+                index: 0,
+                fraction: 0.1,
+                anchor: None,
+            }),
+            view_mode: Some("rendered".to_owned()),
+            digest: "d-md".to_owned(),
+            missing: false,
+            created_at: 2,
+        };
+        app.active_book = Some(OpenBook {
+            id: "md-2".to_owned(),
+            title: "Notes.md".to_owned(),
+            digest: "d-md".to_owned(),
+            kind: "markdown",
+            source: LoadedSource::Flow(flow.clone()),
+            state: BookState {
+                view_mode: Some("rendered".to_owned()),
+                annotations: vec![code_ann.clone(), rendered_ann.clone()],
+                ..Default::default()
+            },
+        });
+
+        // Clicking a code-mode annotation while in rendered mode switches to code mode.
+        app.jump_to_annotation(&code_ann);
+        assert_eq!(
+            app.active_book
+                .as_ref()
+                .and_then(|b| b.state.view_mode.as_deref()),
+            Some("code")
+        );
+        assert!(app.flow_cache.is_none());
+        let jump_code = app.pending_jump.as_ref().expect("pending jump to code");
+        assert_eq!(
+            jump_code.anchor.as_ref().map(|a| a.quote.as_str()),
+            Some("second code line")
+        );
+        let code_built = build_flow_items_list(&flow, "markdown", true, 760.0, 19.0, 1.8);
+        let code_cache = FlowLayoutCache {
+            key: FlowCacheKey {
+                book_id: "md-2".to_owned(),
+                is_code_mode: true,
+                width_px: 760,
+                font_size_tenths: 190,
+                line_height_hundredths: 180,
+                dark: false,
+            },
+            item_char_ranges: compute_item_char_ranges(&code_built.0),
+            items: code_built.0,
+            chapter_first_item: code_built.1,
+            anchor_to_item: code_built.2,
+            resolved_ann_rev: None,
+            item_annotations: HashMap::new(),
+        };
+        let resolved_code = resolve_flow_anchor_items(
+            &code_cache,
+            jump_code.anchor.as_ref().expect("code anchor"),
+            &mut HashMap::new(),
+        );
+        assert_eq!(resolved_code, vec![(1, 0, "second code line".len())]);
+
+        // Clicking a rendered-mode annotation while in code mode switches back to rendered mode.
+        app.jump_to_annotation(&rendered_ann);
+        assert_eq!(
+            app.active_book
+                .as_ref()
+                .and_then(|b| b.state.view_mode.as_deref()),
+            Some("rendered")
+        );
+        let jump_ren = app.pending_jump.as_ref().expect("pending jump to rendered");
+        let ren_built = build_flow_items_list(&flow, "markdown", false, 760.0, 19.0, 1.8);
+        let ren_cache = FlowLayoutCache {
+            key: FlowCacheKey {
+                book_id: "md-2".to_owned(),
+                is_code_mode: false,
+                width_px: 760,
+                font_size_tenths: 190,
+                line_height_hundredths: 180,
+                dark: false,
+            },
+            item_char_ranges: compute_item_char_ranges(&ren_built.0),
+            items: ren_built.0,
+            chapter_first_item: ren_built.1,
+            anchor_to_item: ren_built.2,
+            resolved_ann_rev: None,
+            item_annotations: HashMap::new(),
+        };
+        let resolved_ren = resolve_flow_anchor_items(
+            &ren_cache,
+            jump_ren.anchor.as_ref().expect("rendered anchor"),
+            &mut HashMap::new(),
+        );
+        assert_eq!(resolved_ren, vec![(0, 0, "rendered target".len())]);
     }
 }

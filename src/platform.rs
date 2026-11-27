@@ -164,6 +164,18 @@ fn is_newer_version(candidate: &str, current: &str) -> bool {
         .is_some_and(|(cand, cur)| cand > cur)
 }
 
+fn is_alpha_version(version: &str) -> bool {
+    parse_version(version).is_some_and(|parsed| {
+        parsed.prerelease.iter().any(|segment| {
+            matches!(segment, PreId::AlphaNum(id) if id == "alpha" || id.starts_with("alpha"))
+        })
+    })
+}
+
+fn should_trigger_manual_update(candidate: &str, previous: &str) -> bool {
+    is_alpha_version(candidate) || is_newer_version(candidate, previous)
+}
+
 pub fn record_version(app_data: &Path) -> io::Result<()> {
     if installed() {
         write_json(&app_data.join("installed-version.json"), &VERSION)?;
@@ -196,21 +208,27 @@ pub fn check_manual_update(data: &Path) -> io::Result<bool> {
     if !target.is_file() {
         return Ok(false);
     }
-    let previous: String = read_json(&data.join("installed-version.json"))?;
-    if !is_newer_version(VERSION, &previous) {
+    let force_alpha = is_alpha_version(VERSION);
+    let previous: String = if force_alpha {
+        read_json(&data.join("installed-version.json")).unwrap_or_default()
+    } else {
+        read_json(&data.join("installed-version.json"))?
+    };
+    if !should_trigger_manual_update(VERSION, &previous) {
         Command::new(target)
             .args(std::env::args_os().skip(1))
             .spawn()?;
         return Ok(true);
     }
-    let accepted = rfd::MessageDialog::new()
-        .set_title("HayakuReader")
-        .set_description(format!(
-            "Update the installed HayakuReader from {previous} to {VERSION}?"
-        ))
-        .set_buttons(rfd::MessageButtons::YesNo)
-        .show()
-        == rfd::MessageDialogResult::Yes;
+    let accepted = force_alpha
+        || rfd::MessageDialog::new()
+            .set_title("HayakuReader")
+            .set_description(format!(
+                "Update the installed HayakuReader from {previous} to {VERSION}?"
+            ))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show()
+            == rfd::MessageDialogResult::Yes;
     if accepted {
         let staging = data.join(format!("update-{}.exe", Uuid::new_v4()));
         copy_binary(&std::env::current_exe()?, &staging)?;
@@ -1182,5 +1200,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn alpha_versions_force_manual_update_even_without_version_bump() {
+        assert!(is_alpha_version("0.3.0-alpha.7"));
+        assert!(is_alpha_version("0.3.0-alpha"));
+        assert!(is_alpha_version("0.3.0-alpha1"));
+        assert!(is_alpha_version("v0.3.0-ALPHA.2"));
+
+        assert!(!is_alpha_version("0.3.0"));
+        assert!(!is_alpha_version("0.3.0-beta.1"));
+        assert!(!is_alpha_version("0.3.0-rc.1"));
+
+        assert!(should_trigger_manual_update("0.3.0-alpha.7", "0.3.0-alpha.7"));
+        assert!(should_trigger_manual_update("0.3.0-alpha.6", "0.3.0-alpha.7"));
+        assert!(should_trigger_manual_update("0.3.0-alpha.7", ""));
+
+        assert!(!should_trigger_manual_update("0.3.0-beta.1", "0.3.0-beta.1"));
+        assert!(!should_trigger_manual_update("0.3.0", "0.3.0"));
+        assert!(should_trigger_manual_update("0.3.1", "0.3.0"));
     }
 }
