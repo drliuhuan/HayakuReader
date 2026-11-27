@@ -7,6 +7,8 @@ HayakuReader is a local Windows document reader built in pure Rust by **drliuhua
 - **Flexible reading controls**: Light and dark themes, smart dark-mode inversion for PDF/Word (preserving vivid colors and illustrations while inverting scanned pages), draggable reading-width margins for reflowable documents, auto-hiding sidebar, and `F11` focus mode.
 - **Offline & portable**: Reading progress, bookmarks, and preferences stay local. The single EXE supports per-user installation, file associations, Start Menu / Desktop shortcuts, and GitHub update checks.
 
+- **v0.3.1 reading fixes**: Page through documents by clicking the scrollbar track, restore reading positions when switching tabs, display EPUB SVG illustrations and metadata covers, and keep the correct contents entry highlighted after navigation.
+
 ### Shortcuts
 
 - `Ctrl+O` Open · `Ctrl+F` Find · `Ctrl+B` Pin / auto sidebar

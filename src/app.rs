@@ -36,6 +36,76 @@ const TAB_SLEEP_MAX_AWAKE: usize = 5;
 const SPLASH_DIRECT_DURATION: Duration = Duration::from_secs(1);
 const INTRO_ZH_MD: &str = include_str!("../docs/intro.zh.md");
 
+// Own the track interaction: egui's built-in track centers the thumb on click.
+fn reader_scroll_area(salt: impl std::hash::Hash + std::fmt::Debug) -> ScrollArea {
+    ScrollArea::vertical()
+        .id_salt(salt)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+}
+
+fn reader_scrollbar<R>(
+    ui: &mut Ui,
+    output: &egui::scroll_area::ScrollAreaOutput<R>,
+    pending: &mut Option<f32>,
+) {
+    let viewport = output.inner_rect;
+    let max_offset = (output.content_size.y - viewport.height()).max(0.0);
+    if max_offset <= 0.0 {
+        return;
+    }
+    let track = Rect::from_min_max(
+        Pos2::new(viewport.right() - 12.0, viewport.top()),
+        viewport.max,
+    );
+    let handle_h = (viewport.height() * viewport.height() / output.content_size.y)
+        .clamp(24.0_f32.min(viewport.height()), viewport.height());
+    let travel = (viewport.height() - handle_h).max(1.0);
+    let mut offset = output.state.clamped_offset().y;
+    let top = track.top() + offset / max_offset * travel;
+    let handle = Rect::from_min_size(Pos2::new(track.left(), top), Vec2::new(12.0, handle_h));
+    let response = ui.interact(track, output.id.with("reader_bar"), Sense::click_and_drag());
+    let drag_id = output.id.with("reader_bar_grab");
+    if ui.input(|i| i.pointer.primary_pressed())
+        && response.hovered()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        if handle.contains(pos) {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(drag_id, pos.y - top));
+        } else {
+            let direction = if pos.y < top { -1.0 } else { 1.0 };
+            offset = (offset + direction * viewport.height()).clamp(0.0, max_offset);
+        }
+    }
+    if response.dragged()
+        && let Some(grab) = ui.ctx().data(|data| data.get_temp::<f32>(drag_id))
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        offset = ((pos.y - track.top() - grab) / travel * max_offset).clamp(0.0, max_offset);
+    }
+    if !ui.input(|i| i.pointer.primary_down()) {
+        ui.ctx().data_mut(|data| data.remove::<f32>(drag_id));
+    }
+    if (offset - output.state.clamped_offset().y).abs() > 0.01 {
+        *pending = Some(offset);
+        ui.ctx().request_repaint();
+    }
+    let handle = handle.translate(Vec2::new(
+        0.0,
+        track.top() + offset / max_offset * travel - top,
+    ));
+    ui.painter()
+        .rect_filled(track, 3.0, ui.visuals().extreme_bg_color);
+    ui.painter().rect_filled(
+        handle.shrink2(Vec2::new(2.0, 0.0)),
+        4.0,
+        ui.style().interact(&response).bg_fill,
+    );
+    if response.hovered() || response.dragged() {
+        ui.ctx().request_repaint();
+    }
+}
+
 fn now_epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -305,6 +375,7 @@ pub struct HayakuApp {
     use_tick: u64,
     pending_jump: Option<PendingJump>,
     pending_scroll_y: Option<f32>,
+    pending_restore_fraction: Option<f32>,
     last_scroll_y: f32,
     last_viewport_h: f32,
     last_content_h: f32,
@@ -388,10 +459,8 @@ impl HayakuApp {
         let mut install_selected = HashMap::new();
         if let Some(st) = &install_status {
             for ext in EXTENSIONS {
-                install_selected.insert(
-                    (*ext).to_owned(),
-                    st.associations.iter().any(|a| a == ext),
-                );
+                install_selected
+                    .insert((*ext).to_owned(), st.associations.iter().any(|a| a == ext));
             }
         }
         let tabs = if settings.restore_session {
@@ -455,6 +524,7 @@ impl HayakuApp {
             use_tick: 0,
             pending_jump: None,
             pending_scroll_y: None,
+            pending_restore_fraction: None,
             last_scroll_y: 0.0,
             last_viewport_h: 600.0,
             last_content_h: 600.0,
@@ -730,13 +800,10 @@ impl HayakuApp {
         let pos = book.state.position.clone().unwrap_or_default();
         self.current_unit = pos.index;
         self.scroll_fraction = pos.fraction;
-        self.pending_jump = Some(PendingJump {
-            chapter: pos.index,
-            item_idx: None,
-            fragment: String::new(),
-            fraction: pos.fraction,
-            anchor: None,
-        });
+        self.pending_jump = None;
+        self.pending_scroll_y = None;
+        self.pending_restore_fraction = Some(pos.fraction);
+        self.last_scroll_y = 0.0;
         self.bump_annotations_rev();
 
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
@@ -782,7 +849,13 @@ impl HayakuApp {
         let mut ordered: Vec<(String, u64, bool)> = self
             .tabs
             .iter()
-            .map(|t| (t.id.clone(), t.last_used, active_id.as_deref() == Some(t.id.as_str())))
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    t.last_used,
+                    active_id.as_deref() == Some(t.id.as_str()),
+                )
+            })
             .collect();
         ordered.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)));
 
@@ -1067,14 +1140,7 @@ impl HayakuApp {
             let want_code = annotation_is_code_mode(ann);
             let current_code = book.state.view_mode.as_deref() == Some("code");
             if want_code != current_code {
-                book.state.view_mode = Some(
-                    if want_code {
-                        "code"
-                    } else {
-                        "rendered"
-                    }
-                    .to_owned(),
-                );
+                book.state.view_mode = Some(if want_code { "code" } else { "rendered" }.to_owned());
                 self.flow_cache = None;
                 self.clear_selection();
                 self.save_active_book();
@@ -1448,26 +1514,16 @@ impl HayakuApp {
             for theme in [egui::Theme::Light, egui::Theme::Dark] {
                 ctx.style_mut_of(theme, |s| {
                     s.interaction.selectable_labels = false;
-                    s.text_styles.insert(
-                        egui::TextStyle::Small,
-                        FontId::proportional(14.0),
-                    );
-                    s.text_styles.insert(
-                        egui::TextStyle::Body,
-                        FontId::proportional(18.0),
-                    );
-                    s.text_styles.insert(
-                        egui::TextStyle::Button,
-                        FontId::proportional(18.0),
-                    );
-                    s.text_styles.insert(
-                        egui::TextStyle::Monospace,
-                        FontId::monospace(17.0),
-                    );
-                    s.text_styles.insert(
-                        egui::TextStyle::Heading,
-                        FontId::proportional(26.0),
-                    );
+                    s.text_styles
+                        .insert(egui::TextStyle::Small, FontId::proportional(14.0));
+                    s.text_styles
+                        .insert(egui::TextStyle::Body, FontId::proportional(18.0));
+                    s.text_styles
+                        .insert(egui::TextStyle::Button, FontId::proportional(18.0));
+                    s.text_styles
+                        .insert(egui::TextStyle::Monospace, FontId::monospace(17.0));
+                    s.text_styles
+                        .insert(egui::TextStyle::Heading, FontId::proportional(26.0));
                     s.spacing.item_spacing = Vec2::new(8.0, 7.0);
                     s.spacing.button_padding = Vec2::new(10.0, 5.0);
                     s.spacing.interact_size.y = 28.0;
@@ -1769,8 +1825,7 @@ impl HayakuApp {
                         right: 0,
                         top: 0,
                         bottom: 0,
-                    }),
-            )
+            }))
             .show(ui, |ui| {
                 let bar_center_x = ui.max_rect().center().x;
                 ui.horizontal_centered(|ui| {
@@ -1809,7 +1864,10 @@ impl HayakuApp {
                     let icon_color = if self.sidebar_pinned { p.accent } else { p.ink };
                     for dy in [-5.0f32, 0.0, 5.0] {
                         ui.painter().line_segment(
-                            [Pos2::new(sc.x - 7.0, sc.y + dy), Pos2::new(sc.x + 7.0, sc.y + dy)],
+                            [
+                                Pos2::new(sc.x - 7.0, sc.y + dy),
+                                Pos2::new(sc.x + 7.0, sc.y + dy),
+                            ],
                             Stroke::new(1.8, icon_color),
                         );
                     }
@@ -1840,19 +1898,15 @@ impl HayakuApp {
                         controls_reserve += 100.0;
                     }
                     let drag_width = (ui.available_width() - controls_reserve).max(40.0);
-                    let (drag_rect, drag_resp) = ui.allocate_exact_size(
-                        Vec2::new(drag_width, 42.0),
-                        Sense::click_and_drag(),
-                    );
+                    let (drag_rect, drag_resp) = ui
+                        .allocate_exact_size(Vec2::new(drag_width, 42.0), Sense::click_and_drag());
                     let title_font = FontId::proportional(18.5);
                     let avail_title_w = (drag_rect.width() - 16.0).max(20.0);
                     let display_title =
                         truncate_to_width(ui.painter(), &full_title, &title_font, avail_title_w);
-                    let title_galley = ui.painter().layout_no_wrap(
-                        display_title,
-                        title_font,
-                        p.ink,
-                    );
+                    let title_galley =
+                        ui.painter()
+                            .layout_no_wrap(display_title, title_font, p.ink);
                     let tw = title_galley.size().x;
                     let half_w = tw * 0.5;
                     let min_cx = drag_rect.left() + 8.0 + half_w;
@@ -2127,7 +2181,11 @@ impl HayakuApp {
                         let quote = slice_chars(&full, s_char, sel_end_char);
                         if !quote.trim().is_empty() {
                             let before = slice_chars(&full, s_char.saturating_sub(24), s_char);
-                            let after = slice_chars(&full, sel_end_char, (sel_end_char + 24).min(total_chars));
+                            let after = slice_chars(
+                                &full,
+                                sel_end_char,
+                                (sel_end_char + 24).min(total_chars),
+                            );
                             anchors.push(Anchor {
                                 index: page,
                                 start: s_char,
@@ -2388,7 +2446,10 @@ impl HayakuApp {
                     Vec2::new(arrow_w, bar_h),
                 );
                 let right_rect = Rect::from_min_size(
-                    Pos2::new((bar_rect.right() - arrow_w).max(left_rect.right() + 40.0), top_y),
+                    Pos2::new(
+                        (bar_rect.right() - arrow_w).max(left_rect.right() + 40.0),
+                        top_y,
+                    ),
                     Vec2::new(arrow_w, bar_h),
                 );
                 let mid_left = left_rect.right() + arrow_gap;
@@ -2412,7 +2473,11 @@ impl HayakuApp {
 
                 // Left scroll arrow pinned at left end
                 let left_resp = ui
-                    .interact(left_rect, ui.scope_id().with("tabs_arrow_left"), Sense::click())
+                    .interact(
+                        left_rect,
+                        ui.scope_id().with("tabs_arrow_left"),
+                        Sense::click(),
+                    )
                     .on_hover_text("向左滚动标签栏");
                 if can_left && left_resp.hovered() {
                     ui.painter().rect_filled(left_rect, 5.0, p.surface);
@@ -2421,7 +2486,14 @@ impl HayakuApp {
                 ui.painter().rect_stroke(
                     left_rect,
                     5.0,
-                    Stroke::new(1.0, if can_left { p.line } else { Color32::TRANSPARENT }),
+                    Stroke::new(
+                        1.0,
+                        if can_left {
+                            p.line
+                        } else {
+                            Color32::TRANSPARENT
+                        },
+                    ),
                     StrokeKind::Inside,
                 );
                 draw_chevron(
@@ -2571,7 +2643,11 @@ impl HayakuApp {
 
                 // Right scroll arrow pinned at right end of the window
                 let right_resp = ui
-                    .interact(right_rect, ui.scope_id().with("tabs_arrow_right"), Sense::click())
+                    .interact(
+                        right_rect,
+                        ui.scope_id().with("tabs_arrow_right"),
+                        Sense::click(),
+                    )
                     .on_hover_text("向右滚动标签栏");
                 if can_right && right_resp.hovered() {
                     ui.painter().rect_filled(right_rect, 5.0, p.surface);
@@ -2580,7 +2656,14 @@ impl HayakuApp {
                 ui.painter().rect_stroke(
                     right_rect,
                     5.0,
-                    Stroke::new(1.0, if can_right { p.line } else { Color32::TRANSPARENT }),
+                    Stroke::new(
+                        1.0,
+                        if can_right {
+                            p.line
+                        } else {
+                            Color32::TRANSPARENT
+                        },
+                    ),
                     StrokeKind::Inside,
                 );
                 draw_chevron(
@@ -2665,11 +2748,7 @@ impl HayakuApp {
             .default_size(320.0)
             .size_range(260.0..=480.0)
             .show_separator_line(true)
-            .frame(
-                Frame::new()
-                    .fill(p.side)
-                    .inner_margin(Margin::same(10)),
-            )
+            .frame(Frame::new().fill(p.side).inner_margin(Margin::same(10)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Recent, "最近打开");
@@ -2685,7 +2764,11 @@ impl HayakuApp {
                         let mut open_path = None;
                         let mut clear_all = false;
                         if self.recent.is_empty() {
-                            ui.label(RichText::new("暂无最近打开的文件").size(14.0).color(p.muted));
+                            ui.label(
+                                RichText::new("暂无最近打开的文件")
+                                    .size(14.0)
+                                    .color(p.muted),
+                            );
                         } else {
                             ui.horizontal(|ui| {
                                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -2716,10 +2799,8 @@ impl HayakuApp {
                                     .unwrap_or("");
                                 let card_w = ui.available_width();
                                 let row_h = 46.0;
-                                let (row_rect, row_resp) = ui.allocate_exact_size(
-                                    Vec2::new(card_w, row_h),
-                                    Sense::click(),
-                                );
+                                let (row_rect, row_resp) = ui
+                                    .allocate_exact_size(Vec2::new(card_w, row_h), Sense::click());
                                 let row_resp =
                                     row_resp.on_hover_text(item.path.display().to_string());
                                 let del_rect = Rect::from_center_size(
@@ -2769,12 +2850,8 @@ impl HayakuApp {
                                 );
                                 let clipped_painter = ui.painter().with_clip_rect(text_clip);
                                 let name_font = FontId::proportional(13.5);
-                                let shown_name = truncate_to_width(
-                                    ui.painter(),
-                                    &name,
-                                    &name_font,
-                                    text_max_w,
-                                );
+                                let shown_name =
+                                    truncate_to_width(ui.painter(), &name, &name_font, text_max_w);
                                 clipped_painter.text(
                                     Pos2::new(text_left, row_rect.top() + 7.5),
                                     egui::Align2::LEFT_TOP,
@@ -2843,15 +2920,9 @@ impl HayakuApp {
                             ui.label(RichText::new("此文档没有目录").color(p.muted));
                         } else {
                             ui.spacing_mut().item_spacing.y = 8.0;
-                            let fallback_idx = entries.iter().position(|e| e.index == self.current_unit);
+                            let selected = self.selected_outline_index(&entries);
                             for (oi, entry) in entries.iter().enumerate() {
-                                let active = if let Some(sel) = self.active_outline_idx
-                                    && entries.get(sel).is_some_and(|e| e.index == self.current_unit)
-                                {
-                                    sel == oi
-                                } else {
-                                    fallback_idx == Some(oi)
-                                };
+                                let active = selected == Some(oi);
                                 let text = if active {
                                     RichText::new(&entry.title).size(18.0).strong().color(p.accent)
                                 } else {
@@ -3279,6 +3350,27 @@ impl HayakuApp {
         }
     }
 
+    fn selected_outline_index(&self, entries: &[OutlineEntry]) -> Option<usize> {
+        if let Some(selected) = self.active_outline_idx
+            && let Some(entry) = entries.get(selected)
+        {
+            let target_near_top = self.flow_cache.as_ref().is_some_and(|cache| {
+                let target = cache.anchor_to_item.get(&(entry.index, entry.fragment.clone()))
+                    .copied().or_else(|| cache.chapter_first_item.get(entry.index).copied());
+                target.is_some_and(|index| {
+                    let top = 24.0 + cache.items.iter().take(index).map(|item| item.height).sum::<f32>();
+                    // Anchor jumps reserve 80 points above the title. The preceding
+                    // chapter can still occupy this margin without being the selection.
+                    top >= self.last_scroll_y - 0.5 && top <= self.last_scroll_y + 80.5
+                })
+            });
+            if entry.index == self.current_unit || target_near_top {
+                return Some(selected);
+            }
+        }
+        entries.iter().position(|entry| entry.index == self.current_unit)
+    }
+
     fn draw_fixed_viewer(&mut self, ui: &mut Ui) {
         let smart_invert = self.is_smart_invert();
         let p = self.palette();
@@ -3306,8 +3398,12 @@ impl HayakuApp {
             total_h += disp_h + gap;
         }
 
-        let mut scroll = ScrollArea::vertical().id_salt("fixed_scroll");
-        if let Some(target_y) = self.pending_scroll_y.take() {
+        let mut scroll = reader_scroll_area(("fixed_scroll", &book_id));
+        if let Some(fraction) = self.pending_restore_fraction.take() {
+            scroll = scroll.vertical_scroll_offset(
+                fraction.clamp(0.0, 1.0) * (total_h - ui.available_height()).max(0.0),
+            );
+        } else if let Some(target_y) = self.pending_scroll_y.take() {
             scroll = scroll.vertical_scroll_offset(target_y.max(0.0));
         } else if let Some(jump) = self.pending_jump.take()
             && let Some(&(top, _, h)) = page_tops.get(jump.chapter)
@@ -3357,8 +3453,9 @@ impl HayakuApp {
 
         let scroll_out = scroll.show_viewport(ui, |ui, viewport| {
             let clip = ui.clip_rect();
-            let view_pointer_pos = pointer_pos
-                .filter(|&pos| clip.contains(pos) && ui.ctx().layer_id_at(pos) == Some(ui.layer_id()));
+            let view_pointer_pos = pointer_pos.filter(|&pos| {
+                clip.contains(pos) && ui.ctx().layer_id_at(pos) == Some(ui.layer_id())
+            });
             let drag_pointer_pos = pointer_pos.filter(|&pos| clip.contains(pos));
             let hit_pointer_pos = if self.fixed_sel_dragging {
                 drag_pointer_pos
@@ -3400,7 +3497,10 @@ impl HayakuApp {
                 let is_vis = bot >= vis_top && top <= vis_bot;
                 let cache_key = (book_id.clone(), idx);
                 let (has_entry, needs_render) = match self.page_cache.get(&cache_key) {
-                    Some(c) => (true, c.scale_key != scale_key || c.smart_invert != smart_invert),
+                    Some(c) => (
+                        true,
+                        c.scale_key != scale_key || c.smart_invert != smart_invert,
+                    ),
                     None => (false, true),
                 };
                 if needs_render && (!has_entry || !resizing_debounce) {
@@ -3494,7 +3594,9 @@ impl HayakuApp {
                                         .get(idx)
                                         .into_iter()
                                         .flatten()
-                                        .map(|[ix, iy, iw, ih]| [ix * sx, iy * sy, iw * sx, ih * sy])
+                                        .map(|[ix, iy, iw, ih]| {
+                                            [ix * sx, iy * sy, iw * sx, ih * sy]
+                                        })
                                         .collect();
                                     smart_invert_rgba(&mut rgba, w, h, &rects);
                                 }
@@ -3640,7 +3742,10 @@ impl HayakuApp {
                                                 page_rect.left() + run.rect_pt[0] * factor,
                                                 page_rect.top() + run.rect_pt[1] * factor,
                                             ),
-                                            Vec2::new(run.rect_pt[2] * factor, run.rect_pt[3] * factor),
+                                            Vec2::new(
+                                                run.rect_pt[2] * factor,
+                                                run.rect_pt[3] * factor,
+                                            ),
                                         ),
                                         run.text.chars().count().max(1),
                                     )
@@ -3652,7 +3757,10 @@ impl HayakuApp {
                                                 page_rect.left() + run.left * factor,
                                                 page_rect.top() + run.top * factor,
                                             ),
-                                            Vec2::new(run.width * factor, (run.size * 1.2) * factor),
+                                            Vec2::new(
+                                                run.width * factor,
+                                                (run.size * 1.2) * factor,
+                                            ),
                                         ),
                                         run.text.chars().count().max(1),
                                     )
@@ -3738,8 +3846,12 @@ impl HayakuApp {
                             }
                             let resp = ui.interact(
                                 lr,
-                                ui.scope_id()
-                                    .with(("pdf-link", idx, lr.min.x as i32, lr.min.y as i32)),
+                                ui.scope_id().with((
+                                    "pdf-link",
+                                    idx,
+                                    lr.min.x as i32,
+                                    lr.min.y as i32,
+                                )),
                                 Sense::click(),
                             );
                             if resp.hovered() {
@@ -3897,6 +4009,7 @@ impl HayakuApp {
             self.scroll_fraction = (vis_top / max_scroll).clamp(0.0, 1.0);
         });
 
+        reader_scrollbar(ui, &scroll_out, &mut self.pending_scroll_y);
         self.last_scroll_y = scroll_out.state.clamped_offset().y;
         self.last_viewport_h = scroll_out.inner_rect.height();
         self.last_content_h = scroll_out.content_size.y;
@@ -4028,6 +4141,31 @@ impl HayakuApp {
         };
 
         self.ensure_flow_cache(ui, measure);
+        if let Some(cache) = self.flow_cache.as_mut() {
+            for item in &mut cache.items {
+                if item.visual.is_none() {
+                    let mut ctx = FlowDrawCtx {
+                        book_id: &book_id,
+                        palette: p,
+                        mode,
+                        font_size,
+                        line_height,
+                        max_width: measure,
+                        resources: &flow.resources,
+                        math_cache: &mut self.math_cache,
+                        math_textures: &mut self.math_textures,
+                        image_textures: &mut self.image_textures,
+                        clicked_link: &mut None,
+                        requested_menu: &mut None,
+                    };
+                    let (visual, height) =
+                        build_flow_item_visual(ui, &item.source, &flow, &mut ctx);
+                    item.visual = Some(visual);
+                    item.height = height;
+                }
+            }
+        }
+
         if self
             .flow_cache
             .as_ref()
@@ -4048,6 +4186,13 @@ impl HayakuApp {
 
         // Resolve PendingJump into scroll offset before ScrollArea renders
         let mut initial_scroll_offset: Option<f32> = self.pending_scroll_y.take();
+        if let Some(fraction) = self.pending_restore_fraction.take()
+            && let Some(cache) = &self.flow_cache
+        {
+            let height = 88.0 + cache.items.iter().map(|item| item.height).sum::<f32>();
+            initial_scroll_offset =
+                Some(fraction.clamp(0.0, 1.0) * (height - ui.available_height()).max(0.0));
+        }
         if initial_scroll_offset.is_none()
             && let Some(jump) = self.pending_jump.take()
             && let Some(cache) = self.flow_cache.as_mut()
@@ -4100,7 +4245,7 @@ impl HayakuApp {
             }
         }
 
-        let mut scroll = ScrollArea::vertical().id_salt("flow_scroll");
+        let mut scroll = reader_scroll_area(("flow_scroll", &book_id));
         if let Some(target_y) = initial_scroll_offset {
             scroll = scroll.vertical_scroll_offset(target_y);
         }
@@ -4157,8 +4302,9 @@ impl HayakuApp {
             let view_pointer_pos = if modal_open || self.flow_width_dragging {
                 None
             } else {
-                pointer_pos
-                    .filter(|&pos| clip.contains(pos) && ui.ctx().layer_id_at(pos) == Some(ui.layer_id()))
+                pointer_pos.filter(|&pos| {
+                    clip.contains(pos) && ui.ctx().layer_id_at(pos) == Some(ui.layer_id())
+                })
             };
             let drag_pointer_pos = if modal_open || self.flow_width_dragging {
                 None
@@ -4175,8 +4321,10 @@ impl HayakuApp {
             } else {
                 Sense::click()
             };
-            let (canvas_rect, canvas_resp) =
-                ui.allocate_exact_size(Vec2::new(avail_w.max(viewport.width()), total_h), canvas_sense);
+            let (canvas_rect, canvas_resp) = ui.allocate_exact_size(
+                Vec2::new(avail_w.max(viewport.width()), total_h),
+                canvas_sense,
+            );
             let col_left = canvas_rect.left() + ((canvas_rect.width() - measure) * 0.5).max(16.0);
             let vis_top = viewport.min.y;
             let vis_bot = viewport.max.y;
@@ -4416,8 +4564,12 @@ impl HayakuApp {
                                     }
                                     let resp = ui.interact(
                                         lr,
-                                        ui.scope_id()
-                                            .with(("flow-link", idx, lr.min.x as i32, lr.min.y as i32)),
+                                        ui.scope_id().with((
+                                            "flow-link",
+                                            idx,
+                                            lr.min.x as i32,
+                                            lr.min.y as i32,
+                                        )),
                                         Sense::click(),
                                     );
                                     if resp.hovered() {
@@ -4558,8 +4710,9 @@ impl HayakuApp {
                                     .as_ref()
                                     .unwrap_or(&flow.chapters[*chapter_idx].blocks[*block_idx]);
                                 let inlines = match block_ref {
-                                    Block::Heading { inlines, .. }
-                                    | Block::Paragraph(inlines) => Some(inlines.as_slice()),
+                                    Block::Heading { inlines, .. } | Block::Paragraph(inlines) => {
+                                        Some(inlines.as_slice())
+                                    }
                                     _ => None,
                                 };
                                 if let Some(inlines) = inlines {
@@ -4885,18 +5038,18 @@ impl HayakuApp {
                         Stroke::new(1.0, p.line)
                     };
                     ui.painter().line_segment(
-                        [Pos2::new(guide_x, vp.top()), Pos2::new(guide_x, vp.bottom())],
+                        [
+                            Pos2::new(guide_x, vp.top()),
+                            Pos2::new(guide_x, vp.bottom()),
+                        ],
                         stroke,
                     );
                     let grip = Rect::from_center_size(
                         Pos2::new(guide_x, vp.center().y),
                         Vec2::new(4.0, 36.0),
                     );
-                    ui.painter().rect_filled(
-                        grip,
-                        2.0,
-                        if dragging { p.accent } else { p.muted },
-                    );
+                    ui.painter()
+                        .rect_filled(grip, 2.0, if dragging { p.accent } else { p.muted });
                 }
                 if dragging {
                     active_drag = true;
@@ -4916,6 +5069,7 @@ impl HayakuApp {
             self.flow_width_dragging = false;
         }
 
+        reader_scrollbar(ui, &scroll_out, &mut self.pending_scroll_y);
         self.last_scroll_y = scroll_out.state.clamped_offset().y;
         self.last_viewport_h = scroll_out.inner_rect.height();
         self.last_content_h = scroll_out.content_size.y;
@@ -5309,7 +5463,10 @@ impl HayakuApp {
                     ui.horizontal(|ui| {
                         if editor.existing_id.is_some()
                             && ui
-                                .button(RichText::new("删除").color(Color32::from_rgb(0xb5, 0x47, 0x35)))
+                                .button(
+                                    RichText::new("删除")
+                                        .color(Color32::from_rgb(0xb5, 0x47, 0x35)),
+                                )
                                 .clicked()
                         {
                             do_delete = true;
@@ -5441,7 +5598,10 @@ impl HayakuApp {
                 })
                 .unwrap_or_else(|| {
                     let s = ctx.content_rect();
-                    Rect::from_center_size(Pos2::new(s.center().x, s.top() + 64.0), Vec2::new(120.0, 24.0))
+                    Rect::from_center_size(
+                        Pos2::new(s.center().x, s.top() + 64.0),
+                        Vec2::new(120.0, 24.0),
+                    )
                 });
             let dismissed = draw_callout_bubble(
                 ctx,
@@ -5581,7 +5741,10 @@ impl HayakuApp {
                         ui.horizontal(|ui| {
                             changed |= ui
                                 .add(
-                                    egui::Slider::new(&mut self.settings.text_width, 360.0..=1800.0)
+                                    egui::Slider::new(
+                                        &mut self.settings.text_width,
+                                        360.0..=1800.0,
+                                    )
                                         .step_by(10.0),
                                 )
                                 .changed();
@@ -5647,9 +5810,10 @@ impl HayakuApp {
             let mut trigger_search = false;
             let mut step: isize = 0;
             let mut jump_to_idx: Option<usize> = None;
-            let is_fixed_doc = self.active_book.as_ref().is_some_and(|b| {
-                matches!(b.source, LoadedSource::Pdf(_) | LoadedSource::Word(_))
-            });
+            let is_fixed_doc = self
+                .active_book
+                .as_ref()
+                .is_some_and(|b| matches!(b.source, LoadedSource::Pdf(_) | LoadedSource::Word(_)));
             egui::Window::new("搜索正文")
                 .collapsible(false)
                 .resizable(false)
@@ -5900,13 +6064,19 @@ impl HayakuApp {
                                 ui.painter().line_segment(
                                     [
                                         Pos2::new(check_rect.left() + 3.0, check_rect.center().y),
-                                        Pos2::new(check_rect.center().x - 0.5, check_rect.bottom() - 3.5),
+                                        Pos2::new(
+                                            check_rect.center().x - 0.5,
+                                            check_rect.bottom() - 3.5,
+                                        ),
                                     ],
                                     Stroke::new(1.8, p.accent_ink),
                                 );
                                 ui.painter().line_segment(
                                     [
-                                        Pos2::new(check_rect.center().x - 0.5, check_rect.bottom() - 3.5),
+                                        Pos2::new(
+                                            check_rect.center().x - 0.5,
+                                            check_rect.bottom() - 3.5,
+                                        ),
                                         Pos2::new(check_rect.right() - 2.8, check_rect.top() + 3.2),
                                     ],
                                     Stroke::new(1.8, p.accent_ink),
@@ -6476,7 +6646,15 @@ fn estimate_block_height(
         Block::Quote(inner) => {
             let sum: f32 = inner
                 .iter()
-                .map(|b| estimate_block_height(b, &block_plain_text(b), chars_per_line, line_px, font_size))
+                .map(|b| {
+                    estimate_block_height(
+                        b,
+                        &block_plain_text(b),
+                        chars_per_line,
+                        line_px,
+                        font_size,
+                    )
+                })
                 .sum();
             sum + 12.0 + gap
         }
@@ -6484,12 +6662,20 @@ fn estimate_block_height(
             let mut sum = gap;
             for item in items {
                 for b in item {
-                    sum += estimate_block_height(b, &block_plain_text(b), chars_per_line, line_px, font_size);
+                    sum += estimate_block_height(
+                        b,
+                        &block_plain_text(b),
+                        chars_per_line,
+                        line_px,
+                        font_size,
+                    );
                 }
             }
             sum
         }
-        Block::Table { rows, .. } => (rows.len().max(1) as f32 + 1.0) * (line_px + 6.0) + 16.0 + gap,
+        Block::Table { rows, .. } => {
+            (rows.len().max(1) as f32 + 1.0) * (line_px + 6.0) + 16.0 + gap
+        }
     }
 }
 
@@ -6819,8 +7005,17 @@ fn build_flow_item_visual(
                 Block::Quote(_)
                 | Block::List { .. }
                 | Block::Table { .. }
-                | Block::DisplayMath { .. }
-                | Block::Image { .. } => (FlowVisual::FallbackBlock, 48.0),
+                | Block::DisplayMath { .. } => (FlowVisual::FallbackBlock, 48.0),
+                Block::Image { path, .. } => {
+                    let height = ctx
+                        .resources
+                        .get(path)
+                        .and_then(|bytes| decode_resource_image(path, bytes))
+                        .map_or(48.0, |(w, h, _)| {
+                            h as f32 * (eff_max_w / (w as f32).max(1.0)).min(1.0) + gap
+                        });
+                    (FlowVisual::FallbackBlock, height)
+                }
             }
         }
     }
@@ -6938,9 +7133,13 @@ fn get_or_load_math(
         color,
     };
     if let Some(entry) = textures.get(&key) {
-        return entry
-            .as_ref()
-            .map(|c| (c.texture.id(), Vec2::from(c.logical_size), c.baseline_from_top));
+        return entry.as_ref().map(|c| {
+            (
+                c.texture.id(),
+                Vec2::from(c.logical_size),
+                c.baseline_from_top,
+            )
+        });
     }
     let rendered = math_cache.render(latex, display, font_size, ppp, color);
     let cached = rendered.map(|r| {
@@ -6959,9 +7158,13 @@ fn get_or_load_math(
             texture: tex,
         }
     });
-    let out = cached
-        .as_ref()
-        .map(|c| (c.texture.id(), Vec2::from(c.logical_size), c.baseline_from_top));
+    let out = cached.as_ref().map(|c| {
+        (
+            c.texture.id(),
+            Vec2::from(c.logical_size),
+            c.baseline_from_top,
+        )
+    });
     textures.insert(key, cached);
     out
 }
@@ -7307,12 +7510,7 @@ fn paint_measured_lines(
     }
 }
 
-fn draw_inline_flow(
-    ui: &mut Ui,
-    inlines: &[Inline],
-    scale_mul: f32,
-    ctx: &mut FlowDrawCtx<'_>,
-) {
+fn draw_inline_flow(ui: &mut Ui, inlines: &[Inline], scale_mul: f32, ctx: &mut FlowDrawCtx<'_>) {
     let (lines, _, _, extra_gap, base_ascent, total_h) =
         measure_rich_lines(ui, inlines, scale_mul, ctx);
     let max_w = ui.available_width().min(ctx.max_width).max(60.0);
@@ -7566,7 +7764,10 @@ fn paint_galley_selection_rects(
                 ui.painter().rect_filled(r, 1.0, color);
                 if underline {
                     ui.painter().line_segment(
-                        [Pos2::new(r.left(), r.bottom()), Pos2::new(r.right(), r.bottom())],
+                        [
+                            Pos2::new(r.left(), r.bottom()),
+                            Pos2::new(r.right(), r.bottom()),
+                        ],
                         Stroke::new(2.0, underline_color),
                     );
                 }
@@ -8043,9 +8244,11 @@ fn paint_fixed_page_annotations(
     dark: bool,
 ) -> Vec<(String, Rect, String, u64)> {
     let mut hit_rects = Vec::new();
-    let has_page_ann = annotations
+    let has_page_ann = annotations.iter().any(|ann| {
+        ann.parts
         .iter()
-        .any(|ann| ann.parts.iter().any(|pt| pt.index == page_idx && !pt.quote.is_empty()));
+            .any(|pt| pt.index == page_idx && !pt.quote.is_empty())
+    });
     if !has_page_ann {
         return hit_rects;
     }
@@ -8120,7 +8323,10 @@ fn paint_fixed_page_annotations(
                         ui.painter().rect_filled(sub, 1.5, fill);
                     } else {
                         ui.painter().line_segment(
-                            [Pos2::new(sub.left(), sub.bottom()), Pos2::new(sub.right(), sub.bottom())],
+                            [
+                                Pos2::new(sub.left(), sub.bottom()),
+                                Pos2::new(sub.right(), sub.bottom()),
+                            ],
                             Stroke::new(2.2, underline),
                         );
                     }
@@ -8344,9 +8550,14 @@ fn draw_callout_bubble(
 ) -> bool {
     let screen = ctx.content_rect();
     let bubble_w = (screen.width() - 24.0).clamp(280.0, 460.0);
-    let anchor_cx = anchor.center().x.clamp(screen.left() + 20.0, screen.right() - 20.0);
-    let bubble_x = (anchor_cx - bubble_w * 0.5)
-        .clamp(screen.left() + 12.0, (screen.right() - bubble_w - 12.0).max(12.0));
+    let anchor_cx = anchor
+        .center()
+        .x
+        .clamp(screen.left() + 20.0, screen.right() - 20.0);
+    let bubble_x = (anchor_cx - bubble_w * 0.5).clamp(
+        screen.left() + 12.0,
+        (screen.right() - bubble_w - 12.0).max(12.0),
+    );
 
     egui::Area::new(Id::unique((id_salt, "backdrop")))
         .fixed_pos(screen.min)
@@ -8354,7 +8565,11 @@ fn draw_callout_bubble(
         .show(ctx, |ui| {
             let (bg_rect, _) = ui.allocate_exact_size(screen.size(), Sense::click());
             let painter = ui.painter();
-            painter.rect_filled(bg_rect, 0.0, Color32::from_rgba_unmultiplied(0x0f, 0x16, 0x12, 110));
+            painter.rect_filled(
+                bg_rect,
+                0.0,
+                Color32::from_rgba_unmultiplied(0x0f, 0x16, 0x12, 110),
+            );
             painter.rect_stroke(
                 anchor.expand(3.0),
                 8.0,
@@ -8709,12 +8924,7 @@ fn crop_rgba_png(
     Some(buf.into_inner())
 }
 
-fn truncate_to_width(
-    painter: &egui::Painter,
-    text: &str,
-    font: &FontId,
-    max_width: f32,
-) -> String {
+fn truncate_to_width(painter: &egui::Painter, text: &str, font: &FontId, max_width: f32) -> String {
     if painter
         .layout_no_wrap(text.to_owned(), font.clone(), Color32::TRANSPARENT)
         .size()
@@ -8833,7 +9043,10 @@ fn install_system_fonts(ctx: &Context) {
         ("cjk_deng", &["Deng.ttf", "deng.ttf"][..]),
         ("cjk_msyh", &["msyh.ttc"][..]),
         ("cjk_simsun", &["simsun.ttc"][..]),
-        ("jp_yugoth", &["YuGothR.ttc", "meiryo.ttc", "msgothic.ttc"][..]),
+        (
+            "jp_yugoth",
+            &["YuGothR.ttc", "meiryo.ttc", "msgothic.ttc"][..],
+        ),
     ];
     let mut loaded_keys = Vec::new();
     for (key, files) in candidates {
@@ -8931,8 +9144,10 @@ fn load_format_icon_textures(ctx: &Context) -> HashMap<String, TextureHandle> {
             continue;
         };
         let rgba = img.to_rgba8();
-        let color_img =
-            ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw());
+        let color_img = ColorImage::from_rgba_unmultiplied(
+            [rgba.width() as usize, rgba.height() as usize],
+            rgba.as_raw(),
+        );
         let tex = ctx.load_texture(format!("fmt_icon_{ext}"), color_img, TextureOptions::LINEAR);
         map.insert((*ext).to_owned(), tex);
     }
@@ -8980,9 +9195,9 @@ mod tests {
 
     fn find_text_rect_in_shape(shape: &egui::epaint::Shape, needle: &str) -> Option<Rect> {
         match shape {
-            egui::epaint::Shape::Vec(v) => v
-                .iter()
-                .find_map(|s| find_text_rect_in_shape(s, needle)),
+            egui::epaint::Shape::Vec(v) => {
+                v.iter().find_map(|s| find_text_rect_in_shape(s, needle))
+            }
             egui::epaint::Shape::Text(t) => {
                 if t.galley.text() == needle {
                     Some(Rect::from_min_size(t.pos, t.galley.size()))
@@ -9042,6 +9257,7 @@ mod tests {
             use_tick: 0,
             pending_jump: None,
             pending_scroll_y: None,
+            pending_restore_fraction: None,
             last_scroll_y: 0.0,
             last_viewport_h: 600.0,
             last_content_h: 600.0,
@@ -9091,6 +9307,80 @@ mod tests {
             scroll_fraction: 0.0,
             current_unit: 0,
         }
+    }
+
+    #[test]
+    fn outline_selection_keeps_clicked_chapter_above_title_margin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_test_app(dir.path().to_owned());
+        let mut flow = crate::flow::parse_markdown_document("Previous chapter", None);
+        let mut next = crate::flow::parse_markdown_document("# Current chapter\n\nText", None)
+            .chapters.remove(0);
+        next.anchors.insert("title".to_owned(), 0);
+        flow.chapters.push(next);
+        let (items, chapter_first_item, anchor_to_item) =
+            build_flow_items_list(&flow, "epub", false, 760.0, 19.0, 1.8);
+        let title_top = 24.0 + items.iter().take(anchor_to_item[&(1, "title".to_owned())])
+            .map(|item| item.height).sum::<f32>();
+        app.flow_cache = Some(FlowLayoutCache {
+            key: FlowCacheKey { book_id: "book".to_owned(), is_code_mode: false,
+                width_px: 760, font_size_tenths: 190, line_height_hundredths: 180, dark: false },
+            item_char_ranges: compute_item_char_ranges(&items), items, chapter_first_item,
+            anchor_to_item, resolved_ann_rev: None, item_annotations: HashMap::new(),
+        });
+        let entries = vec![
+            OutlineEntry { title: "Previous".to_owned(), index: 0, fragment: String::new() },
+            OutlineEntry { title: "Current".to_owned(), index: 1, fragment: "title".to_owned() },
+        ];
+        app.current_unit = 0;
+        app.active_outline_idx = Some(1);
+        app.last_scroll_y = (title_top - 80.0).max(0.0);
+        assert_eq!(app.selected_outline_index(&entries), Some(1));
+        app.last_scroll_y = title_top + 100.0;
+        assert_eq!(app.selected_outline_index(&entries), Some(0));
+        app.last_scroll_y = (title_top - 16.0).max(0.0);
+        assert_eq!(app.selected_outline_index(&entries), Some(1));
+    }
+
+    #[test]
+    fn reader_track_click_pages_instead_of_jumping() {
+        let ctx = Context::default();
+        let mut pending = None;
+        let mut viewport = Rect::NOTHING;
+        for pressed in [false, true] {
+            let pos = Pos2::new(viewport.right() - 6.0, viewport.bottom() - 10.0);
+            let events = if pressed {
+                vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                    pos, button: PointerButton::Primary, pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                }]
+            } else { Vec::new() };
+            let mut frame = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                events, ..Default::default()
+            }, |ui| {
+                let out = reader_scroll_area("test_page_track").show(ui, |ui| {
+                    ui.allocate_exact_size(Vec2::new(700.0, 10000.0), Sense::hover());
+                });
+                viewport = out.inner_rect;
+                reader_scrollbar(ui, &out, &mut pending);
+            });
+            frame.textures_delta.clear();
+        }
+        assert!((pending.expect("track should scroll") - viewport.height()).abs() < 1.0);
+    }
+
+    #[test]
+    fn activation_restores_document_fraction_and_clears_previous_scroll_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_test_app(dir.path().to_owned());
+        app.pending_scroll_y = Some(9000.0);
+        let mut book = make_dummy_flow_book("restore", "book.txt");
+        book.state.position = Some(Position { index: 3, fraction: 0.6, anchor: None });
+        app.activate_loaded_book(book, 1, false);
+        assert!(app.pending_scroll_y.is_none());
+        assert!(app.pending_jump.is_none());
+        assert_eq!(app.pending_restore_fraction, Some(0.6));
     }
 
     #[test]
@@ -9667,7 +9957,11 @@ mod tests {
     fn search_finds_all_occurrences_across_items_and_jumps_accurately() {
         let dir = tempfile::tempdir().expect("tempdir");
         let md_path = dir.path().join("search.md");
-        fs::write(&md_path, "Rust 很棒，学好 Rust 很有用。\n\n- 列表里的 rust 关键词").expect("write");
+        fs::write(
+            &md_path,
+            "Rust 很棒，学好 Rust 很有用。\n\n- 列表里的 rust 关键词",
+        )
+        .expect("write");
         let flow = crate::flow::open_markdown(&md_path).expect("parse md");
 
         let mut app = make_test_app(dir.path().to_path_buf());
@@ -9899,9 +10193,9 @@ mod tests {
             chapters: vec![crate::flow::FlowChapter {
                 path: "notes.md".to_owned(),
                 title: "Main".to_owned(),
-                blocks: vec![
-                    Block::Paragraph(vec![Inline::Text("rendered target".to_owned())]),
-                ],
+                blocks: vec![Block::Paragraph(vec![Inline::Text(
+                    "rendered target".to_owned(),
+                )])],
                 anchors: HashMap::new(),
                 raw_source: "# Heading\nsecond code line\n".to_owned(),
             }],

@@ -14,18 +14,18 @@ Download `HayakuReader.exe` and double-click to launch. On first run, you can in
 
 Open tabs and reading positions are restored on the next launch by default; this can be turned off in Settings. Background tabs hibernate after five minutes of inactivity or when moved beyond the five most recent tabs. Reading positions, annotations, and settings are stored in `%LOCALAPPDATA%\HayakuReader`.
 
-The release is a single standalone EXE and requires the Windows WebView2 Runtime.
+The release is a single standalone EXE using native egui / wgpu rendering, with no WebView2 Runtime dependency.
 
 ## Building
 
-Requires the Windows x64 Rust MSVC target, Microsoft C++ build tools, the Windows SDK, and Node.js. Run the following commands to produce `dist\HayakuReader.exe`:
+Requires the Windows x64 Rust MSVC target, Microsoft C++ build tools, the Windows SDK, and a PDFium DLL to embed (set `PDFIUM_DLL` to its path). Run the following commands to produce `dist\HayakuReader.exe`:
 
 ```powershell
 rustup target add x86_64-pc-windows-msvc
 ./scripts/package-windows.ps1
 ```
 
-PDF rendering uses the bundled PDF.js. Word documents are laid out and rendered in Rust via `docboss`, Kindle formats are parsed with `ebook-rs`, and Markdown is rendered with `pulldown-cmark`. No LibreOffice, calibre, or Calibri installation is required.
+PDF rendering uses the embedded PDFium library. Word documents are laid out and rendered in Rust via `docboss`, Kindle formats are parsed with `ebook-rs`, and Markdown is rendered with `pulldown-cmark`. No LibreOffice, calibre, or Calibri installation is required.
 
 ## Releasing
 

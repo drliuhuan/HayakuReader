@@ -4,12 +4,7 @@ use encoding_rs::{GB18030, UTF_8, UTF_16BE, UTF_16LE};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use scraper::{ElementRef, Html, Node};
 use serde::Serialize;
-use std::{
-    collections::HashMap,
-    fs,
-    io::Read,
-    path::Path,
-};
+use std::{collections::HashMap, fs, io::Read, path::Path};
 use zip::ZipArchive;
 
 const MAX_RESOURCE: u64 = 64 * 1024 * 1024;
@@ -398,6 +393,24 @@ pub fn open_epub(path: &Path) -> Result<FlowDocument, String> {
             raw_source: xhtml,
         });
     }
+    // Some EPUBs declare the cover only in OPF metadata, outside the spine.
+    if let Some(cover) = epub_cover_path(&mut zip)
+        && !resources.contains_key(&cover)
+        && let Ok(bytes) = zip_entry(&mut zip, &cover)
+        && let Some(first) = chapters.first_mut()
+    {
+        resources.insert(cover.clone(), bytes);
+        first.blocks.insert(
+            0,
+            Block::Image {
+                path: cover,
+                alt: "封面".to_owned(),
+            },
+        );
+        for index in first.anchors.values_mut() {
+            *index += 1;
+        }
+    }
     let mut final_outline = outline;
     if final_outline.is_empty() {
         for (idx, chapter) in chapters.iter().enumerate() {
@@ -721,7 +734,9 @@ pub fn parse_plain_text_blocks(raw: &str) -> Vec<Block> {
             for seg in segments {
                 match seg {
                     MathSegment::Text(t) => push_plain_segment_with_links(t, &mut current_inlines),
-                    MathSegment::Inline(latex) => current_inlines.push(Inline::InlineMath { latex }),
+                    MathSegment::Inline(latex) => {
+                        current_inlines.push(Inline::InlineMath { latex })
+                    }
                     MathSegment::Display(latex) => {
                         if !current_inlines.is_empty() {
                             blocks.push(Block::Paragraph(std::mem::take(&mut current_inlines)));
@@ -829,9 +844,11 @@ pub fn parse_markdown_document(raw: &str, base_dir: Option<&Path>) -> FlowDocume
                        quote_blocks: &mut [Vec<Block>],
                        current_item_blocks: &mut [Vec<Block>],
                        top_blocks: &mut Vec<Block>| {
-        if let Some(last) = block_stack.iter().rev().find(|k| {
-            matches!(k, ContainerKind::Quote | ContainerKind::ListItem)
-        }) {
+        if let Some(last) = block_stack
+            .iter()
+            .rev()
+            .find(|k| matches!(k, ContainerKind::Quote | ContainerKind::ListItem))
+        {
             match last {
                 ContainerKind::Quote => {
                     if let Some(q) = quote_blocks.last_mut() {
@@ -889,11 +906,9 @@ pub fn parse_markdown_document(raw: &str, base_dir: Option<&Path>) -> FlowDocume
                     block_stack.push(ContainerKind::Code);
                     code_buf.clear();
                     code_lang = match kind {
-                        CodeBlockKind::Fenced(info) => info
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or("")
-                            .to_owned(),
+                        CodeBlockKind::Fenced(info) => {
+                            info.split_whitespace().next().unwrap_or("").to_owned()
+                        }
                         CodeBlockKind::Indented => String::new(),
                     };
                 }
@@ -1495,7 +1510,7 @@ fn collect_xhtml_inlines(
                             }
                         }
                     }
-                    "img" | "image" => {
+                    "img" | "image" | "object" => {
                         if !cur_inlines.is_empty() {
                             blocks.push(Block::Paragraph(std::mem::take(cur_inlines)));
                         }
@@ -1503,8 +1518,15 @@ fn collect_xhtml_inlines(
                             .attr("src")
                             .or_else(|| el.attr("href"))
                             .or_else(|| el.attr("xlink:href"))
+                            .or_else(|| {
+                                el.attrs()
+                                    .find_map(|(name, value)| (name == "href").then_some(value))
+                            })
+                            .or_else(|| el.attr("data"))
                             .unwrap_or("");
-                        if let Some((path, _)) = resolve_with_fragment(ctx.base_path, src) {
+                        if !src.is_empty()
+                            && let Some((path, _)) = resolve_with_fragment(ctx.base_path, src)
+                        {
                             ctx.image_paths.push(path.clone());
                             blocks.push(Block::Image {
                                 path,
@@ -1658,9 +1680,10 @@ fn collect_xhtml_blocks(
                         }
                         let ordered = tag == "ol";
                         let mut items = Vec::new();
-                        for li in child.children().filter(|n| {
-                            matches!(n.value(), Node::Element(e) if e.name() == "li")
-                        }) {
+                        for li in child
+                            .children()
+                            .filter(|n| matches!(n.value(), Node::Element(e) if e.name() == "li"))
+                        {
                             let mut item_blocks = Vec::new();
                             let mut item_loose = Vec::new();
                             collect_xhtml_blocks(li, ctx, &mut item_blocks, &mut item_loose);
@@ -1763,7 +1786,7 @@ fn collect_xhtml_blocks(
                             }
                         }
                     }
-                    "img" | "image" => {
+                    "img" | "image" | "object" => {
                         if !loose_inlines.is_empty() {
                             blocks.push(Block::Paragraph(std::mem::take(loose_inlines)));
                         }
@@ -1771,8 +1794,15 @@ fn collect_xhtml_blocks(
                             .attr("src")
                             .or_else(|| el.attr("href"))
                             .or_else(|| el.attr("xlink:href"))
+                            .or_else(|| {
+                                el.attrs()
+                                    .find_map(|(name, value)| (name == "href").then_some(value))
+                            })
+                            .or_else(|| el.attr("data"))
                             .unwrap_or("");
-                        if let Some((path, _)) = resolve_with_fragment(ctx.base_path, src) {
+                        if !src.is_empty()
+                            && let Some((path, _)) = resolve_with_fragment(ctx.base_path, src)
+                        {
                             ctx.image_paths.push(path.clone());
                             blocks.push(Block::Image {
                                 path,
@@ -1962,7 +1992,14 @@ fn collect_ncx_points(
                 fragment,
             });
         }
-        collect_ncx_points(point, ncx_path, depth + 1, spine_index, outline, first_titles);
+        collect_ncx_points(
+            point,
+            ncx_path,
+            depth + 1,
+            spine_index,
+            outline,
+            first_titles,
+        );
     }
 }
 
@@ -2006,6 +2043,30 @@ fn collect_kindle_toc(
         }
         collect_kindle_toc(&point.subitems, depth + 1, section_index, outline, chapters);
     }
+}
+
+fn epub_cover_path(zip: &mut ZipArchive<fs::File>) -> Option<String> {
+    let container = zip_entry(zip, "META-INF/container.xml").ok()?;
+    let container = roxmltree::Document::parse(std::str::from_utf8(&container).ok()?).ok()?;
+    let package_path = container
+        .descendants()
+        .find(|node| node.has_tag_name("rootfile"))?
+        .attribute("full-path")?;
+    let package = zip_entry(zip, package_path).ok()?;
+    let package = roxmltree::Document::parse(std::str::from_utf8(&package).ok()?).ok()?;
+    let cover_id = package
+        .descendants()
+        .find(|node| node.has_tag_name("meta") && node.attribute("name") == Some("cover"))
+        .and_then(|node| node.attribute("content"));
+    let item = package.descendants().find(|node| {
+        node.has_tag_name("item")
+            && (node.attribute("properties").is_some_and(|properties| {
+                properties
+                    .split_whitespace()
+                    .any(|property| property == "cover-image")
+            }) || cover_id.is_some_and(|id| node.attribute("id") == Some(id)))
+    })?;
+    resolve(package_path, item.attribute("href")?)
 }
 
 fn epub_chapters(
@@ -2133,6 +2194,24 @@ mod tests {
     use super::*;
     use std::io::Write;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn parses_epub_svg_cover_and_nested_illustration() {
+        let (blocks, paths, _) = parse_xhtml_blocks_with_anchors(
+            r#"<html><body><div><svg xmlns:xlink="http://www.w3.org/1999/xlink"><image xlink:href="../Images/cover.jpg" /></svg></div><p><img src="../Images/picture%201.png" /></p></body></html>"#,
+            "Text/chapter.xhtml",
+            0,
+            &HashMap::new(),
+        );
+        assert_eq!(paths, vec!["Images/cover.jpg", "Images/picture 1.png"]);
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| matches!(block, Block::Image { .. }))
+                .count(),
+            2
+        );
+    }
 
     #[test]
     fn decodes_utf8_utf16_and_gb18030() {
@@ -2302,7 +2381,7 @@ mod tests {
                 .unwrap();
             writer.start_file("OEBPS/package.opf", opts).unwrap();
             writer
-                .write_all(br#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/></spine></package>"#)
+                .write_all(br#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><manifest><item id="cover" href="cover.png" media-type="image/png" properties="cover-image"/><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/></spine></package>"#)
                 .unwrap();
             writer.start_file("OEBPS/nav.xhtml", opts).unwrap();
             writer
@@ -2312,10 +2391,15 @@ mod tests {
             writer
                 .write_all(r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><h1 id="top">Chapter 1</h1><p><ruby>漢字<rt>かんじ</rt></ruby></p></body></html>"#.as_bytes())
                 .unwrap();
+            writer.start_file("OEBPS/cover.png", opts).unwrap();
+            writer.write_all(b"cover-test-bytes").unwrap();
             writer.finish().unwrap();
         }
         let doc = open_epub(&epub_path).unwrap();
         assert_eq!(doc.chapters.len(), 1);
+        assert_eq!(doc.resources.get("OEBPS/cover.png").unwrap(), b"cover-test-bytes");
+        assert!(matches!(&doc.chapters[0].blocks[0], Block::Image { path, .. } if path == "OEBPS/cover.png"));
+        assert_eq!(doc.chapters[0].anchors.get("top"), Some(&1));
         assert_eq!(
             doc.outline,
             vec![
@@ -2332,7 +2416,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            doc.chapters[0].blocks[1],
+            doc.chapters[0].blocks[2],
             Block::Paragraph(vec![Inline::Ruby {
                 base: "漢字".into(),
                 annotation: "かんじ".into()
