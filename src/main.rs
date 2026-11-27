@@ -63,13 +63,46 @@ fn main() {
     }
 }
 
+#[cfg(windows)]
+fn has_hardware_vulkan_adapter(base_desc: &eframe::wgpu::InstanceDescriptor) -> bool {
+    let instance = eframe::wgpu::Instance::new(eframe::wgpu::InstanceDescriptor {
+        backends: eframe::wgpu::Backends::VULKAN,
+        flags: base_desc.flags,
+        memory_budget_thresholds: base_desc.memory_budget_thresholds,
+        backend_options: base_desc.backend_options.clone(),
+        display: None,
+    });
+    let mut fut = std::pin::pin!(instance.enumerate_adapters(eframe::wgpu::Backends::VULKAN));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match std::future::Future::poll(fut.as_mut(), &mut cx) {
+        std::task::Poll::Ready(adapters) => adapters.iter().any(|adapter| {
+            matches!(
+                adapter.get_info().device_type,
+                eframe::wgpu::DeviceType::IntegratedGpu | eframe::wgpu::DeviceType::DiscreteGpu
+            )
+        }),
+        std::task::Poll::Pending => false,
+    }
+}
+
 /// Configures wgpu to prefer the integrated/low-power adapter by default so hybrid-graphics
 /// laptops do not wake the discrete GPU for 2D document reading while respecting `WGPU_POWER_PREF`.
+///
+/// When `WGPU_BACKEND` is unset and a hardware Vulkan adapter is available, restricts backends
+/// to `VULKAN` because `egui-wgpu` keeps `available_adapters` alive in `RenderState` and
+/// `wgpu-hal`'s DX12 adapter enumeration holds an open `ID3D12Device` per adapter (waking the
+/// discrete GPU on Optimus laptops even when `LowPower` selects the iGPU), whereas Vulkan
+/// adapters only hold a `vk::PhysicalDevice`.
 #[cfg(windows)]
 fn default_wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     let mut wgpu_setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     wgpu_setup.power_preference = eframe::wgpu::PowerPreference::from_env()
         .unwrap_or(eframe::wgpu::PowerPreference::LowPower);
+    if eframe::wgpu::Backends::from_env().is_none()
+        && has_hardware_vulkan_adapter(&wgpu_setup.instance_descriptor)
+    {
+        wgpu_setup.instance_descriptor.backends = eframe::wgpu::Backends::VULKAN;
+    }
     eframe::egui_wgpu::WgpuConfiguration {
         wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
         ..Default::default()
@@ -186,12 +219,20 @@ fn rendered_svg_app_icon_is_valid() {
 #[cfg(all(test, windows))]
 #[test]
 fn default_wgpu_options_prefers_low_power_by_default() {
-    if std::env::var_os("WGPU_POWER_PREF").is_none() {
-        match default_wgpu_options().wgpu_setup {
-            eframe::egui_wgpu::WgpuSetup::CreateNew(setup) => {
+    match default_wgpu_options().wgpu_setup {
+        eframe::egui_wgpu::WgpuSetup::CreateNew(setup) => {
+            if std::env::var_os("WGPU_POWER_PREF").is_none() {
                 assert_eq!(setup.power_preference, eframe::wgpu::PowerPreference::LowPower);
             }
-            other => panic!("expected WgpuSetup::CreateNew, got {other:?}"),
+            if std::env::var_os("WGPU_BACKEND").is_none()
+                && has_hardware_vulkan_adapter(&setup.instance_descriptor)
+            {
+                assert_eq!(
+                    setup.instance_descriptor.backends,
+                    eframe::wgpu::Backends::VULKAN
+                );
+            }
         }
+        other => panic!("expected WgpuSetup::CreateNew, got {other:?}"),
     }
 }
